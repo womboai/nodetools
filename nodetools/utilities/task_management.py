@@ -625,42 +625,37 @@ class PostFiatTaskGenerationSystem:
 
     def run_cue_processing(self):
         """
-        Runs cue processing tasks in separate threads.
-        This function creates four threads for different cue processing tasks.
+        Runs cue processing tasks sequentially in a single thread.
+        Each task runs to completion before starting again.
         """
-        def process_outstanding_tasks():
+        self.stop_threads = False
+
+        def process_all_tasks():
             while not self.stop_threads:
+                # Process outstanding tasks
                 self.process_outstanding_task_cue()
-                time.sleep(1)  # Run every 1 minute
 
-        def process_initiation_rewards():
-            while not self.stop_threads:
+                # Process initiation rewards
                 self.node_cue_function__initiation_rewards()
-                time.sleep(1)  # Run every 5 minutes
 
-        def process_final_rewards():
-            while not self.stop_threads:
+                # Process final rewards
                 self.process_full_final_reward_cue()
-                time.sleep(1)  # Run every 10 minutes
 
-        def process_verifications():
-            while not self.stop_threads:
+                # Process verifications
                 self.process_verification_cue()
-                time.sleep(1)  # Run every 2 minutes
 
-        threads = [
-            threading.Thread(target=process_outstanding_tasks),
-            threading.Thread(target=process_initiation_rewards),
-            threading.Thread(target=process_final_rewards),
-            threading.Thread(target=process_verifications)
-        ]
+                # Short delay before checking if we should continue
+                time.sleep(1)  # 1 second delay
 
-        for thread in threads:
-            thread.daemon = True
-            thread.start()
+        # Create and start a single thread
+        self.processing_thread = threading.Thread(target=process_all_tasks)
+        self.processing_thread.daemon = True
+        self.processing_thread.start()
 
     def stop_cue_processing(self):
         """
-        Stops all cue processing threads.
+        Stops the cue processing thread.
         """
         self.stop_threads = True
+        if hasattr(self, 'processing_thread'):
+            self.processing_thread.join(timeout=60)  # W

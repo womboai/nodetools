@@ -758,25 +758,30 @@ class MyClient(discord.Client):
             guide_text = """
 # Post Fiat Discord Bot Guide
 
-## Discord Slash Commands 
+### Info Commands
+1. /pf_guide: Show this guide
+2. /pf_my_wallet: Show information about your stored wallet.
+3. /wallet_info: Get information about a specific wallet address.
+4. /pf_show_seed: Display your stored seed 
+5. /pf_rewards: Show recent PFT rewards.
+6. /pf_outstanding: Show your outstanding tasks and verification tasks.
+
+### Initiation
 1. /pf_new_wallet: Generate a new XRP wallet. You need to fund via Coinbase etc to continue
 2. /pf_store_seed: Securely store your wallet seed.
-3. /pf_show_seed: Display your stored seed (visible only to you).
-4. /pf_my_wallet: Show information about your stored wallet.
-5. /wallet_info: Get information about a specific wallet address.
-6. /xrp_send: Send XRP to a destination address with a memo.
-7. /pf_initiate: Initiate your commitment to the Post Fiat system, get access to PFT and initial grant
-8. /pf_send: Open a transaction form to send PFT tokens with a memo.
-9. /pf_request_task: Request a new Post Fiat task.
-10. /pf_outstanding: Show your outstanding tasks and verification tasks.
-11. /pf_accept: View and accept available tasks.
-12. /pf_refuse: View and refuse available tasks.
-13. /pf_initial_verification: Submit a completed task for verification.
-14. /pf_final_verification: Submit final verification for a task in the verification queue.
-You will receive a reward if this of high quality 
-15. /pf_rewards: Show recent PFT rewards.
-15. /pf_guide: Show this guide
-16. /pf_log: take notes re your workflows 
+3. /pf_initiate: Initiate your commitment to the Post Fiat system, get access to PFT and initial grant
+
+### Task Request
+1. /pf_request_task: Request a new Post Fiat task.
+2. /pf_accept: View and accept available tasks.
+3. /pf_refuse: View and refuse available tasks.
+4. /pf_initial_verification: Submit a completed task for verification.
+5. /pf_final_verification: Submit final verification for a task to receive reward
+
+### Transaction
+1. /xrp_send: Send XRP to a destination address with a memo.
+2. /pf_send: Open a transaction form to send PFT tokens with a memo.
+3. /pf_log: take notes re your workflows 
 
 ## Post Fiat operates on a Google Document.
 1. Place your Funded Wallet Address at the top of the Google Document 
