@@ -17,6 +17,10 @@ from nodetools.ai.openai import OpenAIRequestTool
 from nodetools.utilities.settings import PasswordMapLoader
 from nodetools.utilities.generic_pft_utilities import *
 from nodetools.utilities.task_management import PostFiatTaskGenerationSystem
+from nodetools.utilities.generic_pft_utilities import GenericPFTUtilities
+from nodetools.chatbots.personas.odv import odv_system_prompt
+from nodetools.ai.openai import OpenAIRequestTool
+# 
 
 password_map_loader = PasswordMapLoader()
 open_ai_request_tool = OpenAIRequestTool(pw_map=password_map_loader.pw_map)
@@ -27,7 +31,7 @@ generic_pft_utilities.run_transaction_history_updates()
 default_openai_model = 'chatgpt-4o-latest'
 remembrancer = 'rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn'
 MAX_HISTORY = 15
-post_fiat_task_generation_system.run_cue_processing()
+#post_fiat_task_generation_system.run_cue_processing()
 
 
 class MyClient(discord.Client):
@@ -36,6 +40,7 @@ class MyClient(discord.Client):
         self.conversations = {}
         self.user_seeds = {}
         self.tree = app_commands.CommandTree(self)
+        self.open_ai_request_tool = OpenAIRequestTool(pw_map=password_map_loader.pw_map)
 
 
     async def setup_hook(self):
@@ -1137,60 +1142,22 @@ Note: XRP wallets need 15 XRP to transact.
             print(f"Error: Channel with ID {CHANNEL_ID} not found.")
             return
 
-        # Fetch recent transactions
-        all_wallet_transactions = generic_pft_utilities.get_memo_detail_df_for_account(generic_pft_utilities.node_address).copy().sort_values('datetime')
-        
-        # Get the last 50 transactions to ensure we don't miss any
-        recent_transactions = all_wallet_transactions.tail(10)
+        try:
+            # Call the function to get new messages and update the database
+            messages_to_send = post_fiat_task_generation_system.output_messages_to_send_and_write_incremental_info_to_foundation_discord_db()
 
-        # Initialize last_processed_transaction if it doesn't exist
-        if not hasattr(self, 'last_processed_transaction'):
-            self.last_processed_transaction = recent_transactions.index[0]
-            self.processed_hashes = set()  # Set to store processed transaction hashes
+            # Send each new message to the Discord channel
+            for message in messages_to_send:
+                await channel.send(message)
 
-        new_transactions = recent_transactions.loc[recent_transactions.index > self.last_processed_transaction]
-
-        for idx, transaction in new_transactions.iterrows():
-            # Check if we've already processed this transaction
-            if transaction['hash'] in self.processed_hashes:
-                continue
-
-            # Create the transaction URL
-            transaction_url = f"https://livenet.xrpl.org/transactions/{transaction['hash']}/detailed"
-
-            # Create an informative message about the transaction
-            message = (
-                f"**New Transaction**\n"
-                f"Date: {transaction['datetime']}\n"
-                f"Type: {'Incoming' if transaction['pft_sign'] > 0 else 'Outgoing'}\n"
-                f"Amount: {abs(transaction['pft_absolute_amount'])} PFT\n"
-                f"From: {transaction['account']}\n"
-                f"To: {transaction['destination']}\n"
-                f"User Name: {transaction['memo_format']}\n"
-                f"Task ID: {transaction['memo_type']}\n"
-                f"Memo: {transaction['memo_data']}\n"
-                f"Transaction Details: {transaction_url}"
-            )
-
-            # Send the message to the channel
-            await channel.send(message)
-
-            # Add the hash to our set of processed transactions
-            self.processed_hashes.add(transaction['hash'])
-
-        # Update the last processed transaction
-        if not new_transactions.empty:
-            self.last_processed_transaction = new_transactions.index[-1]
-
-        # Limit the size of processed_hashes to prevent unbounded growth
-        if len(self.processed_hashes) > 1000:
-            self.processed_hashes = set(list(self.processed_hashes)[-1000:])
+        except Exception as e:
+            print(f"An error occurred while checking for new transactions: {str(e)}")
 
     async def transaction_checker(self):
         await self.wait_until_ready()
         while not self.is_closed():
             await self.check_and_notify_new_transactions()
-            await asyncio.sleep(60)  # Check every 60 seconds
+            await asyncio.sleep(15)  # Check every 60 seconds
             
     async def on_message(self, message):
         if message.author.id == self.user.id:
@@ -1221,7 +1188,7 @@ Note: XRP wallets need 15 XRP to transact.
             api_args = {
             "model": default_openai_model,
             "messages": ref_convo}
-            op_df = open_ai_request_tool.create_writable_df_for_chat_completion(api_args=api_args)
+            op_df = self.open_ai_request_tool.create_writable_df_for_chat_completion(api_args=api_args)
             content = op_df['choices__message__content'][0]
             gpt_response = content
             self.conversations[user_id].append({
@@ -1229,6 +1196,48 @@ Note: XRP wallets need 15 XRP to transact.
                 "content": gpt_response})
         
             await self.send_long_message(message, gpt_response)
+
+        if message.content.startswith('!tactics'):
+            if user_id in self.user_seeds:
+                seed = self.user_seeds[user_id]
+                
+                try:
+                    generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
+                    user_wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                    full_user_context = generic_pft_utilities.get_full_user_context_string(user_wallet.classic_address)
+                    
+                    open_ai_request_tool = OpenAIRequestTool(pw_map=password_map_loader.pw_map)
+                    
+                    user_prompt = f"""You are ODV Tactician module.
+                    The User has the following transaction context as well as strategic context
+                    they have uploaded here
+                    <FULL USER CONTEXT STARTS HERE>
+                    {full_user_context}
+                    <FULL USER CONTEXT ENDS HERE>
+                    Your job is to read through this and to interogate the future AI as to the best, very short-term use of the user's time.
+                    You are to condense this short term use of the user's time down to a couple paragraphs at most and provide it
+                    to the user
+                    """
+                    
+                    api_args = {
+                        "model": 'chatgpt-4o-latest',
+                        "messages": [
+                            {"role": "system", "content": odv_system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ]
+                    }
+                    
+                    writable_df = open_ai_request_tool.create_writable_df_for_chat_completion(api_args=api_args)
+                    tactical_string = writable_df['choices__message__content'][0]
+                    
+                    await self.send_long_message(message, tactical_string)
+            
+                except Exception as e:
+                    error_message = f"An error occurred while generating tactical advice: {str(e)}"
+                    await message.reply(error_message, mention_author=True)
+            else:
+                await message.reply("You must store a seed using /pf_store_seed before getting tactical advice.", mention_author=True)
+
 
         if message.content.startswith('!new_wallet'):
             wallet_maker =  generic_pft_utilities.create_xrp_wallet()

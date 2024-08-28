@@ -717,7 +717,9 @@ class GenericPFTUtilities:
         # Fetch transaction history and prepare DataFrame
         tx_hist = self.get_account_transactions__exhaustive(account_address=account_address, public=public)
         if len(tx_hist)==0:
-            print('no tx pulled')
+            #print('no tx pulled')
+            #print()
+            2+2
         if len(tx_hist)>0:
             full_transaction_history = pd.DataFrame(
                 tx_hist
@@ -781,8 +783,9 @@ class GenericPFTUtilities:
                         rows_inserted = len(new_rows)
                         new_rows.to_sql('postfiat_tx_cache', conn, if_exists='append', index=False)
                         total_rows_inserted += rows_inserted
-                        print(f"Inserted {rows_inserted} new rows.")
-                print(f"Total rows inserted: {total_rows_inserted}")
+                        #print(f"Inserted {rows_inserted} new rows.")
+                #print(f"Total rows inserted: {total_rows_inserted}")
+        dbconnx.dispose()
 
     def write_all_postfiat_holder_transaction_history(self,public=True):
         """ This writes all the transaction history. if public is True then it goes through full history """ 
@@ -988,7 +991,7 @@ class GenericPFTUtilities:
         """ 
         print('N Version')
         current_date = datetime.datetime.now().strftime('%Y-%m-%d')
-        all_account_info =self.get_memo_detail_df_for_account(account_address=account_address)
+        all_account_info =self.get_memo_detail_df_for_account(account_address=account_address).sort_values('datetime')
         core_element_outstanding_task_df =''
         try:
             outstanding_task_df = self.convert_all_account_info_into_outstanding_task_df(account_memo_detail_df=all_account_info)

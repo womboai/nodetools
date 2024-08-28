@@ -14,6 +14,7 @@ import xrpl
 from xrpl.clients import JsonRpcClient
 from xrpl.models.requests import AccountInfo, AccountLines
 #password_map_loader = PasswordMapLoader()
+import numpy as np
 from xrpl.wallet import Wallet
 from xrpl.clients import JsonRpcClient
 from xrpl.core.keypairs import derive_classic_address
@@ -22,6 +23,7 @@ from nodetools.prompts.rewards_manager import verification_user_prompt
 from nodetools.prompts.rewards_manager import verification_system_prompt
 from nodetools.prompts.rewards_manager import reward_system_prompt
 from nodetools.prompts.rewards_manager import reward_user_prompt
+from nodetools.utilities.db_manager import DBConnectionManager
 
 class PostFiatTaskGenerationSystem:
     def __init__(self,pw_map):
@@ -33,6 +35,7 @@ class PostFiatTaskGenerationSystem:
         self.node_seed = self.pw_map['postfiatfoundation__v1xrpsecret']
         self.node_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=self.node_seed)
         self.stop_threads = False
+        self.db_connection_manager = DBConnectionManager(pw_map=pw_map)
 
     def output_initiation_rite_df(self, all_node_memo_transactions):
         """
@@ -594,7 +597,7 @@ class PostFiatTaskGenerationSystem:
             def extract_pft_reward(x):
                 ret = 1
                 try:
-                    ret = int(x.split('| Total PFT Rewarded |')[-1:][0].replace('|','').strip())
+                    ret = np.abs(int(x.split('| Total PFT Rewarded |')[-1:][0].replace('|','').strip()))
                 except:
                     pass
                 return ret
@@ -617,12 +620,48 @@ class PostFiatTaskGenerationSystem:
             for xrow in rows_to_work:
                 slicex = reward_dispatch.loc[xrow]
                 memo_to_send=slicex.loc['memo_to_send']
+                print(memo_to_send)
                 destination_address = slicex.loc['account']
-                reward_to_dispatch = slicex.loc['reward_to_dispatch']
+                reward_to_dispatch = int(np.abs(slicex.loc['reward_to_dispatch']))
+                reward_to_dispatch = int(np.min([reward_to_dispatch,1200]))
+                reward_to_dispatch = int(np.max([reward_to_dispatch,1]))
                 node_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=self.node_seed)
                 self.generic_pft_utilities.send_PFT_with_info(sending_wallet=node_wallet, amount=reward_to_dispatch, 
                                                             memo=memo_to_send, destination_address=destination_address)
 
+    def server_loop(self):
+        total_time_to_run=1_000_000_000
+        i=0
+        while i<total_time_to_run:
+            self.generic_pft_utilities.write_all_postfiat_holder_transaction_history(public=False)
+            time.sleep(1)
+            try:
+                self.process_outstanding_task_cue()
+                self.generic_pft_utilities.write_all_postfiat_holder_transaction_history(public=False)
+                    # Process initiation rewards
+            except:
+                pass
+            try:
+                self.node_cue_function__initiation_rewards()
+            except:
+                pass
+            try:        
+                self.generic_pft_utilities.write_all_postfiat_holder_transaction_history(public=False)
+                    # Process final rewards
+                self.process_full_final_reward_cue()
+            except:
+                pass
+
+            try:                
+                self.generic_pft_utilities.write_all_postfiat_holder_transaction_history(public=False)
+                    # Process verifications
+                self.process_verification_cue()
+                self.generic_pft_utilities.write_all_postfiat_holder_transaction_history(public=False)
+            except:
+                pass
+            i=i+1
+            time.sleep(1)
+    
     def run_cue_processing(self):
         """
         Runs cue processing tasks sequentially in a single thread.
@@ -633,8 +672,10 @@ class PostFiatTaskGenerationSystem:
         def process_all_tasks():
             while not self.stop_threads:
                 # Process outstanding tasks
-                self.process_outstanding_task_cue()
-
+                try:
+                    self.process_outstanding_task_cue()
+                except:
+                    pass
                 # Process initiation rewards
                 self.node_cue_function__initiation_rewards()
 
@@ -659,3 +700,75 @@ class PostFiatTaskGenerationSystem:
         self.stop_threads = True
         if hasattr(self, 'processing_thread'):
             self.processing_thread.join(timeout=60)  # W
+
+    def write_full_initial_discord_chat_history(self):
+        """ Write the full transaction set """ 
+        simplified_message_df =self.generic_pft_utilities.get_memo_detail_df_for_account(account_address
+                                                                =self.generic_pft_utilities.node_address).sort_values('datetime')
+        simplified_message_df['url']=simplified_message_df['hash'].apply(lambda x: f'https://livenet.xrpl.org/transactions/{x}/detailed')
+
+        def format_message(row):
+            """
+            Format a message string from the given row of simplified_message_df.
+            
+            Args:
+            row (pd.Series): A row from simplified_message_df containing the required fields.
+            
+            Returns:
+            str: Formatted message string.
+            """
+            return (f"Date: {row['datetime']}\n"
+                    f"Account: {row['account']}\n"
+                    f"Memo Format: {row['memo_format']}\n"
+                    f"Memo Type: {row['memo_type']}\n"
+                    f"Memo Data: {row['memo_data']}\n"
+                    f"Directional PFT: {row['directional_pft']}\n"
+                    f"URL: {row['url']}")
+
+        # Apply the function to create a new 'formatted_message' column
+        simplified_message_df['formatted_message'] = simplified_message_df.apply(format_message, axis=1)
+        full_history = simplified_message_df[['datetime','account','memo_format',
+                            'memo_type','memo_data','directional_pft','url','hash','formatted_message']].copy()
+        full_history['displayed']=True
+        dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(user_name=self.generic_pft_utilities.node_name)
+        full_history.to_sql('foundation_discord', dbconnx, if_exists='replace')
+
+    def output_messages_to_send_and_write_incremental_info_to_foundation_discord_db(self):
+        dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(user_name=self.generic_pft_utilities.node_name)
+        existing_hashes = list(pd.read_sql('select hash from foundation_discord', dbconnx)['hash'])
+        dbconnx.dispose()
+        simplified_message_df =self.generic_pft_utilities.get_memo_detail_df_for_account(account_address
+                                                                =self.generic_pft_utilities.node_address).sort_values('datetime')
+        simplified_message_df['url']=simplified_message_df['hash'].apply(lambda x: f'https://livenet.xrpl.org/transactions/{x}/detailed')
+        
+        def format_message(row):
+            """
+            Format a message string from the given row of simplified_message_df.
+            
+            Args:
+            row (pd.Series): A row from simplified_message_df containing the required fields.
+            
+            Returns:
+            str: Formatted message string.
+            """
+            return (f"Date: {row['datetime']}\n"
+                    f"Account: {row['account']}\n"
+                    f"Memo Format: {row['memo_format']}\n"
+                    f"Memo Type: {row['memo_type']}\n"
+                    f"Memo Data: {row['memo_data']}\n"
+                    f"Directional PFT: {row['directional_pft']}\n"
+                    f"URL: {row['url']}")
+        
+        # Apply the function to create a new 'formatted_message' column
+        simplified_message_df['formatted_message'] = simplified_message_df.apply(format_message, axis=1)
+        simplified_message_df.set_index('hash',inplace=True)
+        incremental_df = simplified_message_df[simplified_message_df.index.isin(existing_hashes) == False]
+        messages_to_send = list(incremental_df['formatted_message'])
+        writer_df = incremental_df.reset_index()
+
+        if len(writer_df)>0:
+            dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(user_name=self.generic_pft_utilities.node_name)
+            writer_df[['hash','memo_data','memo_type','memo_format','datetime','url','directional_pft','account']].to_sql('foundation_discord', 
+                                                                                                                        dbconnx, if_exists='append')
+            dbconnx.dispose()
+        return messages_to_send
