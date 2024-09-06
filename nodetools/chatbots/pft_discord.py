@@ -41,7 +41,8 @@ class MyClient(discord.Client):
         self.user_seeds = {}
         self.tree = app_commands.CommandTree(self)
         self.open_ai_request_tool = OpenAIRequestTool(pw_map=password_map_loader.pw_map)
-
+        self.generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
+        self.post_fiat_task_generation_system = PostFiatTaskGenerationSystem(pw_map=password_map_loader.pw_map)
 
     async def setup_hook(self):
         guild_id = 1061800464045310053  # Your specific guild ID
@@ -212,7 +213,7 @@ class MyClient(discord.Client):
             classic_address = wallet.classic_address
             all_node_memo_transactions = generic_pft_utilities.get_memo_detail_df_for_account(account_address=classic_address, pft_only=False).copy()
             pf_df = generic_pft_utilities.convert_all_account_info_into_outstanding_task_df(account_memo_detail_df=all_node_memo_transactions)
-            non_accepted_tasks = pf_df[pf_df['acceptance'] == ''].copy()
+            non_accepted_tasks = pf_df# MADE THIS CHANGE TO REFUSE ANY [pf_df['acceptance'] == ''].copy()
             map_of_non_accepted_tasks = non_accepted_tasks['proposal']
 
             # If there are no non-accepted tasks, notify the user
@@ -1163,9 +1164,9 @@ Note: XRP wallets need 15 XRP to transact.
         if message.author.id == self.user.id:
             return
         
-        if message.author.id != 402536023483088896: 
+        #if message.author.id != 402536023483088896: 
             #print('IT IS ALEX')# Check if the user ID matches goodalexander's ID
-            return
+        #    return
 
         user_id = message.author.id
         if user_id not in self.conversations:
@@ -1229,6 +1230,25 @@ Note: XRP wallets need 15 XRP to transact.
                     
                     writable_df = open_ai_request_tool.create_writable_df_for_chat_completion(api_args=api_args)
                     tactical_string = writable_df['choices__message__content'][0]
+                    
+                    await self.send_long_message(message, tactical_string)
+            
+                except Exception as e:
+                    error_message = f"An error occurred while generating tactical advice: {str(e)}"
+                    await message.reply(error_message, mention_author=True)
+            else:
+                await message.reply("You must store a seed using /pf_store_seed before getting tactical advice.", mention_author=True)
+
+        if message.content.startswith('!blackprint'):
+            if user_id in self.user_seeds:
+                seed = self.user_seeds[user_id]
+                
+                try:
+                    #generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
+                    user_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                    user_address = user_wallet.classic_address
+                    #full_user_context = self.generic_pft_utilities.get_full_user_context_string(user_wallet.classic_address)
+                    tactical_string = self.post_fiat_task_generation_system.generate_coaching_string_for_account(user_address)
                     
                     await self.send_long_message(message, tactical_string)
             

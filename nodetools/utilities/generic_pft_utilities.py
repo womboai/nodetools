@@ -693,26 +693,51 @@ class GenericPFTUtilities:
         return op
 
     def establish_post_fiat_tx_cache_as_hash_unique(self):
-        """ only allows unique hashes to be written to the transaction cache""" 
         dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(user_name=self.node_name)
-        if 'postfiat_tx_cache' in sqlalchemy.inspect(dbconnx).get_table_names():
-            # Use the connection in a context manager to ensure it's properly closed
-            with dbconnx.connect() as connection:
-                # Check if the unique constraint already exists
-                result = connection.execute(sqlalchemy.text("""
-                    SELECT constraint_name
-                    FROM information_schema.table_constraints
-                    WHERE table_name = 'postfiat_tx_cache' 
-                    AND constraint_type = 'UNIQUE' 
-                    AND constraint_name = 'unique_hash';
-                """)).fetchone()
-                # If the constraint doesn't exist, add it
-                if result is None:
-                    connection.execute(sqlalchemy.text("""
-                        ALTER TABLE postfiat_tx_cache
-                        ADD CONSTRAINT unique_hash UNIQUE (hash);
-                    """))
-                    connection.commit()  # Commit the transaction if the constraint was added
+        
+        with dbconnx.connect() as connection:
+            # Check if the table exists
+            table_exists = connection.execute(sqlalchemy.text("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'postfiat_tx_cache'
+                );
+            """)).scalar()
+            
+            if not table_exists:
+                # Create the table if it doesn't exist
+                connection.execute(sqlalchemy.text("""
+                    CREATE TABLE postfiat_tx_cache (
+                        hash VARCHAR(255) PRIMARY KEY,
+                        -- Add other columns as needed, for example:
+                        account VARCHAR(255),
+                        destination VARCHAR(255),
+                        amount DECIMAL(20, 8),
+                        memo TEXT,
+                        timestamp TIMESTAMP
+                    );
+                """))
+                print("Table 'postfiat_tx_cache' created.")
+            
+            # Add unique constraint on hash if it doesn't exist
+            constraint_exists = connection.execute(sqlalchemy.text("""
+                SELECT constraint_name
+                FROM information_schema.table_constraints
+                WHERE table_name = 'postfiat_tx_cache' 
+                AND constraint_type = 'UNIQUE' 
+                AND constraint_name = 'unique_hash';
+            """)).fetchone()
+            
+            if constraint_exists is None:
+                connection.execute(sqlalchemy.text("""
+                    ALTER TABLE postfiat_tx_cache
+                    ADD CONSTRAINT unique_hash UNIQUE (hash);
+                """))
+                print("Unique constraint added to 'hash' column.")
+            
+            connection.commit()
+
+        dbconnx.dispose()
     def generate_postgres_writable_df_for_address(self,account_address = 'r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n',public=True):
         # Fetch transaction history and prepare DataFrame
         tx_hist = self.get_account_transactions__exhaustive(account_address=account_address, public=public)
@@ -764,28 +789,48 @@ class GenericPFTUtilities:
         # Fetch transaction history and prepare DataFrame
         tx_hist = self.generate_postgres_writable_df_for_address(account_address=account_address, public=public)
         dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(user_name=self.node_name)
-        full_transaction_history = tx_hist
-        if tx_hist is not None:    
-            # Use a transaction to handle multiple inserts
-            with dbconnx.begin() as conn:
-                total_rows_inserted = 0
-                for start in range(0, len(full_transaction_history), 100):
-                    chunk = full_transaction_history.iloc[start:start + 100]
-                    # Fetch existing hashes from the database to avoid duplicates
-                    existing_hashes = pd.read_sql_query(
-                        "SELECT hash FROM postfiat_tx_cache WHERE hash IN %(hashes)s",
-                        conn,
-                        params={"hashes": tuple(chunk['hash'].tolist())}
-                    )['hash'].tolist()
-                    # Filter out rows with existing hashes
-                    new_rows = chunk[~chunk['hash'].isin(existing_hashes)]
-                    if not new_rows.empty:
-                        rows_inserted = len(new_rows)
-                        new_rows.to_sql('postfiat_tx_cache', conn, if_exists='append', index=False)
-                        total_rows_inserted += rows_inserted
-                        #print(f"Inserted {rows_inserted} new rows.")
-                #print(f"Total rows inserted: {total_rows_inserted}")
-        dbconnx.dispose()
+        
+        if tx_hist is not None:
+            try:
+                with dbconnx.begin() as conn:
+                    total_rows_inserted = 0
+                    for start in range(0, len(tx_hist), 100):
+                        chunk = tx_hist.iloc[start:start + 100]
+                        
+                        # Fetch existing hashes from the database to avoid duplicates
+                        existing_hashes = pd.read_sql_query(
+                            "SELECT hash FROM postfiat_tx_cache WHERE hash IN %(hashes)s",
+                            conn,
+                            params={"hashes": tuple(chunk['hash'].tolist())}
+                        )['hash'].tolist()
+                        
+                        # Filter out rows with existing hashes
+                        new_rows = chunk[~chunk['hash'].isin(existing_hashes)]
+                        
+                        if not new_rows.empty:
+                            rows_inserted = len(new_rows)
+                            new_rows.to_sql('postfiat_tx_cache', conn, if_exists='append', index=False)
+                            total_rows_inserted += rows_inserted
+                            print(f"Inserted {rows_inserted} new rows.")
+                    
+                    print(f"Total rows inserted: {total_rows_inserted}")
+            
+            except sqlalchemy.exc.InternalError as e:
+                if "current transaction is aborted" in str(e):
+                    print("Transaction aborted. Attempting to reset...")
+                    with dbconnx.connect() as connection:
+                        connection.execute(sqlalchemy.text("ROLLBACK"))
+                    print("Transaction reset. Please try the operation again.")
+                else:
+                    print(f"An error occurred: {e}")
+            
+            except Exception as e:
+                print(f"An unexpected error occurred: {e}")
+            
+            finally:
+                dbconnx.dispose()
+        else:
+            print("No transaction history to write.")
 
     def write_all_postfiat_holder_transaction_history(self,public=True):
         """ This writes all the transaction history. if public is True then it goes through full history """ 
