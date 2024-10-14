@@ -19,8 +19,9 @@ from nodetools.utilities.generic_pft_utilities import *
 from nodetools.utilities.task_management import PostFiatTaskGenerationSystem
 from nodetools.utilities.generic_pft_utilities import GenericPFTUtilities
 from nodetools.chatbots.personas.odv import odv_system_prompt
-from nodetools.ai.openai import OpenAIRequestTool
-# 
+import asyncio
+from datetime import datetime, time
+import pytz
 
 password_map_loader = PasswordMapLoader()
 open_ai_request_tool = OpenAIRequestTool(pw_map=password_map_loader.pw_map)
@@ -44,6 +45,9 @@ class MyClient(discord.Client):
         self.generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
         self.post_fiat_task_generation_system = PostFiatTaskGenerationSystem(pw_map=password_map_loader.pw_map)
 
+
+    
+
     async def setup_hook(self):
         guild_id = 1061800464045310053  # Your specific guild ID
         guild = Object(id=guild_id)
@@ -52,6 +56,7 @@ class MyClient(discord.Client):
         print(f"Slash commands synced to guild ID: {guild_id}")
 
         self.bg_task = self.loop.create_task(self.transaction_checker())
+        self.bg_task_death_march = self.loop.create_task(self.death_march_reminder())
         # Ensure the command is registered
         @self.tree.command(name="pf_send", description="Open a transaction form")
         async def pf_send(interaction: Interaction):
@@ -1159,6 +1164,45 @@ Note: XRP wallets need 15 XRP to transact.
         while not self.is_closed():
             await self.check_and_notify_new_transactions()
             await asyncio.sleep(15)  # Check every 60 seconds
+
+    async def death_march_reminder(self):
+        await self.wait_until_ready()
+        
+        # Wait for 10 seconds after server start (for testing, change back to 30 minutes in production)
+        await asyncio.sleep(30)
+        
+        target_user_id = 402536023483088896  # The specific user ID
+        channel_id = 1229917290254827521  # The specific channel ID
+        
+        est_tz = pytz.timezone('US/Eastern')
+        start_time = time(6, 30)  # 6:30 AM
+        end_time = time(21, 0)  # 9:00 PM
+        
+        while not self.is_closed():
+            try:
+                now = datetime.now(est_tz).time()
+                if start_time <= now <= end_time:
+                    channel = self.get_channel(channel_id)
+                    if channel:
+                        if target_user_id in self.user_seeds:
+                            seed = self.user_seeds[target_user_id]
+                            user_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                            user_address = user_wallet.classic_address
+                            tactical_string = self.post_fiat_task_generation_system.get_o1_coaching_string_for_account(user_address)
+                            
+                            # Send the message to the channel
+                            await self.send_long_message_to_channel(channel, f"<@{target_user_id}> Death March Update:\n{tactical_string}")
+                        else:
+                            print(f"No seed found for user {target_user_id}")
+                    else:
+                        print(f"Channel with ID {channel_id} not found")
+                else:
+                    print("Outside of allowed time range. Skipping Death March reminder.")
+            except Exception as e:
+                print(f"An error occurred in death_march_reminder: {str(e)}")
+            
+            # Wait for 30 minutes before the next reminder (10 seconds for testing)
+            await asyncio.sleep(30*60)  # Change to 1800 (30 minutes) for production
             
     async def on_message(self, message):
         if message.author.id == self.user.id:
@@ -1249,6 +1293,64 @@ Note: XRP wallets need 15 XRP to transact.
                     user_address = user_wallet.classic_address
                     #full_user_context = self.generic_pft_utilities.get_full_user_context_string(user_wallet.classic_address)
                     tactical_string = self.post_fiat_task_generation_system.generate_coaching_string_for_account(user_address)
+                    
+                    await self.send_long_message(message, tactical_string)
+            
+                except Exception as e:
+                    error_message = f"An error occurred while generating tactical advice: {str(e)}"
+                    await message.reply(error_message, mention_author=True)
+            else:
+                await message.reply("You must store a seed using /pf_store_seed before getting tactical advice.", mention_author=True)
+
+        if message.content.startswith('!deathmarch'):
+            ## FOR REPEATED RESPONSE TARGET THIS AT USER ID 402536023483088896
+            if user_id in self.user_seeds:
+                seed = self.user_seeds[user_id]
+                
+                try:
+                    #generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
+                    user_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                    user_address = user_wallet.classic_address
+                    #full_user_context = self.generic_pft_utilities.get_full_user_context_string(user_wallet.classic_address)
+                    tactical_string = self.post_fiat_task_generation_system.get_o1_coaching_string_for_account(user_address)
+                    
+                    await self.send_long_message(message, tactical_string)
+            
+                except Exception as e:
+                    error_message = f"An error occurred while generating tactical advice: {str(e)}"
+                    await message.reply(error_message, mention_author=True)
+            else:
+                await message.reply("You must store a seed using /pf_store_seed before getting tactical advice.", mention_author=True)
+
+        if message.content.startswith('!redpill'):
+            if user_id in self.user_seeds:
+                seed = self.user_seeds[user_id]
+                
+                try:
+                    #generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
+                    user_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                    user_address = user_wallet.classic_address
+                    #full_user_context = self.generic_pft_utilities.get_full_user_context_string(user_wallet.classic_address)
+                    tactical_string = self.post_fiat_task_generation_system.o1_redpill(user_address)
+                    
+                    await self.send_long_message(message, tactical_string)
+            
+                except Exception as e:
+                    error_message = f"An error occurred while generating tactical advice: {str(e)}"
+                    await message.reply(error_message, mention_author=True)
+            else:
+                await message.reply("You must store a seed using /pf_store_seed before getting tactical advice.", mention_author=True)
+
+        if message.content.startswith('!docrewrite'):
+            if user_id in self.user_seeds:
+                seed = self.user_seeds[user_id]
+                
+                try:
+                    #generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
+                    user_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                    user_address = user_wallet.classic_address
+                    #full_user_context = self.generic_pft_utilities.get_full_user_context_string(user_wallet.classic_address)
+                    tactical_string = self.post_fiat_task_generation_system.generate_document_rewrite_instructions(user_address)
                     
                     await self.send_long_message(message, tactical_string)
             
