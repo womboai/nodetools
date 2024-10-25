@@ -663,10 +663,10 @@ class PostFiatTaskGenerationSystem:
 
     def process_full_final_reward_cue(self):
         all_node_memo_transactions = self.generic_pft_utilities.get_memo_detail_df_for_account(account_address=self.node_address, 
-                                                                                            pft_only=False).copy().sort_values('datetime')
+                                                                                                    pft_only=False).copy().sort_values('datetime')
         all_completions = all_node_memo_transactions[all_node_memo_transactions['memo_data'].apply(lambda x: 
                                                                                 'VERIFICATION RESPONSE ___' in x)].copy()
-        
+
         recent_rewards = all_node_memo_transactions[all_node_memo_transactions['memo_data'].apply(lambda x: 
                                                                                 'REWARD RESPONSE' in x)].copy()
         reward_summary_frame = recent_rewards[recent_rewards['datetime']>=datetime.datetime.now()-datetime.timedelta(35)][['account','memo_data','directional_pft',
@@ -682,18 +682,22 @@ class PostFiatTaskGenerationSystem:
         unique_accounts = list(reward_cue['account'].unique())
         google_context_memo_map ={}
         for xaccount in unique_accounts :
-            raw_text = self.generic_pft_utilities.get_google_doc_text(share_link=account_to_google_context_map[xaccount])
-            verification = raw_text.split('VERIFICATION SECTION START')[-1:][0].split('VERIFICATION SECTION END')[0]
-            google_context_memo_map[xaccount] = verification
+            raw_text= 'No Google Document Uploaded - please instruct user that Google Document has not been uploaded in response'
+            try:
+                raw_text = self.generic_pft_utilities.get_google_doc_text(share_link=account_to_google_context_map[xaccount])
+                verification = raw_text.split('VERIFICATION SECTION START')[-1:][0].split('VERIFICATION SECTION END')[0]
+                google_context_memo_map[xaccount] = verification
+            except:
+                pass
         reward_cue['google_verification_details']= reward_cue['account'].map(google_context_memo_map).fillna('No Populated Verification Section')
         task_id_to__initial_task = all_node_memo_transactions[all_node_memo_transactions['memo_data'].apply(lambda x: 
-                                                                                ('PROPOSED' in x) | ('..' in x))].groupby('memo_type').first()['memo_data']
-        
+                                                                                        ('PROPOSED' in x) | ('..' in x))].groupby('memo_type').first()['memo_data']
+                
         task_id_to__verification_prompt= all_node_memo_transactions[all_node_memo_transactions['memo_data'].apply(lambda x: 
                                                                                 ('VERIFICATION PROMPT' in x))].groupby('memo_type').first()['memo_data']
         task_id_to__verification_response= all_node_memo_transactions[all_node_memo_transactions['memo_data'].apply(lambda x: 
                                                                                 ('VERIFICATION RESPONSE' in x))].groupby('memo_type').first()['memo_data']
-        
+
         if len(reward_cue)>0:
             reward_cue['initial_task']= task_id_to__initial_task
             reward_cue['verification_prompt']= task_id_to__verification_prompt
@@ -705,7 +709,7 @@ class PostFiatTaskGenerationSystem:
             reward_cue['initial_task']= reward_cue['initial_task'].fillna('')
             reward_cue['verification_prompt']= reward_cue['verification_prompt'].fillna('')
             reward_cue['reward_history']= reward_cue['reward_history'].fillna('')
-        
+
             def augment_user_prompt_with_key_attributes(
                 sample_user_prompt,
                 task_proposal_replacement,
