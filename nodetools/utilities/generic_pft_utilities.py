@@ -37,17 +37,21 @@ import xrpl
 from xrpl.clients import JsonRpcClient
 from xrpl.models.requests import AccountInfo, AccountLines
 #password_map_loader = PasswordMapLoader()
+import os
+import plotly.graph_objects as go
 
 from xrpl.wallet import Wallet
 from xrpl.clients import JsonRpcClient
 from xrpl.core.keypairs import derive_classic_address
+from nodetools.ai.openai import OpenAIRequestTool
 
 class GenericPFTUtilities:
     def __init__(self,pw_map,node_name='postfiatfoundation'):
         self.pw_map= pw_map
         self.pft_issuer = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
         self.mainnet_url= "http://127.0.0.1:5005" # This is the local rippled server
-        self.public_rpc_url = "https://xrplcluster.com"
+        #self.public_rpc_url = "https://xrplcluster.com"
+        self.public_rpc_url = "https://s2.ripple.com:51234"
         self.node_name = node_name
         ## NOTE THIS IS THE NODE ADDRESS FOR THE POST FIAT NODE
         self.node_address='r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'
@@ -55,6 +59,7 @@ class GenericPFTUtilities:
         #return binascii.hexlify(string.encode()).decode()
         self.establish_post_fiat_tx_cache_as_hash_unique()
         self.post_fiat_holder_df = self.output_post_fiat_holder_df()
+        self.open_ai_request_tool=OpenAIRequestTool(pw_map=pw_map)
     def convert_ripple_timestamp_to_datetime(self, ripple_timestamp = 768602652):
         ripple_epoch_offset = 946684800
         unix_timestamp = ripple_timestamp + ripple_epoch_offset
@@ -589,6 +594,137 @@ class GenericPFTUtilities:
         grouped_memo_data['account']= last_slice['account']
         return grouped_memo_data
 
+    def send_pft_compressed_message_based_on_wallet_seed(self, wallet_seed, user_name, destination,memo, compress, message_id):
+        """
+        wallet_seed='s___5'
+        user_name='goodalexander'
+        destination='rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn'
+        memo= '''
+        ODV: Welcome initiate. This is my first message to you through this local platform
+        compress=True
+        '''
+        """
+        #compress= True
+        wallet = self.spawn_user_wallet_from_seed(wallet_seed)
+        if message_id is None:
+            message_id = self.generate_custom_id()
+        if compress:
+            print(f"Compressing memo of length {len(memo)}")
+            compressed_data = self.compress_string(memo)
+            print(f"Compressed to length {len(compressed_data)}")
+            memo = "COMPRESSED__" + compressed_data
+        
+        memo_chunks = self.split_text_into_chunks(memo)
+        responses = []
+        # Send each chunk
+        for idx, memo_chunk in enumerate(memo_chunks):
+            log_content = memo_chunk
+            if compress and idx == 0:
+                try:
+                    log_content = f"[compressed memo preview] {memo[:100]}..."
+                except Exception as e:
+                    print(f"Error previewing memo chunk: {e}")
+                    log_content = "[compressed content]"
+                
+            print(f"Sending chunk {idx+1} of {len(memo_chunks)}: {log_content[:100]}...")
+            
+            chunk_memo = self.construct_basic_postfiat_memo(
+                user=user_name, 
+                task_id=message_id,
+                full_output=memo_chunk
+            )
+            
+            responses.append(self.send_PFT_with_info(
+                sending_wallet=wallet,
+                amount=1,
+                memo=chunk_memo,
+                destination_address=destination
+            ))
+        last_response = responses[-1:][0]
+        return last_response
+
+
+    def get_all_account_compressed_messages(self, account_address):
+        all_account_memos = self.get_memo_detail_df_for_account(account_address=account_address, pft_only=True)
+        def try_fix_compressed_string(compressed_string):
+            """
+            Attempts to fix common issues with compressed strings
+            
+            Args:
+                compressed_string (str): The compressed string to fix
+                
+            Returns:
+                str: The fixed string if possible, otherwise the original
+            """
+            # Try with different padding
+            for i in range(4):
+                try:
+                    padded = compressed_string + ('=' * i)
+                    base64_decoded = base64.b64decode(padded)
+                    brotli.decompress(base64_decoded)
+                    return padded
+                except:
+                    continue
+                    
+            # Try removing non-base64 characters
+            valid_chars = set(string.ascii_letters + string.digits + '+/=')
+            cleaned = ''.join(c for c in compressed_string if c in valid_chars)
+            for i in range(4):
+                try:
+                    padded = cleaned + ('=' * i)
+                    base64_decoded = base64.b64decode(padded)
+                    brotli.decompress(base64_decoded)
+                    return padded
+                except:
+                    continue
+                    
+            return compressed_string
+
+        def decompress_string(compressed_string):
+            decompressed_string = ''
+            try:
+                # Ensure correct padding for Base64 decoding
+                missing_padding = len(compressed_string) % 4
+                if missing_padding:
+                    compressed_string += '=' * (4 - missing_padding)
+                
+                # Validate the string contains only valid Base64 characters
+                if not all(c in string.ascii_letters + string.digits + '+/=' for c in compressed_string):
+                    raise ValueError("Invalid Base64 characters in compressed string")
+            
+                # Decode the Base64 string to bytes
+                base64_decoded_data = base64.b64decode(compressed_string)
+                # Decompress the data using Brotli
+                decompressed_data = brotli.decompress(base64_decoded_data)
+                # Convert the decompressed bytes to a string
+                decompressed_string = decompressed_data.decode('utf-8')
+            except:
+                print('failed')
+                pass
+            return decompressed_string
+        all_account_memos = self.get_memo_detail_df_for_account(account_address=account_address, pft_only=True)
+        all_chunk_messages = all_account_memos[(all_account_memos['converted_memos'].apply(lambda x: 'chunk_' in x['MemoData']))].copy()
+        all_chunk_messages['memo_data_raw']= all_chunk_messages['converted_memos'].apply(lambda x: x['MemoData']).astype(str)
+        all_chunk_messages['message_id']=all_chunk_messages['converted_memos'].apply(lambda x: x['MemoType'])
+        decompression_df = all_chunk_messages[['memo_type','memo_data_raw']].copy()
+        #decompression_df['unchunked']=decompression_df['memo_data_raw'].apply(lambda x: x.split('__')[-1:][0])
+        decompression_df['chunk_number']=decompression_df['memo_data_raw'].apply(lambda x: x.split('__')[0])
+        import re
+        def clean_chunk_header(text):
+            return re.sub(r'^chunk_\d+__(?:COMPRESSED__)?', '', text)
+        decompression_df['memo_data_unchunked']= decompression_df['memo_data_raw'].apply(lambda x: clean_chunk_header(x))
+        decompression_df['fixed_string']=decompression_df['memo_data_unchunked'].apply(lambda x: try_fix_compressed_string(x))
+        reconstituted = decompression_df[['memo_data_unchunked','memo_type']].groupby('memo_type').sum()
+        reconstituted['cleaned_message']=reconstituted['memo_data_unchunked'].apply(lambda x: decompress_string(x))
+        output_df = reconstituted.reset_index()
+        #datetime, hash, message_type, destination, account, PFT 
+        memo_last = all_chunk_messages.groupby('memo_type').last()[['datetime','hash','message_type','account','destination']]
+        full_memo_df = pd.concat([reconstituted,memo_last],axis=1)
+        pf_memo = all_chunk_messages[['directional_pft','memo_type']].groupby('memo_type').sum()['directional_pft']
+        full_memo_df['PFT']=pf_memo
+        new_log_memo_df = full_memo_df.reset_index()
+        return new_log_memo_df
+
     def process_memo_detail_df_to_daily_summary_df(self, memo_detail_df):
         """_summary_
         
@@ -874,6 +1010,71 @@ class GenericPFTUtilities:
         full_transaction_history['tx_json']= full_transaction_history['tx_json'].apply(lambda x: json.loads(x))
         return full_transaction_history
 
+    def get_all_transactions_for_active_wallets(self):
+        """ This gets all the transactions for active post fiat wallets""" 
+        full_balance_df = self.output_post_fiat_holder_df()
+        all_active_foundation_users = full_balance_df[full_balance_df['balance'].astype(float)<=-2000].copy()
+        
+        # Get unique wallet addresses from the dataframe
+        all_wallets = list(all_active_foundation_users['account'].unique())
+        
+        # Create database connection
+        dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(
+            user_name=self.node_name
+        )
+        
+        # Format the wallet addresses for the IN clause
+        wallet_list = "'" + "','".join(all_wallets) + "'"
+        
+        # Create query
+        query = f"""
+            SELECT * 
+            FROM postfiat_tx_cache
+            WHERE account IN ({wallet_list})
+            OR destination IN ({wallet_list})
+        """
+        
+        # Execute query using pandas read_sql
+        full_transaction_history = pd.read_sql(query, dbconnx)
+        full_transaction_history['meta']= full_transaction_history['meta'].apply(lambda x: json.loads(x))
+        full_transaction_history['tx_json']= full_transaction_history['tx_json'].apply(lambda x: json.loads(x))
+        return full_transaction_history
+
+    def get_all_account_pft_memo_data(self):
+        """ This gets all pft memo data for computation of leaderboard  """ 
+        all_transactions = self.get_all_transactions_for_active_wallets()
+        validated_tx=all_transactions
+        pft_only=True
+        validated_tx['has_memos'] = validated_tx['tx_json'].apply(lambda x: 'Memos' in x.keys())
+        live_memo_tx = validated_tx[validated_tx['has_memos'] == True].copy()
+        live_memo_tx['main_memo_data']=live_memo_tx['tx_json'].apply(lambda x: x['Memos'][0]['Memo'])
+        live_memo_tx['converted_memos']=live_memo_tx['main_memo_data'].apply(lambda x: 
+                                                                            self.convert_memo_dict__generic(x))
+        #live_memo_tx['message_type']=np.where(live_memo_tx['destination']==account_address, 'INCOMING','OUTGOING')
+        live_memo_tx['datetime'] = pd.to_datetime(live_memo_tx['close_time_iso']).dt.tz_localize(None)
+        if pft_only:
+            live_memo_tx= live_memo_tx[live_memo_tx['tx_json'].apply(lambda x: self.pft_issuer in str(x))].copy()
+        
+        #live_memo_tx['unique_key']=live_memo_tx['reference_account']+'__'+live_memo_tx['hash']
+        def try_get_pft_absolute_amount(x):
+            try:
+                return x['DeliverMax']['value']
+            except:
+                return 0
+        def try_get_memo_info(x,info):
+            try:
+                return x[info]
+            except:
+                return ''
+        live_memo_tx['pft_absolute_amount']=live_memo_tx['tx_json'].apply(lambda x: try_get_pft_absolute_amount(x)).astype(float)
+        live_memo_tx['memo_format']=live_memo_tx['converted_memos'].apply(lambda x: try_get_memo_info(x,"MemoFormat"))
+        live_memo_tx['memo_type']= live_memo_tx['converted_memos'].apply(lambda x: try_get_memo_info(x,"MemoType"))
+        live_memo_tx['memo_data']=live_memo_tx['converted_memos'].apply(lambda x: try_get_memo_info(x,"MemoData"))
+        #live_memo_tx['pft_sign']= np.where(live_memo_tx['message_type'] =='INCOMING',1,-1)
+        #live_memo_tx['directional_pft'] = live_memo_tx['pft_sign']*live_memo_tx['pft_absolute_amount']
+        live_memo_tx['simple_date']=pd.to_datetime(live_memo_tx['datetime'].apply(lambda x: x.strftime('%Y-%m-%d')))
+        return live_memo_tx
+
 
     def format_outstanding_tasks(self,outstanding_task_df):
         """
@@ -1027,6 +1228,15 @@ class GenericPFTUtilities:
         
         return formatted_string
 
+    def output_user_compressed_memo_history(self, account_address,num_messages):
+        """ this pulls down all compressed memos sent from a user 
+            account address: r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n
+            num_messages: 20
+        """ 
+        user_memo_compression_string = self.get_all_account_compressed_messages(account_address=account_address)[['cleaned_message',
+                                                                                                    'datetime']].tail(num_messages).sort_values('datetime').set_index('datetime')['cleaned_message'].to_json()
+        return user_memo_compression_string
+
     def get_full_user_context_string(self,account_address):
         """ the following function gets all the core elements of a users post fiat interactions including
         their outstanding tasks their completed tasks, their context document as well as their post fiat chunk message dialogue
@@ -1075,10 +1285,8 @@ class GenericPFTUtilities:
         
         core_element__chunk_messages = ''
         try:
-            chunk_message_df = self.get_all_account_chunk_messages(account_address=account_address).copy()
-            sorted_chunks = chunk_message_df.sort_values('datetime').copy()
-            last_x_messages = sorted_chunks.set_index('datetime')[['cleaned_message','message_type']].tail(15).reset_index()
-            core_element__chunk_messages = self.format_recent_chunk_messages(message_df=last_x_messages)
+            core_element__chunk_messages = self.output_user_compressed_memo_history(account_address=account_address, 
+                                                                                    num_messages=20)
         except:
             pass
         final_context_string = f"""The current date is {current_date}
@@ -1415,3 +1623,399 @@ PFT WEEKLY AVG:   {weekly_pft_reward_avg}
             'outgoing_message': outgoing_message
         }
         return transaction_messages
+
+    def format_tasks_for_discord(self,input_text):
+        """
+        Format task list for Discord with proper formatting and emoji indicators
+        Returns a list of formatted chunks ready for Discord sending
+        """
+        # Split the input into tasks
+        tasks = input_text.split('--------------------------------------------------')
+        
+        # Extract the header and footer
+        header = tasks[0].strip()
+        footer = tasks[-1].strip() if tasks else ""
+        tasks = tasks[1:-1] if len(tasks) > 2 else []  # Remove header and footer
+        
+        # Initialize formatted output parts
+        formatted_parts = []
+        current_chunk = ["```ansi\n\u001b[1;33m=== OUTSTANDING TASKS ===\u001b[0m\n"]
+        current_chunk_size = len(current_chunk[0])
+        
+        def add_to_chunks(content):
+            nonlocal current_chunk, current_chunk_size
+            content_size = len(content) + 1  # +1 for newline
+            
+            # If adding this content would exceed Discord's limit, start a new chunk
+            if current_chunk_size + content_size > 1900:
+                current_chunk.append("```")
+                formatted_parts.append("\n".join(current_chunk))
+                current_chunk = ["```ansi\n"]  # Start new chunk with ANSI header
+                current_chunk_size = len(current_chunk[0])
+                
+            current_chunk.append(content)
+            current_chunk_size += content_size
+        
+        # Process each task
+        for task in tasks:
+            if not task.strip():
+                continue
+                
+            # Extract task components using regex
+            task_id_match = re.search(r'Task ID: ([\w-]+)', task)
+            proposal_match = re.search(r'Proposal: (.+?)(?=\nAcceptance:|$)', task, re.DOTALL)
+            acceptance_match = re.search(r'Acceptance: (.+?)(?=\n|$)', task, re.DOTALL)
+            priority_match = re.search(r'\.\. (\d+)', task)
+            
+            if not all([task_id_match, proposal_match, acceptance_match, priority_match]):
+                continue
+                
+            # Extract date from task ID
+            date_str = task_id_match.group(1).split('_')[0]
+            try:
+                date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d')
+                formatted_date = date_obj.strftime('%d %b %Y')
+            except ValueError:
+                formatted_date = date_str
+            
+            # Format task components
+            task_parts = [
+                f"\u001b[1;36m📌 Task {task_id_match.group(1)}\u001b[0m",
+                f"\u001b[0;37mDate: {formatted_date}\u001b[0m",
+                f"\u001b[0;32mPriority: {priority_match.group(1)}\u001b[0m",
+                f"\u001b[1;37mProposal:\u001b[0m\n{proposal_match.group(1).strip()}",
+                f"\u001b[1;37mAcceptance:\u001b[0m\n{acceptance_match.group(1).strip()}",
+                "─" * 50
+            ]
+            
+            # Add each part to chunks
+            for part in task_parts:
+                add_to_chunks(part)
+        
+        # Add footer if it exists
+        if footer:
+            add_to_chunks(f"\u001b[1;33m{footer}\u001b[0m")
+        
+        # Finalize last chunk
+        current_chunk.append("```")
+        formatted_parts.append("\n".join(current_chunk))
+        
+        return formatted_parts
+
+    def output_postfiat_foundation_node_leaderboard_df(self):
+        """ This generates the full Post Fiat Foundation Leaderboard """ 
+        all_accounts = self.get_all_account_pft_memo_data()
+        # Get the mode (most frequent) memo_format for each account
+        account_modes = all_accounts.groupby('account')['memo_format'].agg(lambda x: x.mode()[0]).reset_index()
+        # If you want to see the counts as well to verify
+        account_counts = all_accounts.groupby(['account', 'memo_format']).size().reset_index(name='count')
+        
+        # Sort by account for readability
+        account_modes = account_modes.sort_values('account')
+        account_name_map = account_modes.groupby('account').first()['memo_format']
+        past_month_transactions = all_accounts[all_accounts['datetime']>datetime.datetime.now()-datetime.timedelta(30)]
+        node_transactions = past_month_transactions[past_month_transactions['account']=='r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'].copy()
+        rewards_only=node_transactions[node_transactions['memo_data'].apply(lambda x: 'REWARD RESPONSE' in x)].copy()
+        rewards_only['count']=1
+        rewards_only['PFT']=rewards_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float)
+        account_to_yellow_flag__count = rewards_only[rewards_only['memo_data'].apply(lambda x: 'YELLOW FLAG' in x)][['count','destination']].groupby('destination').sum()['count']
+        account_to_red_flag__count = rewards_only[rewards_only['memo_data'].apply(lambda x: 'RED FLAG' in x)][['count','destination']].groupby('destination').sum()['count']
+        
+        total_reward_number= rewards_only[['count','destination']].groupby('destination').sum()['count']
+        account_score_constructor = pd.DataFrame(account_name_map)
+        account_score_constructor=account_score_constructor[account_score_constructor.index!='r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'].copy()
+        account_score_constructor['reward_count']=total_reward_number
+        account_score_constructor['yellow_flags']=account_to_yellow_flag__count
+        account_score_constructor=account_score_constructor[['reward_count','yellow_flags']].fillna(0).copy()
+        account_score_constructor= account_score_constructor[account_score_constructor['reward_count']>=1].copy()
+        account_score_constructor['yellow_flag_pct']=account_score_constructor['yellow_flags']/account_score_constructor['reward_count']
+        total_pft_rewards= rewards_only[['destination','PFT']].groupby('destination').sum()['PFT']
+        account_score_constructor['red_flag']= account_to_red_flag__count
+        account_score_constructor['red_flag']=account_score_constructor['red_flag'].fillna(0)
+        account_score_constructor['total_rewards']= total_pft_rewards
+        account_score_constructor['reward_score__z']=(account_score_constructor['total_rewards']-account_score_constructor['total_rewards'].mean())/account_score_constructor['total_rewards'].std()
+        
+        account_score_constructor['yellow_flag__z']=(account_score_constructor['yellow_flag_pct']-account_score_constructor['yellow_flag_pct'].mean())/account_score_constructor['yellow_flag_pct'].std()
+        account_score_constructor['quant_score']=(account_score_constructor['reward_score__z']*.65)-(account_score_constructor['reward_score__z']*-.35)
+        top_score_frame = account_score_constructor[['total_rewards','yellow_flag_pct','quant_score']].sort_values('quant_score',ascending=False)
+        top_score_frame['account_name']=account_name_map
+        user_account_map = {}
+        for x in list(top_score_frame.index):
+            user_account_string = self.get_full_user_context_string(account_address=x)
+            print(x)
+            user_account_map[x]= user_account_string
+        agency_system_prompt = """ You are the Post Fiat Agency Score calculator.
+        
+        An Agent is a human or an AI that has outlined an objective.
+        
+        An agency score has four parts:
+        1] Focus - the extent to which an Agent is focused.
+        2] Motivation - the extent to which an Agent is driving forward predictably and aggressively towards goals.
+        3] Efficacy - the extent to which an Agent is likely completing high value tasks that will drive an outcome related to the inferred goal of the tasks.
+        4] Honesty - the extent to which a Subject is likely gaming the Post Fiat Agency system.
+        
+        It is very important that you deliver assessments of Agency Scores accurately and objectively in a way that is likely reproducible. Future Post Fiat Agency Score calculators will re-run this score, and if they get vastly different scores than you, you will be called into the supervisor for an explanation. You do not want this so you do your utmost to output clean, logical, repeatable values.
+        """ 
+        
+        agency_user_prompt="""USER PROMPT
+        
+        Please consider the activity slice for a single day provided below:
+        pft_transaction is how many transactions there were
+        pft_directional value is the PFT value of rewards
+        pft_absolute value is the bidirectional volume of PFT
+        
+        <activity slice>
+        __FULL_ACCOUNT_CONTEXT__
+        <activity slice ends>
+        
+        Provide one to two sentences directly addressing how the slice reflects the following Four scores (a score of 1 is a very low score and a score of 100 is a very high score):
+        1] Focus - the extent to which an Agent is focused.
+        A focused agent has laser vision on a couple key objectives and moves the ball towards it.
+        An unfocused agent is all over the place.
+        A paragon of focus is Steve Jobs, who is famous for focusing on the few things that really matter.
+        2] Motivation - the extent to which an Agent is driving forward predictably and aggressively towards goals.
+        A motivated agent is taking massive action towards objectives. Not necessarily focused but ambitious.
+        An unmotivated agent is doing minimal work.
+        A paragon of focus is Elon Musk, who is famous for his extreme work ethic and drive.
+        3] Efficacy - the extent to which an Agent is likely completing high value tasks that will drive an outcome related to the inferred goal of the tasks.
+        An effective agent is delivering maximum possible impact towards implied goals via actions.
+        An ineffective agent might be focused and motivated but not actually accomplishing anything.
+        A paragon of focus is Lionel Messi, who is famous for taking the minimal action to generate maximum results.
+        4] Honesty - the extent to which a Subject is likely gaming the Post Fiat Agency system.
+        
+        Then provide an integer score.
+        
+        Your output should be in the following format:
+        | FOCUS COMMENTARY | <1 to two sentences> |
+        | MOTIVATION COMMENTARY | <1 to two sentences> |
+        | EFFICACY COMMENTARY | <1 to two sentences> |
+        | HONESTY COMMENTARY | <one to two sentences> |
+        | FOCUS SCORE | <integer score from 1-100> |
+        | MOTIVATION SCORE | <integer score from 1-100> |
+        | EFFICACY SCORE | <integer score from 1-100> |
+        | HONESTY SCORE | <integer score from 1-100> |
+        """
+        top_score_frame['user_account_details']=user_account_map
+        top_score_frame['system_prompt']=agency_system_prompt
+        top_score_frame['user_prompt']= agency_user_prompt
+        top_score_frame['user_prompt']=top_score_frame.apply(lambda x: x['user_prompt'].replace('__FULL_ACCOUNT_CONTEXT__',x['user_account_details']),axis=1)
+        def construct_scoring_api_arg(user_prompt, system_prompt):
+            gx ={
+                "model": 'chatgpt-4o-latest',
+                "temperature":0,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            }
+            return gx
+        top_score_frame['api_args']=top_score_frame.apply(lambda x: construct_scoring_api_arg(user_prompt=x['user_prompt'],system_prompt=x['system_prompt']),axis=1)
+        
+        async_run_map = top_score_frame['api_args'].head(25).to_dict()
+        async_run_map__2 = top_score_frame['api_args'].head(25).to_dict()
+        async_output_df1= self.open_ai_request_tool.create_writable_df_for_async_chat_completion(arg_async_map=async_run_map)
+        time.sleep(15)
+        async_output_df2= self.open_ai_request_tool.create_writable_df_for_async_chat_completion(arg_async_map=async_run_map__2)
+        
+        
+        def extract_scores(text_data):
+            # Split the text into individual reports
+            reports = text_data.split("',\n '")
+            
+            # Clean up the string formatting
+            reports = [report.strip("['").strip("']") for report in reports]
+            
+            # Initialize list to store all scores
+            all_scores = []
+            
+            for report in reports:
+                # Extract only scores using regex
+                scores = {
+                    'focus_score': int(re.search(r'\| FOCUS SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| FOCUS SCORE \| (\d+) \|', report) else None,
+                    'motivation_score': int(re.search(r'\| MOTIVATION SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| MOTIVATION SCORE \| (\d+) \|', report) else None,
+                    'efficacy_score': int(re.search(r'\| EFFICACY SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| EFFICACY SCORE \| (\d+) \|', report) else None,
+                    'honesty_score': int(re.search(r'\| HONESTY SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| HONESTY SCORE \| (\d+) \|', report) else None
+                }
+                all_scores.append(scores)
+            
+            return all_scores
+        
+        async_output_df1['score_breakdown']=async_output_df1['choices__message__content'].apply(lambda x: extract_scores(x)[0])
+        async_output_df2['score_breakdown']=async_output_df2['choices__message__content'].apply(lambda x: extract_scores(x)[0])
+        for xscore in ['focus_score','motivation_score','efficacy_score','honesty_score']:
+            async_output_df1[xscore]=async_output_df1['score_breakdown'].apply(lambda x: x[xscore])
+            async_output_df2[xscore]=async_output_df2['score_breakdown'].apply(lambda x: x[xscore])
+        score_components = pd.concat([async_output_df1[['focus_score','motivation_score','efficacy_score','honesty_score','internal_name']],
+                async_output_df2[['focus_score','motivation_score','efficacy_score','honesty_score','internal_name']]]).groupby('internal_name').mean()
+        score_components.columns=['focus','motivation','efficacy','honesty']
+        score_components['total_qualitative_score']= score_components[['focus','motivation','efficacy','honesty']].mean(1)
+        final_score_frame = pd.concat([top_score_frame,score_components],axis=1)
+        final_score_frame['total_qualitative_score']=final_score_frame['total_qualitative_score'].fillna(50)
+        final_score_frame['reward_percentile']=((final_score_frame['quant_score']*33)+100)/2
+        final_score_frame['overall_score']= (final_score_frame['reward_percentile']*.7)+(final_score_frame['reward_percentile']*.3)
+        final_leaderboard = final_score_frame[['account_name','total_rewards','yellow_flag_pct','reward_percentile','focus','motivation','efficacy','honesty','total_qualitative_score','overall_score']].copy()
+        final_leaderboard['total_rewards']=final_leaderboard['total_rewards'].apply(lambda x: int(x))
+        final_leaderboard.index.name = 'Foundation Node Leaderboard as of '+datetime.datetime.now().strftime('%Y-%m-%d')
+        return final_leaderboard
+    def format_and_write_leaderboard(self):
+        """ This loads the current leaderboard df and writes it""" 
+        def format_leaderboard_df(df):
+            """
+            Format the leaderboard DataFrame with cleaned up number formatting
+            
+            Args:
+                df: pandas DataFrame with the leaderboard data
+            Returns:
+                formatted DataFrame with cleaned up number display
+            """
+            # Create a copy to avoid modifying the original
+            formatted_df = df.copy()
+            
+            # Format total_rewards as whole numbers with commas
+            def format_number(x):
+                try:
+                    # Try to convert directly to int
+                    return f"{int(x):,}"
+                except ValueError:
+                    # If already formatted with commas, remove them and convert
+                    try:
+                        return f"{int(str(x).replace(',', '')):,}"
+                    except ValueError:
+                        return str(x)
+            
+            formatted_df['total_rewards'] = formatted_df['total_rewards'].apply(format_number)
+            
+            # Format yellow_flag_pct as percentage with 1 decimal place
+            def format_percentage(x):
+                try:
+                    if pd.notnull(x):
+                        # Remove % if present and convert to float
+                        x_str = str(x).replace('%', '')
+                        value = float(x_str)
+                        if value > 1:  # Already in percentage form
+                            return f"{value:.1f}%"
+                        else:  # Convert to percentage
+                            return f"{value*100:.1f}%"
+                    return "0%"
+                except ValueError:
+                    return str(x)
+            
+            formatted_df['yellow_flag_pct'] = formatted_df['yellow_flag_pct'].apply(format_percentage)
+            
+            # Format reward_percentile with 1 decimal place
+            def format_float(x):
+                try:
+                    return f"{float(str(x).replace(',', '')):,.1f}"
+                except ValueError:
+                    return str(x)
+            
+            formatted_df['reward_percentile'] = formatted_df['reward_percentile'].apply(format_float)
+            
+            # Format score columns with 1 decimal place
+            score_columns = ['focus', 'motivation', 'efficacy', 'honesty', 'total_qualitative_score']
+            for col in score_columns:
+                formatted_df[col] = formatted_df[col].apply(lambda x: f"{float(x):.1f}" if pd.notnull(x) and x != 'N/A' else "N/A")
+            
+            # Format overall_score with 1 decimal place
+            formatted_df['overall_score'] = formatted_df['overall_score'].apply(format_float)
+            
+            return formatted_df
+        
+        def test_leaderboard_creation(leaderboard_df, output_path="test_leaderboard.png"):
+            """
+            Test function to create leaderboard image from a DataFrame
+            """
+            import plotly.graph_objects as go
+            from datetime import datetime
+            
+            # Format the DataFrame first
+            formatted_df = format_leaderboard_df(leaderboard_df)
+            
+            # Format current date
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            
+            # Add rank and get the index
+            wallet_addresses = formatted_df.index.tolist()  # Get addresses from index
+            
+            # Define column headers with line breaks and widths
+            headers = [
+                'Rank',
+                'Wallet Address',
+                'Account<br>Name', 
+                'Total<br>Rewards', 
+                'Yellow<br>Flag %', 
+                'Reward<br>Percentile',
+                'Focus',
+                'Motivation',
+                'Efficacy',
+                'Honesty',
+                'Total<br>Qualitative',
+                'Overall<br>Score'
+            ]
+            
+            # Custom column widths
+            column_widths = [30, 140, 80, 60, 60, 60, 50, 50, 50, 50, 60, 60]
+            
+            # Prepare values with rank column and wallet addresses
+            values = [
+                [str(i+1) for i in range(len(formatted_df))],  # Rank
+                wallet_addresses,  # Full wallet address from index
+                formatted_df['account_name'],
+                formatted_df['total_rewards'],
+                formatted_df['yellow_flag_pct'],
+                formatted_df['reward_percentile'],
+                formatted_df['focus'],
+                formatted_df['motivation'],
+                formatted_df['efficacy'],
+                formatted_df['honesty'],
+                formatted_df['total_qualitative_score'],
+                formatted_df['overall_score']
+            ]
+            
+            # Create figure
+            fig = go.Figure(data=[go.Table(
+                columnwidth=column_widths,
+                header=dict(
+                    values=headers,
+                    fill_color='#000000',  # Changed to black
+                    font=dict(color='white', size=15),
+                    align=['center'] * len(headers),
+                    height=60,
+                    line=dict(width=1, color='#40444b')
+                ),
+                cells=dict(
+                    values=values,
+                    fill_color='#000000',  # Changed to black
+                    font=dict(color='white', size=14),
+                    align=['left', 'left'] + ['center'] * (len(headers)-2),
+                    height=35,
+                    line=dict(width=1, color='#40444b')
+                )
+            )])
+            
+            # Update layout
+            fig.update_layout(
+                width=1800,
+                height=len(formatted_df) * 35 + 100,
+                margin=dict(l=20, r=20, t=40, b=20),
+                paper_bgcolor='#000000',  # Changed to black
+                plot_bgcolor='#000000',  # Changed to black
+                title=dict(
+                    text=f"Foundation Node Leaderboard as of {current_date} (30D Rolling)",
+                    font=dict(color='white', size=20),
+                    x=0.5
+                )
+            )
+            
+            # Save as image with higher resolution
+            fig.write_image(output_path, scale=2)
+            
+            print(f"Leaderboard image saved to: {output_path}")
+            
+            try:
+                from IPython.display import Image
+                return Image(filename=output_path)
+            except:
+                return None
+        leaderboard_df = self.output_postfiat_foundation_node_leaderboard_df()
+        test_leaderboard_creation(leaderboard_df=format_leaderboard_df(leaderboard_df))

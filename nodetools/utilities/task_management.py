@@ -28,6 +28,18 @@ from nodetools.utilities.db_manager import DBConnectionManager
 from nodetools.chatbots.personas.odv import odv_system_prompt
 import datetime
 import pytz
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
+import matplotlib.ticker as ticker
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
+import matplotlib.ticker as ticker
 
 class PostFiatTaskGenerationSystem:
     def __init__(self,pw_map):
@@ -427,124 +439,6 @@ class PostFiatTaskGenerationSystem:
             extracted_values = extract_values(xo['choices__message__content'][0])
         task_string_to_send = 'PROPOSED PF ___ '+' .. '.join(extracted_values)
         return task_string_to_send
-
-
-    def process_outstanding_task_cue__legacy(self):
-        """This loads task requests, processes them, and sends the resulting workflows out."""
-        all_node_transactions = self.generic_pft_utilities.get_all_cached_transactions_related_to_account(self.node_address).copy()
-        all_node_memo_transactions = self.generic_pft_utilities.get_memo_detail_df_for_account(account_address=self.node_address, pft_only=False).copy()
-        postfiat_cue = self.convert_all_node_memo_transactions_to_required_pft_generation(all_node_memo_transactions=all_node_memo_transactions).copy()
-        pft_generation_to_work = postfiat_cue[postfiat_cue['requires_work'] == True].copy()
-        all_accounts = list(pft_generation_to_work['account'].unique())
-        context_mapper = {}
-        for xaccount in all_accounts:
-            context_mapper[xaccount] = self.generic_pft_utilities.get_full_user_context_string(account_address=xaccount)
-        pft_generation_to_work['full_user_context'] = pft_generation_to_work['account'].map(context_mapper)
-        if len(pft_generation_to_work) > 0:
-            pft_generation_to_work['first_n_tasks_to_select'] = pft_generation_to_work.apply(
-                lambda x: self.phase_1_a__n_post_fiat_task_generator(
-                    full_user_context_replace=x['most_recent_status'],
-                    user_request=x['full_user_context'],
-                    n_copies=3
-                ), axis=1)
-            pft_generation_to_work['task_string'] = pft_generation_to_work['first_n_tasks_to_select'].apply(lambda x: x['n_task_output'])
-
-            def convert_task_string_into_api_args(task_string_input, full_user_context_input):
-                system_prompt = phase_1_b__system
-                user_prompt = phase_1_b__user.replace('___SELECTION_OPTION_REPLACEMENT___', task_string_input).replace('___FULL_USER_CONTEXT_REPLACE___', full_user_context_input)
-                api_args = {
-                    "model": self.default_model,
-                    "temperature":0,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ]}
-                return api_args
-
-            pft_generation_to_work['final_api_arg'] = pft_generation_to_work.apply(
-                lambda x: convert_task_string_into_api_args(
-                    task_string_input=x['task_string'],
-                    full_user_context_input=x['full_user_context']
-                ), axis=1)
-            selection_mapper = pft_generation_to_work.set_index('hash')['final_api_arg'].to_dict()
-            async_df = self.openai_request_tool.create_writable_df_for_async_chat_completion(arg_async_map=selection_mapper)
-            async_df['output_selection'] = async_df['choices__message__content'].apply(
-                lambda x: int(x.split('BEST OUTPUT |')[-1].replace('|', '').strip()))
-            selected_choice = async_df.groupby('internal_name').first()['output_selection']
-            pft_generation_to_work['best_choice'] = pft_generation_to_work['hash'].map(selected_choice)
-            pft_generation_to_work['df_to_extract'] = pft_generation_to_work['first_n_tasks_to_select'].apply(lambda x: x['full_api_output'])
-            pft_generation_to_work['task_string'] = pft_generation_to_work['first_n_tasks_to_select'].apply(lambda x: x['n_task_output'])
-            pft_generation_to_work['best_choice_string'] = pft_generation_to_work['best_choice'].apply(lambda x: 'OUTPUT ' + str(x))
-
-            def get_output_map_for_output_value(choice_string, df_to_extract):
-                # choice_string = 'OUTPUT 3'
-                output_map = {}
-                simple_string = 'Update and review your context document and ensure it is populated'
-                simple_reward = 50
-                try:
-                    selection_df = df_to_extract[df_to_extract['classification'] == choice_string]
-                    simple_string = list(selection_df['simplified_string'])[0]
-                    simple_reward = float(list(selection_df['value'])[0])
-                except:
-                    pass
-                output_map = {'task': simple_string, 'reward': simple_reward}
-                return output_map
-
-            pft_generation_to_work['task_map'] = pft_generation_to_work.apply(
-                lambda x: get_output_map_for_output_value(x['best_choice_string'], x['df_to_extract']), axis=1)
-            pft_generation_to_work['task_string_to_send'] = 'PROPOSED PF ___ ' + pft_generation_to_work['task_map'].apply(lambda x: x['task'])
-            pft_generation_to_work['memo_to_send'] = pft_generation_to_work.apply(
-                lambda x: self.generic_pft_utilities.construct_standardized_xrpl_memo(
-                    memo_data=x['task_string_to_send'],
-                    memo_format=x['memo_format'],
-                    memo_type=x['memo_type']
-                ), axis=1)
-            rows_to_work = list(pft_generation_to_work.index)
-
-            for xrow in rows_to_work:
-                slicex = pft_generation_to_work.loc[xrow]
-                memo_to_send = slicex.loc['memo_to_send']
-                pft_user_account = slicex.loc['user_account']
-                destination_address = slicex.loc['user_account']
-                plain_english_text = slicex.loc['task_string_to_send']
-                print(plain_english_text)
-                if 'Update and review your context document' in plain_english_text:
-                    print('invalid')
-                    try:
-                        # Generate new task using generate_o1_task_one_shot_version
-                        user_account = slicex.loc['user_account']
-                        user_request = slicex.loc['full_user_context']
-                        # Generate task string
-                        task_string_to_send = self.generate_o1_task_one_shot_version(
-                            model_version='o1',
-                            user_account=user_account,
-                            task_string_input=user_request
-                        )
-                        # Create memo using the output string and relevant details from the row
-                        memo_to_send = self.generic_pft_utilities.construct_standardized_xrpl_memo(
-                            memo_data=task_string_to_send,
-                            memo_format=slicex.loc['memo_format'],
-                            memo_type=slicex.loc['memo_type']
-                        )
-                        # Send it to the user
-                        node_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=self.node_seed)
-                        self.generic_pft_utilities.send_PFT_with_info(
-                            sending_wallet=node_wallet,
-                            amount=1,
-                            memo=memo_to_send,
-                            destination_address=destination_address
-                        )
-                    except Exception as e:
-                        print(f"Error in generating o1 task: {e}")
-                if 'Update and review your context document' not in plain_english_text:
-                    print('sending')
-                    node_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=self.node_seed)
-                    self.generic_pft_utilities.send_PFT_with_info(
-                        sending_wallet=node_wallet,
-                        amount=1,
-                        memo=memo_to_send,
-                        destination_address=destination_address
-                    )
 
     def process_outstanding_task_cue(self):
         """
@@ -1185,6 +1079,7 @@ _________________________________
         <FULL USER CONTEXT STRING ENDS HERE>
         
         You are the world's most effective product manager helping the user reach the ODV mandate.
+        
         You are to ingest the user's message history recent task generation and schedule to output
         a suggested course of action for the next 30 minutes. Be careful not to tell the user to do 
         something that conflicts with his schedule. For example if it's 9 pm if you tell the user to do a workflow
@@ -1199,6 +1094,8 @@ _________________________________
         It's acceptable to suggest that the user update their context document, request new Post Fiat (PFT) tasks 
         from the system that align with the overall Strategy (If the current PFT task cue has the wrong 
         tasks in it - this could include requesting new tasks or refusing existing tasks), or focus on implementing tasks in their current cue.
+
+        Output your analysis in the most emotionally intense and persuasive way possible to maximize user motivation. 
         
         Keep your text to under 2000 characters to avoid overwhelming the user
                 """
@@ -1399,3 +1296,120 @@ _________________________________
                                                         user_prompt=user_prompt)
         o1_coaching_string = o1_request.choices[0].message.content
         return o1_coaching_string
+
+    def output_pft_KPI_graph_for_address(self,user_wallet = 'r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n'):
+        
+        account_hist = self.generic_pft_utilities.get_memo_detail_df_for_account(account_address='r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n')
+        full_pft_history= account_hist[account_hist['memo_data'].apply(lambda x: 'REWARD' in x)][['datetime','pft_absolute_amount']].set_index('datetime').resample('H').sum()#.rolling(24).mean().plot()
+        
+        hourly_append = pd.DataFrame(pd.date_range(list(full_pft_history.tail(1).index)[0], datetime.datetime.now(),freq='H'))
+        hourly_append.columns=['datetime']
+        hourly_append['pft_absolute_amount']=0
+        full_hourly_hist = pd.concat([full_pft_history,hourly_append.set_index('datetime')['pft_absolute_amount']]).groupby('datetime').sum()
+        full_hourly_hist['24H']=full_hourly_hist['pft_absolute_amount'].rolling(24).mean()
+        full_hourly_hist['3D']=full_hourly_hist['pft_absolute_amount'].rolling(24*3).mean()
+        full_hourly_hist['1W']=full_hourly_hist['pft_absolute_amount'].rolling(24*7).mean()
+        full_hourly_hist['1M']=full_hourly_hist['pft_absolute_amount'].rolling(24*30).mean()
+        full_hourly_hist['MoM']=full_hourly_hist['1M']-full_hourly_hist['1M'].shift(30)
+        
+        
+        
+        def plot_pft_with_oscillator(df, figure_size=(15, 8)):
+            # Create figure with two subplots
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figure_size, height_ratios=[3, 1], gridspec_kw={'hspace': 0.2})
+            
+            # Main chart colors and styles
+            line_styles = {
+                '1M':  {'color': '#2C3E50', 'alpha': 1.0, 'lw': 2.5, 'zorder': 5},
+                '1W':  {'color': '#27AE60', 'alpha': 0.9, 'lw': 1.8, 'zorder': 4},
+                '3D':  {'color': '#E67E22', 'alpha': 0.8, 'lw': 1.5, 'zorder': 3},
+                '24H': {'color': '#3498DB', 'alpha': 0.6, 'lw': 1.0, 'zorder': 2}
+            }
+            
+            # Plot main chart
+            for period, style in line_styles.items():
+                ax1.plot(df.index, df[period], 
+                        label=period.replace('H', ' Hours').replace('D', ' Days')
+                                .replace('W', ' Week').replace('M', ' Month'),
+                        **style)
+            
+            # Format main chart
+            ax1.grid(True, color='#E6E6E6', linestyle='-', alpha=0.7, zorder=1)
+            ax1.spines['top'].set_visible(False)
+            ax1.spines['right'].set_visible(False)
+            ax1.spines['left'].set_color('#CCCCCC')
+            ax1.spines['bottom'].set_color('#CCCCCC')
+            
+            # Add annotations to main chart
+            max_point = df['24H'].max()
+            monthly_avg = df['1M'].mean()
+            
+            ax1.annotate(f'Peak: {max_point:.0f}',
+                        xy=(0.99, 0.99),
+                        xytext=(0, 0),
+                        xycoords='axes fraction',
+                        textcoords='offset points',
+                        ha='right',
+                        va='top',
+                        fontsize=10,
+                        color='#666666')
+            
+            ax1.axhline(y=monthly_avg, color='#2C3E50', linestyle='--', alpha=0.3)
+            ax1.annotate(f'Monthly Average: {monthly_avg:.1f}',
+                        xy=(0.01, monthly_avg),
+                        xytext=(5, 5),
+                        textcoords='offset points',
+                        fontsize=9,
+                        color='#666666')
+            
+            # Add legend to main chart
+            ax1.legend(loc='upper right', frameon=True, framealpha=0.9, 
+                    edgecolor='#CCCCCC', fontsize=10, ncol=4)
+            
+            # Plot oscillator
+            zero_line = ax2.axhline(y=0, color='#666666', linestyle='-', alpha=0.3)
+            mom_line = ax2.fill_between(df.index, df['MoM'], 
+                                    where=(df['MoM'] >= 0),
+                                    color='#27AE60', alpha=0.6)
+            mom_line_neg = ax2.fill_between(df.index, df['MoM'], 
+                                        where=(df['MoM'] < 0),
+                                        color='#E74C3C', alpha=0.6)
+            
+            # Format oscillator
+            ax2.grid(True, color='#E6E6E6', linestyle='-', alpha=0.7)
+            ax2.spines['top'].set_visible(False)
+            ax2.spines['right'].set_visible(False)
+            ax2.spines['left'].set_color('#CCCCCC')
+            ax2.spines['bottom'].set_color('#CCCCCC')
+            
+            # Format both charts' axes
+            for ax in [ax1, ax2]:
+                ax.xaxis.set_major_formatter(DateFormatter('%b %d'))
+                ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: format(int(x), ',')))
+                plt.setp(ax.get_xticklabels(), rotation=0)
+            
+            # Set y-axis limits
+            ax1.set_ylim(bottom=0, top=df['24H'].max() * 1.1)
+            
+            # Labels
+            ax2.set_ylabel('MoM Δ', fontsize=10)
+            ax1.set_ylabel('Hourly PFT Generation', fontsize=10)
+            
+            # Add title only to top chart
+            ax1.set_title('PFT Rewards Analysis', pad=20, fontsize=16, fontweight='bold')
+            
+            # Adjust layout
+            plt.tight_layout()
+            
+            return fig, (ax1, ax2)
+        
+        # Usage:
+        fig, (ax1, ax2) = plot_pft_with_oscillator(full_hourly_hist)
+        plt.show()
+        
+        # Save with high resolution
+        plt.savefig(f'pft_rewards__{user_wallet}.png', 
+                    dpi=300, 
+                    bbox_inches='tight', 
+                    facecolor='white',
+                    pad_inches=0.1)

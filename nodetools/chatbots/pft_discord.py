@@ -22,7 +22,7 @@ from nodetools.chatbots.personas.odv import odv_system_prompt
 import asyncio
 from datetime import datetime, time
 import pytz
-
+import datetime
 password_map_loader = PasswordMapLoader()
 open_ai_request_tool = OpenAIRequestTool(pw_map=password_map_loader.pw_map)
 
@@ -201,7 +201,7 @@ class MyClient(discord.Client):
             view.add_item(select)
 
             # Send the message with the dropdown menu
-            await interaction.response.send_message("Please choose a task to accept:", view=view)
+            await interaction.response.send_message("Please choose a task to accept:", view=view, ephemeral=True)
         
         @self.tree.command(name="pf_refuse", description="Refuse tasks")
         async def pf_refuse_menu(interaction: discord.Interaction):
@@ -313,7 +313,7 @@ class MyClient(discord.Client):
             except Exception as e:
                 await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
 
-        @client.tree.command(name="pf_log", description="Send a long message to the remembrancer wallet")
+        @self.tree.command(name="pf_log", description="Send a long message to the remembrancer wallet")
         async def pf_remembrancer(interaction: discord.Interaction, message: str):
             user_id = interaction.user.id
             
@@ -332,13 +332,15 @@ class MyClient(discord.Client):
             await interaction.response.defer(ephemeral=True)
 
             try:
+                remembrancer = 'rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn'
                 # Call the send_PFT_chunk_message__seed_based function
-                response = generic_pft_utilities.send_PFT_chunk_message__seed_based(
-                    wallet_seed=seed,
-                    user_name=user_name,
-                    full_text=message,
-                    destination_address=remembrancer  # Use the global remembrancer address
-                )
+                ### RETURN TO wallet_seed, user_name, destination,memo, compress
+                response = generic_pft_utilities.send_pft_compressed_message_based_on_wallet_seed(wallet_seed=seed, 
+                                                                                                  user_name=user_name, 
+                                                                                                  destination=remembrancer,
+                                                                                                  memo = message, message_id=None,
+                                                                                                  compress=True)
+                
 
                 # Extract transaction information
                 transaction_info = generic_pft_utilities.extract_transaction_info_from_response_object(response=response)
@@ -351,6 +353,102 @@ class MyClient(discord.Client):
                 await interaction.followup.send(response_message, ephemeral=True)
             except Exception as e:
                 await interaction.followup.send(f"An error occurred while sending the message: {str(e)}", ephemeral=True)
+        
+        @self.tree.command(name="pf_chart", description="Generate a chart of your PFT rewards and metrics")
+        async def pf_chart(interaction: discord.Interaction):
+            user_id = interaction.user.id
+            
+            # Check if the user has a stored seed
+            if user_id not in self.user_seeds:
+                await interaction.response.send_message(
+                    "You must store a seed using /pf_store_seed before generating a chart.", 
+                    ephemeral=True
+                )
+                return
+
+            seed = self.user_seeds[user_id]
+            wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed)
+            wallet_address = wallet.classic_address
+
+            # Defer the response since chart generation might take time
+            await interaction.response.defer(ephemeral=True)
+
+            try:
+                # Call the charting function
+                post_fiat_task_generation_system.output_pft_KPI_graph_for_address(user_wallet=wallet_address)
+                
+                # Create the file object from the saved image
+                chart_file = discord.File(f'pft_rewards__{wallet_address}.png', filename='pft_chart.png')
+                
+                # Create an embed for better formatting
+                embed = discord.Embed(
+                    title="PFT Rewards Analysis",
+                    color=discord.Color.blue()
+                )
+                
+                # Add the chart image to the embed
+                embed.set_image(url="attachment://pft_chart.png")
+                
+                # Send the embed with the chart
+                await interaction.followup.send(
+                    file=chart_file,
+                    embed=embed,
+                    ephemeral=True
+                )
+                
+                # Clean up the file after sending
+                import os
+                os.remove(f'pft_rewards__{wallet_address}.png')
+
+            except Exception as e:
+                await interaction.followup.send(
+                    f"An error occurred while generating your PFT chart: {str(e)}", 
+                    ephemeral=True
+                )
+
+        @self.tree.command(
+            name="pf_leaderboard", 
+            description="Display the Post Fiat Foundation Node Leaderboard"
+        )
+        async def pf_leaderboard(interaction: discord.Interaction):
+            # Check if the user has permission (matches the specific ID)
+            if interaction.user.id != 402536023483088896:
+                await interaction.response.send_message(
+                    "You don't have permission to use this command.", 
+                    ephemeral=True
+                )
+                return
+                
+            # Proceed with the command for authorized user
+            await interaction.response.defer(ephemeral=False)
+            
+            try:
+                # Generate and format the leaderboard
+                leaderboard_df = generic_pft_utilities.output_postfiat_foundation_node_leaderboard_df()
+                generic_pft_utilities.format_and_write_leaderboard()
+                
+                embed = discord.Embed(
+                    title="Post Fiat Foundation Node Leaderboard 🏆",
+                    description=f"Current Post Fiat Leaderboard",
+                    color=0x00ff00
+                )
+                
+                file = discord.File("test_leaderboard.png", filename="leaderboard.png")
+                embed.set_image(url="attachment://leaderboard.png")
+                
+                await interaction.followup.send(
+                    embed=embed, 
+                    file=file
+                )
+                
+                # Clean up
+                import os
+                os.remove("test_leaderboard.png")
+                
+            except Exception as e:
+                await interaction.followup.send(
+                    f"An error occurred while generating the leaderboard: {str(e)}"
+                )
 
         @self.tree.command(name="pf_outstanding", description="Show your outstanding tasks and verification tasks")
         async def pf_outstanding(interaction: discord.Interaction):
@@ -358,7 +456,10 @@ class MyClient(discord.Client):
             
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
-                await interaction.response.send_message("You must store a seed using /pf_store_seed before viewing outstanding tasks.", ephemeral=True)
+                await interaction.response.send_message(
+                    "You must store a seed using /pf_store_seed before viewing outstanding tasks.", 
+                    ephemeral=True
+                )
                 return
 
             seed = self.user_seeds[user_id]
@@ -369,31 +470,24 @@ class MyClient(discord.Client):
             await interaction.response.defer(ephemeral=True)
 
             try:
+                # Get the unformatted output message
                 output_message = generic_pft_utilities.create_full_outstanding_pft_string(account_address=wallet_address)
                 
-                # Split the message into chunks if it's too long
-                chunks = []
-                while len(output_message) > 0:
-                    if len(output_message) > 1900:
-                        chunk = output_message[:1900]
-                        last_newline = chunk.rfind('\n')
-                        if last_newline != -1:
-                            chunk = output_message[:last_newline]
-                        chunks.append(f"```\n{chunk}\n```")
-                        output_message = output_message[len(chunk):]
-                    else:
-                        chunks.append(f"```\n{output_message}\n```")
-                        output_message = ""
-
+                # Format the message using the new formatting function
+                formatted_chunks = generic_pft_utilities.format_tasks_for_discord(output_message)
+                
                 # Send the first chunk
-                await interaction.followup.send(chunks[0], ephemeral=True)
+                await interaction.followup.send(formatted_chunks[0], ephemeral=True)
 
                 # Send the rest of the chunks
-                for chunk in chunks[1:]:
+                for chunk in formatted_chunks[1:]:
                     await interaction.followup.send(chunk, ephemeral=True)
 
             except Exception as e:
-                await interaction.followup.send(f"An error occurred while fetching your outstanding tasks: {str(e)}", ephemeral=True)
+                await interaction.followup.send(
+                    f"An error occurred while fetching your outstanding tasks: {str(e)}", 
+                    ephemeral=True
+                )
 
         @self.tree.command(name="xrp_send", description="Send XRP to a destination address")
         async def xrp_send(interaction: discord.Interaction):
@@ -813,11 +907,10 @@ Note: XRP wallets need 15 XRP to transact.
             
             await interaction.response.send_message(guide_text, ephemeral=True)
 
-        @self.tree.command(name="pf_my_wallet", description="Show your wallet information and recent transactions")
+        @self.tree.command(name="pf_my_wallet", description="Show your wallet information")
         async def pf_my_wallet(interaction: discord.Interaction):
             user_id = interaction.user.id
             
-            # Check if the user has a stored seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
                     "No seed found for your account. Use /pf_store_seed to store a seed first.",
@@ -827,56 +920,54 @@ Note: XRP wallets need 15 XRP to transact.
 
             try:
                 seed = self.user_seeds[user_id]
-                
-                # Spawn wallet
-                try:
-                    wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed)
-                    wallet_address = wallet.classic_address
-                except Exception as e:
-                    await interaction.response.send_message(
-                        f"Error spawning wallet: {str(e)}. Please check your seed and try again.",
-                        ephemeral=True
-                    )
-                    return
+                wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed)
+                wallet_address = wallet.classic_address
 
                 # Get account info
-                try:
-                    account_info = generic_pft_utilities.generate_basic_balance_info_string_for_account_address(account_address=wallet_address)
-                except Exception as e:
-                    await interaction.response.send_message(
-                        f"Error fetching account info: {str(e)}. The account might not be activated or there might be network issues.",
-                        ephemeral=True
-                    )
-                    return
-
+                account_info = generic_pft_utilities.generate_basic_balance_info_string_for_account_address(account_address=wallet_address)
+                
                 # Get recent messages
-                try:
-                    recent_messages = generic_pft_utilities.get_recent_messages_for_account_address(wallet_address)
-                except Exception as e:
-                    await interaction.response.send_message(
-                        f"Error fetching recent messages: {str(e)}. There might be issues with the transaction history.",
-                        ephemeral=True
-                    )
-                    return
+                recent_messages = generic_pft_utilities.get_recent_messages_for_account_address(wallet_address)
 
-                # Create an embed for better formatting
+                # Split long strings if they exceed Discord's limit
+                def truncate_field(content, max_length=1024):
+                    if len(content) > max_length:
+                        return content[:max_length-3] + "..."
+                    return content
+
+                # Create multiple embeds if needed
+                embeds = []
+                
+                # First embed with basic info
                 embed = discord.Embed(title="Your Wallet Information", color=0x00ff00)
                 embed.add_field(name="Wallet Address", value=wallet_address, inline=False)
-                embed.add_field(name="Balance Information", value=account_info, inline=False)
                 
-                # Handle incoming message
-                if recent_messages['incoming_message']:
-                    embed.add_field(name="Most Recent Incoming Transaction", value=recent_messages['incoming_message'], inline=False)
+                # Split account info into multiple fields if needed
+                if len(account_info) > 1024:
+                    parts = [account_info[i:i+1024] for i in range(0, len(account_info), 1024)]
+                    for i, part in enumerate(parts):
+                        embed.add_field(name=f"Balance Information {i+1}", value=part, inline=False)
                 else:
-                    embed.add_field(name="Most Recent Incoming Transaction", value="No recent incoming transactions", inline=False)
+                    embed.add_field(name="Balance Information", value=account_info, inline=False)
                 
-                # Handle outgoing message
-                if recent_messages['outgoing_message']:
-                    embed.add_field(name="Most Recent Outgoing Transaction", value=recent_messages['outgoing_message'], inline=False)
-                else:
-                    embed.add_field(name="Most Recent Outgoing Transaction", value="No recent outgoing transactions", inline=False)
-                
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+                embeds.append(embed)
+
+                # Second embed for transaction history if needed
+                if recent_messages['incoming_message'] or recent_messages['outgoing_message']:
+                    embed2 = discord.Embed(title="Recent Transactions", color=0x00ff00)
+                    
+                    if recent_messages['incoming_message']:
+                        incoming = truncate_field(recent_messages['incoming_message'])
+                        embed2.add_field(name="Most Recent Incoming Transaction", value=incoming, inline=False)
+                    
+                    if recent_messages['outgoing_message']:
+                        outgoing = truncate_field(recent_messages['outgoing_message'])
+                        embed2.add_field(name="Most Recent Outgoing Transaction", value=outgoing, inline=False)
+                    
+                    embeds.append(embed2)
+
+                # Send all embeds
+                await interaction.response.send_message(embeds=embeds, ephemeral=True)
             
             except Exception as e:
                 error_message = f"An unexpected error occurred: {str(e)}. Please try again later or contact support if the issue persists."
