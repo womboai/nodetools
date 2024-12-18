@@ -37,11 +37,36 @@ def update_credentials():
             print(f"\n{idx}. {cred_name}")
             print(f"   Current value: {cred_value}")
 
+        # Add delete option explanation
+        print("\nOptions:")
+        print("1-{}: Update a credential".format(len(existing_credentials)))
+        print("D: Delete a credential")
+
         # Get user selection
         while True:
             try:
-                selection = input("\nEnter the number of the credential you want to update: ")
-                
+                selection = input("\nEnter your choice (number to update, 'D' to delete): ").strip().upper()
+
+                if selection == 'D':
+                    # Handle deletion
+                    delete_idx = input("Enter the number of the credential to delete: ")
+                    try:
+                        delete_idx = int(delete_idx) - 1
+                        if 0 <= delete_idx < len(existing_credentials):
+                            to_delete = existing_credentials[delete_idx]
+                            confirm = input(f"\n⚠️  WARNING: Are you sure you want to delete '{to_delete}'? (y/N): ").strip().lower()
+                            if confirm == 'y':
+                                cm.delete_credential(to_delete)
+                                print(f"\nSuccessfully deleted credential: {to_delete}")
+                            else:
+                                print("\nDeletion cancelled.")
+                            return
+                        else:
+                            print("Invalid selection. Please try again.")
+                    except ValueError:
+                        print("Please enter a valid number.")
+                    continue
+
                 selection_idx = int(selection) - 1
                 if 0 <= selection_idx < len(existing_credentials):
                     selected_credential = existing_credentials[selection_idx]

@@ -138,6 +138,29 @@ class CredentialManager:
             cursor.execute("SELECT key FROM credentials;")
             rows = cursor.fetchall()
             return [row[0] for row in rows]
+        
+    def delete_credential(self, credential_key: str) -> bool:
+        """Delete a specific credential from the database.
+        
+        Args:
+            credential_key (str): The key of the credential to delete
+            
+        Returns:
+            bool: True if credential was deleted, False if it didn't exist
+        """
+        self._check_key_expiry()
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                DELETE FROM credentials 
+                WHERE key = ?;
+            """, (credential_key,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            if deleted:
+                print(f"Deleted credential: {credential_key}")
+            return deleted
 
     @staticmethod
     def _derive_encryption_key(password):
