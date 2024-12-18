@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from typing import Optional
 import nodetools.configuration.constants as constants
+import time 
 
 class CorbanuChatBot:
     def __init__(
@@ -58,9 +59,17 @@ class CorbanuChatBot:
         # Initialize market data
         self.angron_map = self._generate_most_recent_angron_map()
         self.fulgrim_context = self._load_fulgrim_context()
+        self.last_context_refresh = time.time()
 
         self.MAX_PER_OFFERING_REWARD_VALUE = 3000
         self.MAX_DAILY_REWARD_VALUE = 9000
+
+    def _refresh_contexts_if_needed(self, refresh_interval=300):
+        # Refresh contexts if older than refresh_interval seconds
+        if time.time() - self.last_context_refresh > refresh_interval:
+            self.angron_map = self._generate_most_recent_angron_map()
+            self.fulgrim_context = self._load_fulgrim_context()
+            self.last_context_refresh = time.time()
 
     def _generate_most_recent_angron_map(self):
         """Get most recent SPM signal data"""
@@ -100,18 +109,19 @@ class CorbanuChatBot:
             raise
 
     async def get_response_async(self, user_message: str) -> str:
-        """Process user message and return appropriate response"""
         try:
-            # Route to appropriate SPM based on content
+            # Before handling the request, ensure our contexts are current
+            self._refresh_contexts_if_needed()
+
             spm_choice = await self._determine_spm_choice(user_message)
             
             if spm_choice == "FULGRIM":
                 response = await self._get_fulgrim_response(user_message)
-            else:  # Default to ANGRON
+            else:
                 response = await self._get_angron_response(user_message)
-            
+
             return f"Corbanu Summons Synthetic Portfolio Manager {spm_choice} To Assist:\n{response}"
-            
+
         except Exception as e:
             logger.error(f"Error in get_response_async: {str(e)}")
             raise
