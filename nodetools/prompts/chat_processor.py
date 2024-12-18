@@ -135,8 +135,12 @@ class ChatProcessor:
 
         # Process each message
         for msg_id in message_queue.index:
-            logger.debug(f"\nChatProcessor.process_chat_queue: Processing message {msg_id}")
             message = message_queue.loc[msg_id]
+
+            # Determine if original message was encrypted
+            was_encrypted = '[Decrypted]' in message['processed_message']
+
+            logger.debug(f"\nChatProcessor.process_chat_queue: Processing message {msg_id}: {message['processed_message']}")
 
             # Construct prompt
             user_prompt = self._construct_user_prompt(
@@ -166,7 +170,7 @@ class ChatProcessor:
                 message_id=message_id,
                 chunk=True,
                 compress=True,
-                encrypt=True
+                encrypt=was_encrypted
             )
 
             if not self.generic_pft_utilities.verify_transaction_response(responses):

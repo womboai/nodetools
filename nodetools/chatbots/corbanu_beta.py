@@ -47,6 +47,8 @@ class CorbanuChatBot:
 
         # Initialize model
         self.model = "openai/o1-preview"
+
+        self.GOOGLE_DOC_TEXT_CHAR_LIMIT = 10000
         
         # Get user context once
         memo_history = self.pft_utils.get_account_memo_history(account_address=account_address)
@@ -54,7 +56,6 @@ class CorbanuChatBot:
             account_address=account_address,
             memo_history=memo_history
         )
-        self.GOOGLE_DOC_TEXT_CHAR_LIMIT = 10000
 
         # Initialize market data
         self.angron_map = self._generate_most_recent_angron_map()
