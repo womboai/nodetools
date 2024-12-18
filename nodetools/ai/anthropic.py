@@ -7,16 +7,29 @@ import nest_asyncio
 from anthropic import AsyncAnthropic
 import time
 from asyncio import Semaphore
+from nodetools.utilities.credentials import CredentialManager
+import nodetools.configuration.constants as constants
+from loguru import logger
 
 class AnthropicTool:
-    def __init__(self, pw_map, max_concurrent_requests=2, requests_per_minute=30):
-        self.pw_map = pw_map
-        self.client = anthropic.Anthropic(api_key=self.pw_map['anthropic'])
-        self.async_client = AsyncAnthropic(api_key=self.pw_map['anthropic'])
-        self.default_model = 'claude-3-5-sonnet-20241022'
-        self.semaphore = Semaphore(max_concurrent_requests)
-        self.rate_limit = requests_per_minute
-        self.request_times = []
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self, max_concurrent_requests=2, requests_per_minute=30):
+        if not self.__class__._initialized:
+            cred_manager = CredentialManager()
+            self.client = anthropic.Anthropic(api_key=cred_manager.get_credential('anthropic'))
+            self.async_client = AsyncAnthropic(api_key=cred_manager.get_credential('anthropic'))
+            self.default_model = constants.DEFAULT_ANTHROPIC_MODEL
+            self.semaphore = Semaphore(max_concurrent_requests)
+            self.rate_limit = requests_per_minute
+            self.request_times = []
+            self.__class__._initialized = True
 
     def sample_output(self):
         """
@@ -53,7 +66,6 @@ class AnthropicTool:
         temperature=0,
         system="You are an expert task manager who is figuring out what to work on ",
         """
-        #client = anthropic.Anthropic(api_key=PW_MAP['claude_key'])
         messages=[
                 {
                     "role": "user",
@@ -93,13 +105,13 @@ class AnthropicTool:
     async def rate_limited_request(self, job_name, api_args):
         async with self.semaphore:
             await self.wait_for_rate_limit()
-            print(f"Task {job_name} start: {datetime.datetime.now().time()}")
+            logger.debug(f"AnthropicTool.rate_limited_request: Task {job_name} start: {datetime.datetime.now().time()}")
             try:
                 response = await self.async_client.messages.create(**api_args)
-                print(f"Task {job_name} end: {datetime.datetime.now().time()}")
+                logger.debug(f"AnthropicTool.rate_limited_request: Task {job_name} end: {datetime.datetime.now().time()}")
                 return job_name, response
             except anthropic.RateLimitError as e:
-                print(f"Rate limit error for task {job_name}: {str(e)}")
+                logger.debug(f"AnthropicTool.rate_limited_request: Rate limit error for task {job_name}: {str(e)}")
                 await asyncio.sleep(5)  # Wait for 5 seconds before retrying
                 return await self.rate_limited_request(job_name, api_args)
 

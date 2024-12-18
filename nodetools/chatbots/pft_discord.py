@@ -1,63 +1,635 @@
-
-
-import asyncio
-from nodetools.chatbots.personas.odv import odv_system_prompt
-from nodetools.ai.openai import OpenAIRequestTool
-from nodetools.utilities.settings import PasswordMapLoader
-from nodetools.utilities.generic_pft_utilities import *
-from nodetools.utilities.task_management import PostFiatTaskGenerationSystem
 from xrpl.wallet import Wallet
 import discord
-from discord import Object, Interaction, SelectOption
+from discord import Object, Interaction, SelectOption, app_commands
 from discord.ui import Modal, TextInput, View, Select
-from discord import app_commands
-# Import your other modules here...
-from nodetools.chatbots.personas.odv import odv_system_prompt
 from nodetools.ai.openai import OpenAIRequestTool
-from nodetools.utilities.settings import PasswordMapLoader
+from nodetools.utilities.credentials import CredentialManager
 from nodetools.utilities.generic_pft_utilities import *
-from nodetools.utilities.task_management import PostFiatTaskGenerationSystem
+from nodetools.task_processing.task_management import PostFiatTaskGenerationSystem
 from nodetools.utilities.generic_pft_utilities import GenericPFTUtilities
 from nodetools.chatbots.personas.odv import odv_system_prompt
+from nodetools.performance.monitor import PerformanceMonitor
+from nodetools.configuration.configuration import RuntimeConfig, get_network_config
+from nodetools.task_processing.user_context_parsing import UserTaskParser
 import asyncio
 from datetime import datetime, time
 import pytz
 import datetime
-password_map_loader = PasswordMapLoader()
-open_ai_request_tool = OpenAIRequestTool(pw_map=password_map_loader.pw_map)
-
-post_fiat_task_generation_system = PostFiatTaskGenerationSystem(pw_map=password_map_loader.pw_map)
-generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
-generic_pft_utilities.run_transaction_history_updates()
-default_openai_model = 'chatgpt-4o-latest'
-remembrancer = 'rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn'
-MAX_HISTORY = 15
-#post_fiat_task_generation_system.run_cue_processing()
-
+import nodetools.configuration.constants as constants
+import nodetools.configuration.configuration as config
+import getpass
+from loguru import logger
+from nodetools.configuration.configure_logger import configure_logger
+from pathlib import Path
+from dataclasses import dataclass
+import traceback
+from nodetools.chatbots.personas.odv import odv_system_prompt
+from nodetools.chatbots.odv_sprint_planner import ODVSprintPlannerO1
+from nodetools.chatbots.odv_context_doc_improvement import ODVContextDocImprover
+from nodetools.ai.openrouter import OpenRouterTool
+from nodetools.chatbots.corbanu_beta import CorbanuChatBot
 
 class MyClient(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Get network configuration and set network-specific attributes
+        self.network_config = config.get_network_config()
+        self.node_config = config.get_node_config()
+        self.remembrancer = self.node_config.remembrancer_address
+
+        # Initialize components
+        self.openrouter = OpenRouterTool()
+        self.openai_request_tool = OpenAIRequestTool()
+        self.generic_pft_utilities = GenericPFTUtilities()
+        self.post_fiat_task_generation_system = PostFiatTaskGenerationSystem()
+        self.user_task_parser = UserTaskParser(
+            task_management_system=self.post_fiat_task_generation_system,
+            generic_pft_utilities=self.generic_pft_utilities
+        )
+
+        # Set network-specific attributes
+        self.default_openai_model = constants.DEFAULT_OPEN_AI_MODEL
         self.conversations = {}
         self.user_seeds = {}
+        self.doc_improvers = {}
+        self.sprint_planners = {}  # Dictionary: user_id -> ODVSprintPlanner instance
+        self.user_steps = {}       # Dictionary: user_id -> current step in the sprint process
+        self.user_questions = {}
+
         self.tree = app_commands.CommandTree(self)
-        self.open_ai_request_tool = OpenAIRequestTool(pw_map=password_map_loader.pw_map)
-        self.generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
-        self.post_fiat_task_generation_system = PostFiatTaskGenerationSystem(pw_map=password_map_loader.pw_map)
 
-
-    
+    def chunk_message(self, message, max_length=1900):
+            """Split a message into multiple parts to avoid exceeding Discord's 2000-char limit."""
+            lines = message.split('\n')
+            chunks = []
+            current_chunk = ""
+            for line in lines:
+                if len(current_chunk) + len(line) + 1 > max_length:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = line + "\n"
+                else:
+                    current_chunk += line + "\n"
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+            return chunks
 
     async def setup_hook(self):
-        guild_id = 1061800464045310053  # Your specific guild ID
+        """Sets up the slash commands for the bot and initiates background tasks."""
+        guild_id = self.node_config.discord_guild_id
         guild = Object(id=guild_id)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
-        print(f"Slash commands synced to guild ID: {guild_id}")
+        logger.debug(f"MyClient.setup_hook: Slash commands synced to guild ID: {guild_id}")
 
         self.bg_task = self.loop.create_task(self.transaction_checker())
-        # self.bg_task_death_march = self.loop.create_task(self.death_march_reminder())
-        # Ensure the command is registered
+
+        @self.tree.command(name="odv_sprint", description="Start an ODV sprint planning session")
+        async def odv_sprint(interaction: discord.Interaction):
+            user_id = interaction.user.id
+
+            if user_id not in self.user_seeds:
+                await interaction.response.send_message(
+                    "You must store a seed using /pf_store_seed before starting an ODV sprint planning session.", 
+                    ephemeral=True
+                )
+                return
+
+            seed = self.user_seeds[user_id]
+            wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message(
+                    "You must perform the initiation rite first. Run /pf_initiate to do so.", 
+                    ephemeral=True
+                )
+                return
+
+            # Defer early
+            await interaction.response.defer(ephemeral=True)
+
+            try:
+                odv_planner = ODVSprintPlannerO1(
+                    account_address=wallet.classic_address,
+                    openrouter=self.openrouter,
+                    user_context_parser=self.user_task_parser,
+                    pft_utils=self.generic_pft_utilities
+                )
+                self.sprint_planners[user_id] = odv_planner
+                logger.debug(f"MyClient.odv_sprint: Initialized ODV sprint planner for {interaction.user.name}")
+
+                # Potentially long operation
+                logger.debug(f"MyClient.odv_sprint: Getting initial response for {interaction.user.name}")
+                initial_response = await odv_planner.get_response_async("Please provide your context analysis.")
+
+                # Use the helper function to send the possibly long response
+                logger.debug(f"MyClient.odv_sprint: Sending initial response for {interaction.user.name}")
+                await self.send_long_interaction_response(
+                    interaction, 
+                    f"**ODV Sprint Planning Initialized**\n\n{initial_response}", 
+                    ephemeral=True
+                )
+            except Exception as e:
+                logger.error(f"Error in odv_sprint: {str(e)}")
+                await interaction.followup.send(
+                    f"An error occurred while initializing the ODV sprint planning session: {str(e)}", 
+                    ephemeral=True
+                )
+
+        @self.tree.command(name="odv_sprint_reply", description="Continue the ODV sprint planning session")
+        @app_commands.describe(message="Your next input to ODV")
+        async def odv_sprint_reply(interaction: discord.Interaction, message: str):
+            user_id = interaction.user.id
+
+            if user_id not in self.sprint_planners:
+                await interaction.response.send_message(
+                    "No active ODV sprint planning session. Start one with /odv_sprint.", 
+                    ephemeral=True
+                )
+                return
+
+            odv_planner: ODVSprintPlannerO1 = self.sprint_planners[user_id]
+            logger.debug(f"MyClient.odv_sprint_reply: Continuing ODV sprint planning session for {interaction.user.name}")
+            await interaction.response.defer(ephemeral=True)
+
+            try:
+                # Now using async version
+                logger.debug(f"MyClient.odv_sprint_reply: Getting response for {interaction.user.name}")
+                response = await odv_planner.get_response_async(message)
+                logger.debug(f"MyClient.odv_sprint_reply: Response received for {interaction.user.name}")
+                await self.send_long_interaction_response(interaction, response, ephemeral=True)
+            except Exception as e:
+                logger.error(f"Error in odv_sprint_reply: {str(e)}")
+                await interaction.followup.send(
+                    f"An error occurred: {str(e)}", 
+                    ephemeral=True
+                )
+
+        # Inside MyClient.setup_hook or a similar initialization section in your MyClient class
+        @self.tree.command(name="odv_context_doc", description="Start an ODV context document improvement session")
+        async def odv_context_doc(interaction: discord.Interaction):
+            user_id = interaction.user.id
+
+            # Check if the user has a stored seed
+            if user_id not in self.user_seeds:
+                await interaction.response.send_message(
+                    "You must store a seed using /pf_store_seed before starting an ODV context document improvement session.", 
+                    ephemeral=True
+                )
+                return
+
+            seed = self.user_seeds[user_id]
+            wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message(
+                    "You must perform the initiation rite first. Run /pf_initiate to do so.", 
+                    ephemeral=True
+                )
+                return
+
+            # Defer early so Discord knows we're working
+            await interaction.response.defer(ephemeral=True)
+
+            try:
+                # Initialize the ODVContextDocImprover
+                doc_improver = ODVContextDocImprover(
+                    account_address=wallet.classic_address,
+                    openrouter=self.openrouter,
+                    user_context_parser=self.user_task_parser,
+                    pft_utils=self.generic_pft_utilities
+                )
+
+                # Ensure you have a dictionary to store doc improvers per user
+                if not hasattr(self, 'doc_improvers'):
+                    self.doc_improvers = {}
+
+                self.doc_improvers[user_id] = doc_improver
+                logger.debug(f"MyClient.odv_context_doc: Initialized ODV context document improver for {interaction.user.name}")
+
+                # Potentially long operation: getting the initial suggestion
+                logger.debug(f"MyClient.odv_context_doc: Getting initial response for {interaction.user.name}")
+                initial_response = await doc_improver.get_response_async("Please provide your first improvement suggestion.")
+                logger.debug(f"MyClient.odv_context_doc: Sending initial response for {interaction.user.name}")
+
+                # Use the helper function to send the possibly long response
+                await self.send_long_interaction_response(
+                    interaction, 
+                    f"**ODV Context Document Improvement Initialized**\n\n{initial_response}", 
+                    ephemeral=True
+                )
+            except Exception as e:
+                logger.error(f"Error in odv_context_doc: {str(e)}")
+                await interaction.followup.send(
+                    f"An error occurred while initializing the ODV context document improvement session: {str(e)}", 
+                    ephemeral=True
+                )
+
+        @self.tree.command(name="odv_context_doc_reply", description="Continue the ODV context document improvement session")
+        @app_commands.describe(message="Your next input to ODV")
+        async def odv_context_doc_reply(interaction: discord.Interaction, message: str):
+            user_id = interaction.user.id
+
+            # Check if we have a doc improver session in progress
+            if not hasattr(self, 'doc_improvers') or user_id not in self.doc_improvers:
+                await interaction.response.send_message(
+                    "No active ODV context document improvement session. Start one with /odv_context_doc.", 
+                    ephemeral=True
+                )
+                return
+
+            doc_improver: ODVContextDocImprover = self.doc_improvers[user_id]
+            logger.debug(f"MyClient.odv_context_doc_reply: Continuing ODV context document improvement session for {interaction.user.name}")
+            await interaction.response.defer(ephemeral=True)
+
+            try:
+                logger.debug(f"MyClient.odv_context_doc_reply: Getting response for {interaction.user.name}")
+                response = await doc_improver.get_response_async(message)
+                logger.debug(f"MyClient.odv_context_doc_reply: Response received for {interaction.user.name}")
+                await self.send_long_interaction_response(interaction, response, ephemeral=True)
+            except Exception as e:
+                logger.error(f"Error in odv_context_doc_reply: {str(e)}")
+                await interaction.followup.send(
+                    f"An error occurred: {str(e)}", 
+                    ephemeral=True
+                )
+
+        # In the corbanu_offering command:
+        @self.tree.command(name="corbanu_offering", description="Generate a Corbanu offering")
+        async def corbanu_offering(interaction: discord.Interaction):
+            user_id = interaction.user.id
+
+            # Check if the user has a stored seed
+            if user_id not in self.user_seeds:
+                await interaction.response.send_message(
+                    "You must store a seed using /pf_store_seed before using this command.",
+                    ephemeral=True
+                )
+                return
+
+            seed = self.user_seeds[user_id]
+            wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.classic_address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message(
+                    "You must perform the initiation rite first. Run /pf_initiate to do so.", 
+                    ephemeral=True
+                )
+                return
+            
+            # Return the existing question if the user has one
+            if user_id in self.user_questions:
+                await interaction.response.send_message(
+                    f"Corbanu Offering:\n\n{self.user_questions[user_id]}",
+                    ephemeral=True
+                )
+                return
+
+            # Defer the response since generating the Corbanu offering might take time
+            await interaction.response.defer(ephemeral=True)
+
+            try:
+                # Initialize the CorbanuChatBot instance
+                logger.debug(f"MyClient.corbanu_offering: {interaction.user.name} has requested a Corbanu offering. Initializing CorbanuChatBot instance.")
+                corbanu = CorbanuChatBot(
+                    account_address=wallet.classic_address,
+                    openrouter=self.openrouter,
+                    user_context_parser=self.user_task_parser,
+                    pft_utils=self.generic_pft_utilities
+                )
+
+                # NOTE: Even without recent conversation history, Claude sonnet 3.5 has too much context to generate a non-duplicate question
+                # Retrieve the user's recent conversation messages
+                # conversation_history = self.conversations.get(user_id, [])
+                # recent_messages = conversation_history[-5:]
+                # user_chat_history = "\n".join(
+                #     f"{msg['role'].upper()}: {msg['content']}" for msg in recent_messages
+                # )
+
+                # Generate a question as the Corbanu offering 
+                question = await corbanu.generate_question()
+                logger.debug(f"MyClient.corbanu_offering: Question generated for {interaction.user.name}: {question}")
+
+                # Store the question so we can use it in /corbanu_reply
+                self.user_questions[user_id] = question
+
+                await interaction.followup.send(
+                    f"Corbanu Offering:\n\n{question}",
+                    ephemeral=True
+                )
+
+            except Exception as e:
+                logger.error(f"Error in corbanu_offering: {str(e)}")
+                logger.error(traceback.format_exc())
+                await interaction.followup.send(
+                    f"An error occurred while generating Corbanu offering: {str(e)}", 
+                    ephemeral=True
+                )
+
+        @self.tree.command(name="corbanu_reply", description="Reply to the last Corbanu offering")
+        @app_commands.describe(answer="Your answer to the last Corbanu question")
+        async def corbanu_reply(interaction: discord.Interaction, answer: str):
+            user_id = interaction.user.id
+
+            if user_id not in self.user_seeds:
+                await interaction.response.send_message(
+                    "You must store a seed using /pf_store_seed before using this command.",
+                    ephemeral=True
+                )
+                return
+
+            seed = self.user_seeds[user_id]
+            wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+
+            # Check initiation
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.classic_address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message(
+                    "You must perform the initiation rite first. Run /pf_initiate to do so.",
+                    ephemeral=True
+                )
+                return
+
+            if user_id not in self.user_questions:
+                await interaction.response.send_message(
+                    "No Corbanu question found. Please use /corbanu_offering first.",
+                    ephemeral=True
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True)
+
+            try:
+                question = self.user_questions[user_id]
+                logger.debug(f"MyClient.corbanu_reply: Received user answer for {interaction.user.name}.\nQuestion:\n{question}\nAnswer: \n{answer}")
+                
+                corbanu = CorbanuChatBot(
+                    account_address=wallet.classic_address,
+                    openrouter=self.openrouter,
+                    user_context_parser=self.user_task_parser,
+                    pft_utils=self.generic_pft_utilities
+                )
+
+                scoring = await corbanu.generate_user_question_scoring_output(
+                    original_question=question,
+                    user_answer=answer,
+                    account_address=wallet.classic_address
+                )
+
+                reward_value = scoring.get('reward_value', 0)
+                reward_description = scoring.get('reward_description', 'No description')
+
+                full_message = (f"CORBANU_OFFERING\n"
+                                f"Q: {question}\n\n"
+                                f"A: {answer}\n\n"
+                                f"Reward: {reward_value} PFT\n"
+                                f"{reward_description}")
+
+                # Send a short summary to the user in Discord
+                summary_chunks = self.chunk_message(f"**Corbanu Summary**\n{full_message}")
+                for chunk in summary_chunks:
+                    await interaction.followup.send(chunk, ephemeral=True)
+
+                # Now the user will send the Q&A to the remembrancer
+                # Similar to pf_log, we need to ensure a handshake if encrypt=True
+                encrypt = True  # We assume we always encrypt the Q&A to the remembrancer.
+                user_name = interaction.user.name
+                message_obj = await interaction.followup.send(
+                    "Preparing to send Q&A to the remembrancer...",
+                    ephemeral=True,
+                    wait=True
+                )
+
+                handshake_success, user_key, counterparty_key, message_obj = await self._ensure_handshake(
+                    interaction=interaction,
+                    seed=seed,
+                    counterparty=self.remembrancer,
+                    username=user_name,
+                    command_name="corbanu_reply",
+                    message_obj=message_obj
+                )
+                if not handshake_success:
+                    logger.error(f"MyClient.corbanu_reply: Handshake failed for {interaction.user.name}.")
+                    await message_obj.edit(content="Handshake failed. Aborting operation.")
+                    return
+                
+                await message_obj.edit(content="Handshake verified. Proceeding to send memo...")
+
+                # Send Q&A from user wallet to remembrancer
+                response = self.generic_pft_utilities.send_memo(
+                    wallet_seed_or_wallet=wallet,
+                    username="Corbanu",  # This is memo_format
+                    destination=self.remembrancer,
+                    memo=full_message,
+                    chunk=True,
+                    compress=True,
+                    encrypt=encrypt,
+                    pft_amount=Decimal(0)  # No PFT here, just sending the message
+                )
+
+                # Verify that the large message was successfully sent
+                if not self.generic_pft_utilities.verify_transaction_response(response):
+                    await message_obj.edit(content="Failed to send Q&A message to remembrancer.")
+                    return
+
+                last_response = response[-1] if isinstance(response, list) else response
+                transaction_info = self.generic_pft_utilities.extract_transaction_info_from_response_object(
+                    response=last_response
+                )
+                clean_string = transaction_info['clean_string']
+
+                await message_obj.edit(
+                    content=f"Q&A message sent to remembrancer successfully. Last chunk details:\n{clean_string}"
+                )
+
+                # Now send the reward from the node to the user
+                foundation_seed = self.generic_pft_utilities.credential_manager.get_credential(
+                    f"{self.node_config.node_name}__v1xrpsecret"
+                )
+                foundation_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(foundation_seed)
+
+                short_reward_message = "Corbanu Reward"
+
+                # Check daily reward limit
+                remaining_daily_limit = corbanu.check_daily_reward_limit(account_address=wallet.classic_address)
+                reward_value = min(reward_value, remaining_daily_limit)
+
+                # Check per-offering reward limit
+                reward_value = min(reward_value, corbanu.MAX_PER_OFFERING_REWARD_VALUE)
+
+                logger.debug(f"MyClient.corbanu_reply: Sending reward of {reward_value} PFT to {wallet.classic_address}")
+                
+                reward_tx = self.generic_pft_utilities.send_memo(
+                    wallet_seed_or_wallet=foundation_wallet,
+                    destination=wallet.classic_address,
+                    memo=short_reward_message,
+                    username="Corbanu",
+                    chunk=False,
+                    compress=False,
+                    encrypt=False,
+                    pft_amount=Decimal(reward_value)
+                )
+
+                if not self.generic_pft_utilities.verify_transaction_response(reward_tx):
+                    await interaction.followup.send("Failed to send reward transaction.", ephemeral=True)
+                    return
+
+                # Confirm reward sent
+                reward_info = self.generic_pft_utilities.extract_transaction_info_from_response_object(
+                    reward_tx
+                )
+                reward_clean_string = reward_info['clean_string']
+
+                reward_chunks = self.chunk_message(f"Reward transaction sent successfully:\n{reward_clean_string}")
+                for chunk in reward_chunks:
+                    await interaction.followup.send(chunk, ephemeral=True)
+
+                # Clear stored question
+                del self.user_questions[user_id]
+
+            except Exception as e:
+                logger.error(f"Error in corbanu_reply: {str(e)}")
+                logger.error(traceback.format_exc())
+                error_chunks = self.chunk_message(f"An error occurred while processing your reply: {str(e)}")
+                for chunk in error_chunks:
+                    await interaction.followup.send(chunk, ephemeral=True)
+
+        @self.tree.command(name="corbanu_request", description="Send a request to Corbanu and get a response from Angron or Fulgrim")
+        @app_commands.describe(message="Your message to Corbanu")
+        async def corbanu_request(interaction: discord.Interaction, message: str):
+            user_id = interaction.user.id
+
+            # Check if the user has a stored seed
+            if user_id not in self.user_seeds:
+                await interaction.response.send_message(
+                    "You must store a seed using /pf_store_seed before using this command.",
+                    ephemeral=True
+                )
+                return
+
+            seed = self.user_seeds[user_id]
+            wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.classic_address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message(
+                    "You must perform the initiation rite first. Run /pf_initiate to do so.", 
+                    ephemeral=True
+                )
+                return
+
+            # Defer since response might be long
+            await interaction.response.defer(ephemeral=True)
+
+            try:
+                # Add the user message to their conversation history
+                if user_id not in self.conversations:
+                    self.conversations[user_id] = []
+
+                self.conversations[user_id].append({"role": "user", "content": message})
+
+                # Create CorbanuChatBot instance
+                corbanu = CorbanuChatBot(
+                    account_address=wallet.classic_address,
+                    openrouter=self.openrouter,
+                    user_context_parser=self.user_task_parser,
+                    pft_utils=self.generic_pft_utilities
+                )
+
+                # Get Corbanu's response asynchronously
+                response = await corbanu.get_response_async(message)
+
+                # Chunk the response if needed and send to user
+                response_chunks = self.chunk_message(response)
+                for chunk in response_chunks:
+                    await interaction.followup.send(chunk, ephemeral=True)
+
+                # Append Corbanu's response to conversation history
+                self.conversations[user_id].append({"role": "assistant", "content": response})
+
+                # Combine USER MESSAGE + CORBANU RESPONSE
+                combined_message = f"USER MESSAGE:\n{message}\n\nCORBANU RESPONSE:\n{response}"
+
+                # Summarize the combined message before sending to remembrancer
+                summarized_message = await corbanu.summarize_text(combined_message, max_length=900)
+
+                encrypt = True
+                user_name = interaction.user.name
+
+                # Notify user we're sending to remembrancer
+                message_obj = await interaction.followup.send(
+                    "Sending the Q&A record (summarized) to the remembrancer...",
+                    ephemeral=True,
+                    wait=True
+                )
+
+                # Ensure handshake
+                if encrypt:
+                    handshake_success, user_key, counterparty_key, message_obj = await self._ensure_handshake(
+                        interaction=interaction,
+                        seed=seed,
+                        counterparty=self.remembrancer,
+                        username=user_name,
+                        command_name="corbanu_request",
+                        message_obj=message_obj
+                    )
+                    if not handshake_success:
+                        return
+                    
+                    await message_obj.edit(content="Handshake verified. Proceeding to send memo...")
+
+                # Send summarized message from user's wallet to remembrancer
+                send_response = self.generic_pft_utilities.send_memo(
+                    wallet_seed_or_wallet=wallet,
+                    username=user_name,
+                    destination=self.remembrancer,
+                    memo=summarized_message,
+                    chunk=True,
+                    compress=True,
+                    encrypt=encrypt,
+                    pft_amount=Decimal(0)
+                )
+
+                # Verify transaction
+                if not self.generic_pft_utilities.verify_transaction_response(send_response):
+                    await message_obj.edit(content="Failed to send the summarized Q&A record to remembrancer.")
+                    return
+
+                last_response = send_response[-1] if isinstance(send_response, list) else send_response
+                transaction_info = self.generic_pft_utilities.extract_transaction_info_from_response_object(last_response)
+                clean_string = transaction_info['clean_string']
+
+                await message_obj.edit(
+                    content=f"Summarized Q&A record sent to remembrancer successfully. Last chunk details:\n{clean_string}"
+                )
+
+            except Exception as e:
+                logger.error(f"Error in corbanu_request: {str(e)}")
+                logger.error(traceback.format_exc())
+                error_chunks = self.chunk_message(f"An error occurred: {str(e)}")
+                for chunk in error_chunks:
+                    await interaction.followup.send(chunk, ephemeral=True)
+
         @self.tree.command(name="pf_send", description="Open a transaction form")
         async def pf_send(interaction: Interaction):
             user_id = interaction.user.id
@@ -70,6 +642,16 @@ class MyClient(discord.Client):
                 return
 
             seed = self.user_seeds[user_id]
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                return
 
             class SimpleTransactionModal(discord.ui.Modal, title='Transaction Details'):
                 address = discord.ui.TextInput(label='Recipient Address')
@@ -89,23 +671,32 @@ class MyClient(discord.Client):
                     amount = self.amount.value
                     message = self.message.value
 
-                    # Trigger the transaction
-                    proper_string = generic_pft_utilities.discord_send_pft_with_info_from_seed(
-                        destination_address=destination_address, 
-                        seed=self.seed,
-                        user_name=interaction.user.name, 
-                        message=message, 
-                        amount=amount
+                    # construct memo
+                    memo = generic_pft_utilities.construct_standardized_xrpl_memo(
+                        memo_data=message, 
+                        memo_type='DISCORD_SERVER', 
+                        memo_format=interaction.user.name
                     )
+
+                    # send memo with PFT attached
+                    response = generic_pft_utilities.send_memo(
+                        wallet_seed_or_wallet=self.seed,
+                        destination=destination_address,
+                        memo=memo,
+                        username=interaction.user.name,
+                        pft_amount=Decimal(amount)
+                    )
+
+                    # extract response from last memo
+                    tx_info = generic_pft_utilities.extract_transaction_info_from_response_object(response)['clean_string']
+
                     await interaction.followup.send(
-                        f'Transaction sent! {proper_string}',
+                        f'Transaction result: {tx_info}',
                         ephemeral=True
                     )
+
             # Pass the user's seed to the modal
             await interaction.response.send_modal(SimpleTransactionModal(seed=seed))
-            print("PF Send command executed!")
-            #def send_xrp_with_info__seed_based(self,wallet_seed, amount, destination, memo):
-        
             
         @self.tree.command(name="pf_accept", description="Accept tasks")
         async def pf_accept_menu(interaction: discord.Interaction):
@@ -118,22 +709,42 @@ class MyClient(discord.Client):
             seed = self.user_seeds[user_id]
 
             # Fetch the tasks that are not yet accepted
-            wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
-            classic_address = wallet.classic_address
-            all_node_memo_transactions = generic_pft_utilities.get_memo_detail_df_for_account(account_address=classic_address, pft_only=False).copy()
-            pf_df = generic_pft_utilities.convert_all_account_info_into_outstanding_task_df(account_memo_detail_df=all_node_memo_transactions)
-            non_accepted_tasks = pf_df[pf_df['acceptance'] == ''].copy()
-            map_of_non_accepted_tasks = non_accepted_tasks['proposal']
+            logger.debug(f"MyClient.setup_hook.pf_accept_menu: Spawning wallet to fetch tasks for {interaction.user.name}")
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
 
-            # If there are no non-accepted tasks, notify the user
-            if map_of_non_accepted_tasks.empty:
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                return
+
+            # Fetch proposal acceptance pairs
+            memo_history = generic_pft_utilities.get_account_memo_history(account_address=wallet.address).copy()
+
+            # Return immediately if memo history is empty
+            if memo_history.empty:
+                await interaction.response.send_message("You have no tasks to accept.", ephemeral=True)
+                return
+
+            # Get pending proposals
+            pf_df = post_fiat_task_generation_system.get_pending_proposals(account=memo_history)
+
+            # Return immediately if proposal acceptance pairs are empty
+            if pf_df.empty:
                 await interaction.response.send_message("You have no tasks to accept.", ephemeral=True)
                 return
 
             # Create dropdown options based on the non-accepted tasks
             options = [
-                SelectOption(label=task_id, description=proposal[:100], value=task_id)
-                for task_id, proposal in map_of_non_accepted_tasks.items()
+                SelectOption(
+                    label=task_id, 
+                    description=str(pf_df.loc[task_id, 'proposal'])[:100],  # get just the proposal text
+                    value=task_id
+                )
+                for task_id in pf_df.index
             ]
 
             # Create the Select menu
@@ -172,7 +783,7 @@ class MyClient(discord.Client):
                     
                     # Call the discord__task_acceptance function
                     output_string = post_fiat_task_generation_system.discord__task_acceptance(
-                        seed_to_work=self.seed,
+                        user_seed=self.seed,
                         user_name=self.user_name,
                         task_id_to_accept=self.task_id,
                         acceptance_string=acceptance_string
@@ -184,7 +795,7 @@ class MyClient(discord.Client):
             # Define the callback for when a user selects an option
             async def select_callback(interaction: discord.Interaction):
                 selected_task_id = select.values[0]
-                task_text = map_of_non_accepted_tasks[selected_task_id]
+                task_text = str(pf_df.loc[selected_task_id, 'proposal'])  # Get just the proposal text
                 # Open the modal to get the acceptance string with the task text pre-populated
                 await interaction.response.send_modal(AcceptanceModal(
                     task_id=selected_task_id,
@@ -213,23 +824,42 @@ class MyClient(discord.Client):
 
             seed = self.user_seeds[user_id]
 
-            # Fetch the tasks that are not yet accepted
-            wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
-            classic_address = wallet.classic_address
-            all_node_memo_transactions = generic_pft_utilities.get_memo_detail_df_for_account(account_address=classic_address, pft_only=False).copy()
-            pf_df = generic_pft_utilities.convert_all_account_info_into_outstanding_task_df(account_memo_detail_df=all_node_memo_transactions)
-            non_accepted_tasks = pf_df# MADE THIS CHANGE TO REFUSE ANY [pf_df['acceptance'] == ''].copy()
-            map_of_non_accepted_tasks = non_accepted_tasks['proposal']
+            logger.debug(f"MyClient.setup_hook.pf_refuse_menu: Spawning wallet to fetch tasks for {interaction.user.name}")
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                return
+            
+            # Fetch account history
+            memo_history = generic_pft_utilities.get_account_memo_history(account_address=wallet.address).copy()
+
+            # Get pending proposals
+            pf_df = post_fiat_task_generation_system.get_refuseable_proposals(account=memo_history)
+
+            # Return immediately if proposal refusal pairs are empty
+            if pf_df.empty:
+                await interaction.response.send_message("You have no tasks to refuse.", ephemeral=True)
+                return
+
+            eligible_tasks = pf_df.copy()
+
+            map_of_eligible_tasks = eligible_tasks['proposal']
 
             # If there are no non-accepted tasks, notify the user
-            if map_of_non_accepted_tasks.empty:
+            if map_of_eligible_tasks.empty:
                 await interaction.response.send_message("You have no tasks to refuse.", ephemeral=True)
                 return
 
             # Create dropdown options based on the non-accepted tasks
             options = [
                 SelectOption(label=task_id, description=proposal[:100], value=task_id)
-                for task_id, proposal in map_of_non_accepted_tasks.items()
+                for task_id, proposal in map_of_eligible_tasks.items()
             ]
 
             # Create the Select menu
@@ -268,9 +898,9 @@ class MyClient(discord.Client):
                     
                     # Call the discord__task_refusal function
                     output_string = post_fiat_task_generation_system.discord__task_refusal(
-                        seed_to_work=self.seed,
+                        user_seed=self.seed,
                         user_name=self.user_name,
-                        task_id_to_accept=self.task_id,
+                        task_id_to_refuse=self.task_id,
                         refusal_string=refusal_string
                     )
                     
@@ -280,7 +910,7 @@ class MyClient(discord.Client):
             # Define the callback for when a user selects an option
             async def select_callback(interaction: discord.Interaction):
                 selected_task_id = select.values[0]
-                task_text = map_of_non_accepted_tasks[selected_task_id]
+                task_text = map_of_eligible_tasks[selected_task_id]
                 # Open the modal to get the refusal string with the task text pre-populated
                 await interaction.response.send_modal(RefusalModal(
                     task_id=selected_task_id,
@@ -297,12 +927,12 @@ class MyClient(discord.Client):
             view.add_item(select)
 
             # Send the message with the dropdown menu
-            await interaction.response.send_message("Please choose a task to refuse:", view=view)
+            await interaction.response.send_message("Please choose a task to refuse:", view=view, ephemeral=True)
 
         @self.tree.command(name="wallet_info", description="Get information about a wallet")
         async def wallet_info(interaction: discord.Interaction, wallet_address: str):
             try:
-                account_info = generic_pft_utilities.generate_basic_balance_info_string_for_account_address(account_address=wallet_address)
+                account_info = self.generate_basic_balance_info_string(address=wallet_address, owns_wallet=False)
                 
                 # Create an embed for better formatting
                 embed = discord.Embed(title="Wallet Information", color=0x00ff00)
@@ -314,7 +944,7 @@ class MyClient(discord.Client):
                 await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
 
         @self.tree.command(name="pf_log", description="Send a long message to the remembrancer wallet")
-        async def pf_remembrancer(interaction: discord.Interaction, message: str):
+        async def pf_remembrancer(interaction: discord.Interaction, message: str, encrypt: bool = False):
             user_id = interaction.user.id
             
             # Check if the user has a stored seed
@@ -327,30 +957,64 @@ class MyClient(discord.Client):
 
             seed = client.user_seeds[user_id]
             user_name = interaction.user.name
+            logger.debug(f"MyClient.pf_remembrancer: Spawning wallet to send message to remembrancer for {interaction.user.name}")
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                return
 
             # Defer the response to avoid timeout for longer operations
             await interaction.response.defer(ephemeral=True)
 
             try:
-                remembrancer = 'rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn'
-                # Call the send_PFT_chunk_message__seed_based function
-                ### RETURN TO wallet_seed, user_name, destination,memo, compress
-                response = generic_pft_utilities.send_pft_compressed_message_based_on_wallet_seed(wallet_seed=seed, 
-                                                                                                  user_name=user_name, 
-                                                                                                  destination=remembrancer,
-                                                                                                  memo = message, message_id=None,
-                                                                                                  compress=True)
-                
 
-                # Extract transaction information
-                transaction_info = generic_pft_utilities.extract_transaction_info_from_response_object(response=response)
+                message_obj = await interaction.followup.send(
+                    "Sending message to remembrancer...",
+                    ephemeral=True,
+                    wait=True  # returns message object
+                )
+
+                if encrypt:
+                    handshake_success, user_key, counterparty_key, message_obj = await self._ensure_handshake(
+                        interaction=interaction,
+                        seed=seed,
+                        counterparty=self.remembrancer,
+                        username=user_name,
+                        command_name="pf_remembrancer",
+                        message_obj=message_obj
+                    )
+                    if not handshake_success:
+                        return
+                    
+                    await message_obj.edit(content="Handshake verified. Proceeding to send memo...")
+
+                response = generic_pft_utilities.send_memo(
+                    wallet_seed_or_wallet=wallet,
+                    username=user_name,
+                    destination=self.remembrancer,
+                    memo=message,
+                    chunk=True,
+                    compress=True,
+                    encrypt=encrypt
+                )
+                response = response[-1] if isinstance(response, list) else response
+
+                transaction_info = generic_pft_utilities.extract_transaction_info_from_response_object(
+                    response=response
+                )
                 clean_string = transaction_info['clean_string']
 
-                # Prepare the response message
-                response_message = f"Message sent to remembrancer successfully. Last chunk details:\n{clean_string}"
+                mode = "Encrypted message" if encrypt else "Message"
+                await message_obj.edit(
+                    content=f"{mode} sent to remembrancer successfully. Last chunk details:\n{clean_string}", 
+                )
 
-                # Send the response
-                await interaction.followup.send(response_message, ephemeral=True)
             except Exception as e:
                 await interaction.followup.send(f"An error occurred while sending the message: {str(e)}", ephemeral=True)
         
@@ -367,18 +1031,27 @@ class MyClient(discord.Client):
                 return
 
             seed = self.user_seeds[user_id]
-            wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed)
-            wallet_address = wallet.classic_address
+            logger.debug(f"MyClient.setup_hook.pf_chart: Spawning wallet to generate chart for {interaction.user.name}")
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
+
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                return
 
             # Defer the response since chart generation might take time
             await interaction.response.defer(ephemeral=True)
 
             try:
                 # Call the charting function
-                post_fiat_task_generation_system.output_pft_KPI_graph_for_address(user_wallet=wallet_address)
+                post_fiat_task_generation_system.output_pft_KPI_graph_for_address(user_wallet=wallet.address)
                 
                 # Create the file object from the saved image
-                chart_file = discord.File(f'pft_rewards__{wallet_address}.png', filename='pft_chart.png')
+                chart_file = discord.File(f'pft_rewards__{wallet.address}.png', filename='pft_chart.png')
                 
                 # Create an embed for better formatting
                 embed = discord.Embed(
@@ -398,7 +1071,7 @@ class MyClient(discord.Client):
                 
                 # Clean up the file after sending
                 import os
-                os.remove(f'pft_rewards__{wallet_address}.png')
+                os.remove(f'pft_rewards__{wallet.address}.png')
 
             except Exception as e:
                 await interaction.followup.send(
@@ -412,7 +1085,7 @@ class MyClient(discord.Client):
         )
         async def pf_leaderboard(interaction: discord.Interaction):
             # Check if the user has permission (matches the specific ID)
-            if interaction.user.id != 402536023483088896:
+            if interaction.user.id not in constants.DISCORD_SUPER_USER_IDS:
                 await interaction.response.send_message(
                     "You don't have permission to use this command.", 
                     ephemeral=True
@@ -463,18 +1136,29 @@ class MyClient(discord.Client):
                 return
 
             seed = self.user_seeds[user_id]
-            wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed)
-            wallet_address = wallet.classic_address
+            logger.debug(f"MyClient.setup_hook.pf_outstanding: Spawning wallet to fetch tasks for {interaction.user.name}")
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
+
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                return
 
             # Defer the response to avoid timeout for longer operations
             await interaction.response.defer(ephemeral=True)
 
             try:
                 # Get the unformatted output message
-                output_message = generic_pft_utilities.create_full_outstanding_pft_string(account_address=wallet_address)
+                output_message = self.create_full_outstanding_pft_string(account_address=wallet.address)
+
+                logger.debug(f"MyClient.pf_outstanding: Output message: {output_message}")
                 
                 # Format the message using the new formatting function
-                formatted_chunks = generic_pft_utilities.format_tasks_for_discord(output_message)
+                formatted_chunks = self.format_tasks_for_discord(output_message)
                 
                 # Send the first chunk
                 await interaction.followup.send(formatted_chunks[0], ephemeral=True)
@@ -484,6 +1168,8 @@ class MyClient(discord.Client):
                     await interaction.followup.send(chunk, ephemeral=True)
 
             except Exception as e:
+                logger.error(f"MyClient.pf_outstanding: Error fetching outstanding tasks: {str(e)}")
+                logger.error(traceback.format_exc())
                 await interaction.followup.send(
                     f"An error occurred while fetching your outstanding tasks: {str(e)}", 
                     ephemeral=True
@@ -509,7 +1195,17 @@ class MyClient(discord.Client):
 
                 address = discord.ui.TextInput(label='Recipient Address')
                 amount = discord.ui.TextInput(label='Amount (in XRP)')
-                message = discord.ui.TextInput(label='Message', style=discord.TextStyle.long, required=False)
+                message = discord.ui.TextInput(
+                    label='Message', 
+                    style=discord.TextStyle.long, 
+                    required=False,
+                    placeholder='Insert an optional message'
+                )
+                destination_tag = discord.ui.TextInput(
+                    label='Destination Tag',
+                    required=False,
+                    placeholder='Required for most exchanges'
+                )
 
                 async def on_submit(self, interaction: discord.Interaction):
                     await interaction.response.defer(ephemeral=True)
@@ -517,6 +1213,7 @@ class MyClient(discord.Client):
                     destination_address = self.address.value
                     amount = self.amount.value
                     message = self.message.value
+                    destination_tag = self.destination_tag.value
 
                     # Create the memo
                     memo = generic_pft_utilities.construct_standardized_xrpl_memo(
@@ -526,12 +1223,16 @@ class MyClient(discord.Client):
                     )
 
                     try:
+                        # Convert destination_tag to integer if it exists
+                        dt = int(destination_tag) if destination_tag else None
+
                         # Call the send_xrp_with_info__seed_based function
                         response = generic_pft_utilities.send_xrp_with_info__seed_based(
                             wallet_seed=self.seed,
                             amount=amount,
                             destination=destination_address,
-                            memo=memo
+                            memo=memo,
+                            destination_tag=dt
                         )
 
                         # Extract transaction information using the improved function
@@ -542,6 +1243,8 @@ class MyClient(discord.Client):
                         embed.add_field(name="Details", value=transaction_info['clean_string'], inline=False)
                         
                         # Add additional fields if available
+                        if dt:
+                            embed.add_field(name="Destination Tag", value=str(dt), inline=False)
                         if 'hash' in transaction_info:
                             embed.add_field(name="Transaction Hash", value=transaction_info['hash'], inline=False)
                         if 'xrpl_explorer_url' in transaction_info:
@@ -555,8 +1258,6 @@ class MyClient(discord.Client):
             modal = XRPTransactionModal(seed=seed)
             await interaction.response.send_modal(modal)
 
-
-
         @self.tree.command(name="pf_store_seed", description="Store a seed")
         async def store_seed(interaction: discord.Interaction):
             # Define the modal with a reference to the client
@@ -569,100 +1270,192 @@ class MyClient(discord.Client):
 
                 async def on_submit(self, interaction: discord.Interaction):
                     user_id = interaction.user.id
-                    self.client.user_seeds[user_id] = self.seed.value  # Store the seed
+
+                    # Test seed for validity
+                    try:
+                        generic_pft_utilities.spawn_wallet_from_seed(self.seed.value.strip())
+                    except Exception as e:
+                        await interaction.response.send_message(f"An error occurred while storing your seed: {str(e)}", ephemeral=True)
+                        return
+                    
+                    self.client.user_seeds[user_id] = self.seed.value.strip()  # Store the seed
                     await interaction.response.send_message(f'Seed stored successfully for user {interaction.user.name}.', ephemeral=True)
 
             # Pass the client instance to the modal
             await interaction.response.send_modal(SeedModal(client=self))
-            print("Seed storage command executed!")
-        # Sync the commands to the guild
-        await self.tree.sync(guild=guild)
-        print(f"Slash commands synced to guild ID: {guild_id}")
+            logger.debug(f"MyClient.setup_hook.store_seed: Seed storage command executed by {interaction.user.name}")
 
         # Sync the commands to the guild
         await self.tree.sync(guild=guild)
-        print(f"Slash commands synced to guild ID: {guild_id}")
+        logger.debug(f"MyClient.setup_hook: Slash commands synced to guild ID: {guild_id}")
+
+        # Sync the commands to the guild
+        await self.tree.sync(guild=guild)
+        logger.debug(f"MyClient.setup_hook: Slash commands synced to guild ID: {guild_id}")
 
         @self.tree.command(name="pf_initiate", description="Initiate your commitment")
         async def pf_initiate(interaction: discord.Interaction):
             user_id = interaction.user.id
 
-            # Step 1: Check if the user has a stored seed
+            # Check if the user has a stored seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
                     "You must store a seed using /store_seed before initiating.", ephemeral=True
                 )
                 return
 
-            seed = self.user_seeds[user_id]
+            try:
+                # Spawn the user's wallet
+                logger.debug(f"MyClient.setup_hook.pf_initiate: Spawning wallet to initiate for {interaction.user.name}")
+                username = interaction.user.name
+                seed = self.user_seeds[user_id]
+                wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
 
-            # Step 2: Spawn the user's wallet and check the XRP balance
-            wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed)
-            wallet_address = wallet.classic_address
-            xrp_balance = generic_pft_utilities.get_account_xrp_balance(account_address=wallet_address)
-            if xrp_balance < 15:
+                # Check initiation status
+                initiation_check_success = await self._check_initiation_rite(
+                    interaction=interaction,
+                    wallet_address=wallet.address,
+                    require_initiation=False  # this means block re-initiations unless on testnet with ENABLE_REINITIATIONS = True
+                )
+                if not initiation_check_success:
+                    await interaction.response.send_message("You've already completed an initiation rite. Re-initiation is not allowed.", ephemeral=True)
+                    return
+
+                # Define the modal to collect Google Doc Link and Commitment
+                class InitiationModal(discord.ui.Modal, title='Initiation Commitment'):
+                    def __init__(self, client_instance: discord.Client, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self.client = client_instance
+
+                    google_doc_link = discord.ui.TextInput(
+                        label='Please enter your Google Doc Link', 
+                        style=discord.TextStyle.long,
+                        placeholder="Your link will be encrypted but the node operator retains access for effective task generation."
+                    )
+                    commitment_sentence = discord.ui.TextInput(
+                        label='Commit to a Long-Term Objective',
+                        style=discord.TextStyle.long,
+                        max_length=constants.MAX_COMMITMENT_SENTENCE_LENGTH,
+                        placeholder="A 1-sentence commitment to a long-term objective"
+                    )
+
+                    async def on_submit(self, interaction: discord.Interaction):
+                        await interaction.response.defer(ephemeral=True)
+                        
+                        try:
+                            handshake_success, user_key, node_key, message_obj = await self.client._ensure_handshake(
+                                interaction=interaction,
+                                seed=seed,
+                                counterparty=generic_pft_utilities.node_address,
+                                username=username,
+                                command_name="pf_initiate"
+                            )
+                            
+                            if not handshake_success:
+                                return
+                            
+                            await message_obj.edit(content="Sending commitment and encrypted google doc link to node...")
+
+                            # Attempt the initiation rite
+                            post_fiat_task_generation_system.discord__initiation_rite(
+                                user_seed=seed, 
+                                initiation_rite=self.commitment_sentence.value, 
+                                google_doc_link=self.google_doc_link.value, 
+                                username=username,
+                                allow_reinitiation=config.RuntimeConfig.USE_TESTNET and config.RuntimeConfig.ENABLE_REINITIATIONS  # Allow re-initiation in test mode
+                            )
+                            
+                            mode = "(TEST MODE)" if config.RuntimeConfig.USE_TESTNET else ""
+                            await message_obj.edit(
+                                content=f"Initiation complete! {mode}\nCommitment: {self.commitment_sentence.value}\nGoogle Doc: {self.google_doc_link.value}"
+                            )
+
+                        except Exception as e:
+                            logger.error(f"MyClient.setup_hook.pf_initiate: Error during initiation: {str(e)}")
+                            await message_obj.edit(content=f"An error occurred during initiation: {str(e)}")
+
+                # Show modal immediately
+                await interaction.response.send_modal(InitiationModal(client_instance=self))
+
+            except Exception as e:
+                logger.error(f"MyClient.setup_hook.pf_initiate: Error during initiation: {str(e)}")
+                await interaction.followup.send(f"An error occurred during initiation: {str(e)}", ephemeral=True)
+
+        @self.tree.command(name="pf_update_link", description="Update your Google Doc link")
+        async def pf_update_link(interaction: discord.Interaction):
+            user_id = interaction.user.id
+
+            # Check if the user has a stored seed
+            if user_id not in self.user_seeds:
                 await interaction.response.send_message(
-                    "You must fund your wallet with at least 15 XRP before initiating.", ephemeral=True
+                    "You must store a seed using /pf_store_seed first.",
+                    ephemeral=True
                 )
                 return
+            
+            try:
+                logger.debug(f"MyClient.pf_update_link: Spawning wallet for {interaction.user.name} to update google doc link")
+                seed = self.user_seeds[user_id]
+                username = interaction.user.name
+                wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
 
-            # Step 3: Check if the initiation rite has already been performed
-            full_memo_detail = generic_pft_utilities.get_memo_detail_df_for_account(
-                account_address=wallet_address, pft_only=False
-            )
-            if len(full_memo_detail[full_memo_detail['memo_type'] == "INITIATION_RITE"]) > 0:
-                await interaction.response.send_message(
-                    "You have already performed an initiation rite with this wallet.", ephemeral=True
+                # Check initiation status
+                initiation_check_success = await self._check_initiation_rite(
+                    interaction=interaction,
+                    wallet_address=wallet.address
                 )
-                return
+                if not initiation_check_success:
+                    await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                    return
+                
+                # Define the modal for new Google Doc link
+                class UpdateLinkModal(discord.ui.Modal, title='Update Google Doc Link'):
+                    def __init__(self, client_instance: discord.Client, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self.client = client_instance
 
-            # Step 4: Define the modal to collect Google Doc Link and Commitment
-            class InitiationModal(discord.ui.Modal, title='Initiation Commitment'):
-                google_doc_link = discord.ui.TextInput(label='Google Doc Link', style=discord.TextStyle.short)
-                commitment_sentence = discord.ui.TextInput(
-                    label='Commit to a Long-Term Objective',
-                    style=discord.TextStyle.long
-                )
+                    google_doc_link = discord.ui.TextInput(
+                        label='Please enter new Google Doc Link', 
+                        style=discord.TextStyle.long,
+                        placeholder="Your link will be encrypted but the node operator retains access for effective task generation."
+                    )
 
-                def __init__(self, wallet_address, seed, username):
-                    super().__init__()
-                    self.wallet_address = wallet_address
-                    self.seed = seed
-                    self.username = username
+                    async def on_submit(self, interaction: discord.Interaction):
+                        await interaction.response.defer(ephemeral=True)
 
-                async def on_submit(self, interaction: discord.Interaction):
-                    await interaction.response.defer(ephemeral=True)
-                    
-                    google_doc_link = self.google_doc_link.value
-                    commitment_sentence = self.commitment_sentence.value
-                    initiation_success = False
-                    
-                    try:
-                        output_string = post_fiat_task_generation_system.discover_server__initiation_rite(
-                            account_seed=self.seed, 
-                            initiation_rite=commitment_sentence, 
-                            google_doc_link=google_doc_link, 
-                            username=self.username
-                        )
-                        initiation_success = True
-                    except Exception as e:
-                        print(f"Error during initiation: {str(e)}")
-                    
-                    if initiation_success:
-                        await interaction.followup.send(
-                            f"Initiation complete!\nGoogle Doc Link: {google_doc_link}\nCommitment: {commitment_sentence}",
-                            ephemeral=True
-                        )
-                    else:
-                        await interaction.followup.send(
-                            "There was an issue with the initiation. Please try again.", 
-                            ephemeral=True
-                        )
-            # Error during initiation: string indices must be integers, not 'str'
-            # Step 5: Present the modal to the user
-            modal = InitiationModal(wallet_address=wallet_address, seed=seed, username=interaction.user.name)
-            await interaction.response.send_modal(modal)
-            print("Initiation command executed!")
+                        try:
+                            handshake_success, user_key, node_key, message_obj = await self.client._ensure_handshake(
+                                interaction=interaction,
+                                seed=seed,
+                                counterparty=generic_pft_utilities.node_address,
+                                username=username,
+                                command_name="pf_update_link"
+                            )
+
+                            if not handshake_success:
+                                return
+
+                            await message_obj.edit(content="Sending encrypted google doc link to node...")
+
+                            # Construct and send the encrypted memo
+                            post_fiat_task_generation_system.discord__update_google_doc_link(
+                                user_seed=seed,
+                                google_doc_link=self.google_doc_link.value,
+                                username=username
+                            )
+
+                            await message_obj.edit(content=f"Google Doc link updated to {self.google_doc_link.value}")
+
+                        except Exception as e:
+                            logger.error(f"MyClient.pf_update_link: Error during update: {str(e)}")
+                            await interaction.followup.send(f"An error occurred during update: {str(e)}", ephemeral=True)
+
+                # Show modal immediately
+                await interaction.response.send_modal(UpdateLinkModal(client_instance=self))
+
+            except Exception as e:
+                logger.error(f"MyClient.pf_update_link: Error during update: {str(e)}")
+                await interaction.followup.send(f"An error occurred during update: {str(e)}", ephemeral=True)
 
         @self.tree.command(name="pf_request_task", description="Request a Post Fiat task")
         async def pf_task_slash(interaction: discord.Interaction, task_request: str):
@@ -676,7 +1469,17 @@ class MyClient(discord.Client):
             # Get the user's seed and other necessary information
             seed = self.user_seeds[user_id]
             user_name = interaction.user.name
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
             
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                return
+
             # Defer the response to avoid timeout
             await interaction.response.defer(ephemeral=True)
             
@@ -685,7 +1488,7 @@ class MyClient(discord.Client):
                 response = post_fiat_task_generation_system.discord__send_postfiat_request(
                     user_request=task_request,
                     user_name=user_name,
-                    seed=seed
+                    user_seed=seed  # TODO: change to wallet
                 )
                 
                 # Extract transaction information
@@ -696,8 +1499,6 @@ class MyClient(discord.Client):
                 await interaction.followup.send(f"Task Requested with Details: {clean_string}", ephemeral=True)
             except Exception as e:
                 await interaction.followup.send(f"An error occurred while processing your request: {str(e)}", ephemeral=True)
-
-
 
         @self.tree.command(name="pf_initial_verification", description="Submit a task for verification")
         async def pf_submit_for_verification(interaction: discord.Interaction):
@@ -712,12 +1513,35 @@ class MyClient(discord.Client):
 
             seed = self.user_seeds[user_id]
 
+            logger.debug(f"MyClient.setup_hook.pf_initial_verification: Spawning wallet to fetch tasks for {interaction.user.name}")
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                return
+
             # Fetch the tasks that are accepted but not completed
-            wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
-            wallet_address = wallet.classic_address
-            all_wallet_transactions = generic_pft_utilities.get_memo_detail_df_for_account(wallet_address).copy()
-            pf_df = generic_pft_utilities.convert_all_account_info_into_outstanding_task_df(account_memo_detail_df=all_wallet_transactions)
-            accepted_tasks = pf_df[pf_df['acceptance'] != ''].copy()
+            memo_history = generic_pft_utilities.get_account_memo_history(wallet.address).copy()
+
+            pf_df = post_fiat_task_generation_system.get_accepted_proposals(account=memo_history)
+
+            # Return immediately if proposal acceptance pairs are empty
+            if pf_df.empty:
+                await interaction.response.send_message("You have no tasks to submit for verification.", ephemeral=True)
+                return
+
+            # Filter for accepted tasks that have not been completed yet
+            accepted_tasks = pf_df[
+                (pf_df['acceptance'] != '') & 
+                ~pf_df.index.isin(memo_history[
+                    memo_history['memo_data'].str.contains(constants.TaskType.VERIFICATION_PROMPT.value, na=False)
+                ]['memo_type'].unique())
+            ].copy()
             
             # If there are no accepted tasks, notify the user
             if accepted_tasks.empty:
@@ -766,7 +1590,7 @@ class MyClient(discord.Client):
                     
                     # Call the discord__initial_submission function
                     output_string = post_fiat_task_generation_system.discord__initial_submission(
-                        seed_to_work=self.seed,
+                        user_seed=self.seed,
                         user_name=self.user_name,
                         task_id_to_accept=self.task_id,
                         initial_completion_string=completion_string
@@ -825,7 +1649,9 @@ class MyClient(discord.Client):
 
                 async def on_submit(self, interaction: discord.Interaction):
                     user_id = interaction.user.id
+                    logger.debug(f"WalletInfoModal.on_submit: Storing seed for user {interaction.user.name} (ID: {user_id})")
                     self.client.user_seeds[user_id] = self.seed.value
+
                     await interaction.response.send_message(
                         "Wallet created successfully. You must fund the wallet with 15+ XRP to use as a Post Fiat Wallet. "
                         "The seed is stored to Discord Hot Wallet. To store different seed use /pf_store_seed. "
@@ -875,6 +1701,7 @@ class MyClient(discord.Client):
 1. /pf_new_wallet: Generate a new XRP wallet. You need to fund via Coinbase etc to continue
 2. /pf_store_seed: Securely store your wallet seed.
 3. /pf_initiate: Initiate your commitment to the Post Fiat system, get access to PFT and initial grant
+4. /pf_update_link: Update your Google Doc link
 
 ### Task Request
 1. /pf_request_task: Request a new Post Fiat task.
@@ -886,7 +1713,7 @@ class MyClient(discord.Client):
 ### Transaction
 1. /xrp_send: Send XRP to a destination address with a memo.
 2. /pf_send: Open a transaction form to send PFT tokens with a memo.
-3. /pf_log: take notes re your workflows 
+3. /pf_log: take notes re your workflows, with optional encryption
 
 ## Post Fiat operates on a Google Document.
 1. Place your Funded Wallet Address at the top of the Google Document 
@@ -910,9 +1737,12 @@ Note: XRP wallets need 15 XRP to transact.
         @self.tree.command(name="pf_my_wallet", description="Show your wallet information")
         async def pf_my_wallet(interaction: discord.Interaction):
             user_id = interaction.user.id
+
+            # Defer the response to avoid timeout
+            await interaction.response.defer(ephemeral=True)
             
             if user_id not in self.user_seeds:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "No seed found for your account. Use /pf_store_seed to store a seed first.",
                     ephemeral=True
                 )
@@ -920,14 +1750,15 @@ Note: XRP wallets need 15 XRP to transact.
 
             try:
                 seed = self.user_seeds[user_id]
-                wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed)
+                logger.debug(f"MyClient.setup_hook.pf_my_wallet: Spawning wallet to fetch info for {interaction.user.name}")
+                wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
                 wallet_address = wallet.classic_address
 
                 # Get account info
-                account_info = generic_pft_utilities.generate_basic_balance_info_string_for_account_address(account_address=wallet_address)
+                account_info = self.generate_basic_balance_info_string(address=wallet.address)
                 
                 # Get recent messages
-                recent_messages = generic_pft_utilities.get_recent_messages_for_account_address(wallet_address)
+                incoming_messages, outgoing_messages = generic_pft_utilities.get_recent_messages(wallet_address)
 
                 # Split long strings if they exceed Discord's limit
                 def truncate_field(content, max_length=1024):
@@ -952,26 +1783,26 @@ Note: XRP wallets need 15 XRP to transact.
                 
                 embeds.append(embed)
 
-                # Second embed for transaction history if needed
-                if recent_messages['incoming_message'] or recent_messages['outgoing_message']:
+                if incoming_messages or outgoing_messages:
                     embed2 = discord.Embed(title="Recent Transactions", color=0x00ff00)
                     
-                    if recent_messages['incoming_message']:
-                        incoming = truncate_field(recent_messages['incoming_message'])
+                    if incoming_messages:
+                        incoming = truncate_field(incoming_messages)
                         embed2.add_field(name="Most Recent Incoming Transaction", value=incoming, inline=False)
                     
-                    if recent_messages['outgoing_message']:
-                        outgoing = truncate_field(recent_messages['outgoing_message'])
+                    if outgoing_messages:
+                        outgoing = truncate_field(outgoing_messages)
                         embed2.add_field(name="Most Recent Outgoing Transaction", value=outgoing, inline=False)
                     
                     embeds.append(embed2)
 
                 # Send all embeds
-                await interaction.response.send_message(embeds=embeds, ephemeral=True)
+                await interaction.followup.send(embeds=embeds, ephemeral=True)
             
             except Exception as e:
                 error_message = f"An unexpected error occurred: {str(e)}. Please try again later or contact support if the issue persists."
-                await interaction.response.send_message(error_message, ephemeral=True)
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+                await interaction.followup.send(error_message, ephemeral=True)
 
         @self.tree.command(name="pf_rewards", description="Show your recent Post Fiat rewards")
         async def pf_rewards(interaction: discord.Interaction):
@@ -986,16 +1817,31 @@ Note: XRP wallets need 15 XRP to transact.
                 return
 
             seed = self.user_seeds[user_id]
-            wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed)
-            wallet_address = wallet.classic_address
+            logger.debug(f"MyClient.setup_hook.pf_rewards: Spawning wallet to fetch rewards for {interaction.user.name}")
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
+
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                return
 
             # Defer the response to avoid timeout for longer operations
             await interaction.response.defer(ephemeral=True)
 
             try:
-                all_wallet_transactions = generic_pft_utilities.get_memo_detail_df_for_account(wallet_address).copy().sort_values('datetime')
-                reward_summary_map = generic_pft_utilities.process_account_memo_details_into_reward_summary_map(all_account_info=all_wallet_transactions)
-                recent_rewards = generic_pft_utilities.format_reward_summary(reward_summary_map['reward_summaries'].tail(10))
+                memo_history = generic_pft_utilities.get_account_memo_history(wallet.address).copy().sort_values('datetime')
+
+                # Return immediately if memo history is empty
+                if memo_history.empty:
+                    await interaction.followup.send("You have no rewards to show.", ephemeral=True)
+                    return
+
+                reward_summary_map = self.generic_pft_utilities.get_reward_data(all_account_info=memo_history)
+                recent_rewards = self.format_reward_summary(reward_summary_map['reward_summaries'].tail(10))
 
                 # Split the message into chunks if it's too long
                 chunks = []
@@ -1033,12 +1879,27 @@ Note: XRP wallets need 15 XRP to transact.
                 return
 
             seed = self.user_seeds[user_id]
+            logger.debug(f"MyClient.setup_hook.pf_final_verification: Spawning wallet to fetch tasks for {interaction.user.name}")
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+
+            # Check initiation status
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=wallet.address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                return
 
             # Fetch the tasks that are in the verification queue
-            wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
-            wallet_address = wallet.classic_address
-            all_wallet_transactions = generic_pft_utilities.get_memo_detail_df_for_account(wallet_address).copy()
-            outstanding_verification = generic_pft_utilities.convert_all_account_info_into_outstanding_verification_df(account_memo_detail_df=all_wallet_transactions)
+            memo_history = generic_pft_utilities.get_account_memo_history(wallet.address).copy()
+
+            # Return immediately if memo history is empty
+            if memo_history.empty:
+                await interaction.response.send_message("You have no tasks in the verification queue.", ephemeral=True)
+                return
+
+            outstanding_verification = post_fiat_task_generation_system.get_verification_proposals(account=memo_history)
             
             # If there are no tasks in the verification queue, notify the user
             if outstanding_verification.empty:
@@ -1047,8 +1908,12 @@ Note: XRP wallets need 15 XRP to transact.
 
             # Create dropdown options based on the tasks in the verification queue
             options = [
-                SelectOption(label=task_id, description=memo_data.replace('VERIFICATION PROMPT ___','')[:100], value=task_id)
-                for task_id, memo_data in zip(outstanding_verification['memo_type'], outstanding_verification['memo_data'])
+                SelectOption(
+                    label=task_id, 
+                    description=verification[:100], 
+                    value=task_id
+                )
+                for task_id, verification in zip(outstanding_verification.index, outstanding_verification['verification'])
             ]
 
             # Create the Select menu
@@ -1087,7 +1952,7 @@ Note: XRP wallets need 15 XRP to transact.
                     
                     # Call the discord__final_submission function
                     output_string = post_fiat_task_generation_system.discord__final_submission(
-                        seed_to_work=self.seed,
+                        user_seed=self.seed,
                         user_name=self.user_name,
                         task_id_to_submit=self.task_id,
                         justification_string=justification_string
@@ -1099,7 +1964,7 @@ Note: XRP wallets need 15 XRP to transact.
             # Define the callback for when a user selects an option
             async def select_callback(interaction: discord.Interaction):
                 selected_task_id = select.values[0]
-                task_text = outstanding_verification[outstanding_verification['memo_type'] == selected_task_id]['memo_data'].values[0]
+                task_text = outstanding_verification.loc[selected_task_id, 'verification']
                 # Open the modal to get the verification justification with the task text pre-populated
                 await interaction.response.send_modal(VerificationModal(
                     task_id=selected_task_id,
@@ -1118,16 +1983,139 @@ Note: XRP wallets need 15 XRP to transact.
             # Send the message with the dropdown menu
             await interaction.response.send_message("Please choose a task for final verification:", view=view, ephemeral=True)
 
+    async def _check_initiation_rite(
+        self,
+        interaction: discord.Interaction,
+        wallet_address: str,
+        require_initiation: bool = True
+    ) -> bool:
+        """
+        Check if a wallet has completed the initiation rite.
+        
+        Args:
+            wallet_address: The wallet address to check
+            interaction: Discord interaction object for sending responses
+            require_initiation: If True, requires initiation to proceed. If False, blocks re-initiation.
+        
+        Returns:
+            bool: True if check passes (can proceed), False if should block
+        """
+        memo_history = generic_pft_utilities.get_account_memo_history(
+            account_address=wallet_address, 
+            pft_only=False
+        )
+        existing_initiations = memo_history[
+            (memo_history['memo_type'] == 'INITIATION_RITE') & 
+            (memo_history['transaction_result'] == 'tesSUCCESS')
+        ]
+
+        has_initiated = not existing_initiations.empty
+
+        if require_initiation:
+            # Block if not initiated
+            if not has_initiated: 
+                return False
+        else:
+            # Block re-initiation unless on testnet with ENABLE_REINITIATIONS
+            if has_initiated and not (config.RuntimeConfig.USE_TESTNET and config.RuntimeConfig.ENABLE_REINITIATIONS):
+                logger.debug(f"MyClient._check_initiation_status: Blocking re-initiation for {interaction.user.name} ({wallet_address})")
+                return False
+        return True
+
+    async def _ensure_handshake(
+        self,
+        interaction: discord.Interaction,
+        seed: str,
+        counterparty: str,
+        username: str,
+        command_name: str,
+        message_obj: discord.Message = None
+    ) -> tuple[bool, Optional[str], Optional[str]]:
+        """
+        Ensures handshake protocol is established between wallet and counterparty
+
+        Args: 
+            interaction: Discord interaction object
+            wallet_address: Wallet address of the user
+            counterparty: Counterparty address
+            seed: Seed of the user
+            username: Username of the user
+            command_name: Name of the command that requires the handshake protocol
+            message_obj: Message object to edit (optional)
+
+        Returns:
+            tuple[bool, str, str, discord.Message]: (success, user_key, counterparty_key, message_obj)
+        """
+        try:
+            # Send message if we don't have a message object
+            if not message_obj:
+                message_obj = await interaction.followup.send(
+                    "Checking encryption handshake status...",
+                    ephemeral=True,
+                    wait=True  # returns message object
+                )
+
+            # Check handshake status
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+            user_key, counterparty_key = generic_pft_utilities.get_handshake_for_address(
+                channel_address=wallet.classic_address,
+                channel_counterparty=counterparty
+            )
+
+            if not user_key:
+                # Send handshake if we haven't yet
+                logger.debug(f"MyClient.{command_name}: Initiating handshake for {username} with {counterparty}")
+                generic_pft_utilities.send_handshake(
+                    wallet_seed=seed,
+                    destination=counterparty,
+                    username=username
+                )
+                await message_obj.edit(content="Encryption handshake initiated. Waiting for onchain confirmation...")
+
+                # Verify handshake completion and response from counterparty (node or remembrancer)
+                for attempt in range(constants.NODE_HANDSHAKE_RESPONSE_USER_VERIFICATION_ATTEMPTS):
+                    logger.debug(f"MyClient.{command_name}: Checking handshake status for {username} with {counterparty} (attempt {attempt+1})")
+
+                    user_key, counterparty_key = generic_pft_utilities.get_handshake_for_address(
+                        channel_address=wallet.classic_address,
+                        channel_counterparty=counterparty
+                    )
+
+                    if counterparty_key:
+                        logger.debug(f"MyClient.{command_name}: Handshake confirmed for {username} with {counterparty}")
+                        break
+
+                    if user_key:
+                        await message_obj.edit(content="Handshake sent. Waiting for node to process...")
+
+                    await asyncio.sleep(constants.NODE_HANDSHAKE_RESPONSE_USER_VERIFICATION_INTERVAL)
+
+            if not user_key:
+                await message_obj.edit(content="Encryption handshake failed to send. Please reach out to support.")
+                return False, None, None, message_obj
+            
+            if not counterparty_key:
+                await message_obj.edit(content="Encryption handshake sent but not yet processed. Please wait and try again later.")
+                return False, user_key, None, message_obj
+            
+            await message_obj.edit(content="Handshake verified. Proceeding with operation...")
+            return True, user_key, counterparty_key, message_obj
+
+        except Exception as e:
+            logger.error(f"MyClient.{command_name}: An error occurred while ensuring handshake: {str(e)}")
+            await message_obj.edit(content=f"An error occurred during handshake setup: {str(e)}")
+            return False, None, None, message_obj
+
     async def on_ready(self):
-        print(f'Logged in as {self.user} (ID: {self.user.id})')
-        print('------')
-        print('Connected to the following guilds:')
+        logger.debug(f'MyClient.on_ready: Logged in as {self.user} (ID: {self.user.id})')
+        logger.debug('MyClient.on_ready: ------------------------------')
+        logger.debug('MyClient.on_ready: Connected to the following guilds:')
         for guild in self.guilds:
-            print(f'- {guild.name} (ID: {guild.id})')
+            logger.debug(f'- {guild.name} (ID: {guild.id})')
 
         # Optionally, re-sync slash commands in all guilds
         await self.tree.sync()
-        print('Slash commands synced across all guilds.')
+        logger.debug('MyClient.on_ready: Slash commands synced across all guilds.')
 
 
     async def send_message_chunks(self, channel, message, user):
@@ -1172,6 +2160,23 @@ Note: XRP wallets need 15 XRP to transact.
                 to_send = long_message
                 long_message = ''
             await channel.send(to_send)
+
+    async def send_long_interaction_response(self, interaction: discord.Interaction, content: str, ephemeral: bool = True):
+        max_length = 1900
+        lines = content.split('\n')
+        current_chunk = ""
+
+        for line in lines:
+            if len(current_chunk) + len(line) + 1 > max_length:
+                # Send the current chunk
+                await interaction.followup.send(current_chunk.strip(), ephemeral=ephemeral)
+                current_chunk = line + "\n"
+            else:
+                current_chunk += line + "\n"
+
+        # Send any remaining content
+        if current_chunk.strip():
+            await interaction.followup.send(current_chunk.strip(), ephemeral=ephemeral)
         
     async def send_long_message(self, message, long_message):
         sent_messages = []
@@ -1232,23 +2237,24 @@ Note: XRP wallets need 15 XRP to transact.
         return sent_messages
 
     async def check_and_notify_new_transactions(self):
-        CHANNEL_ID = 1239280089699450920
+        CHANNEL_ID = self.node_config.discord_activity_channel_id
         channel = self.get_channel(CHANNEL_ID)
         
         if not channel:
-            print(f"Error: Channel with ID {CHANNEL_ID} not found.")
+            logger.error(f"MyClient.check_and_notify_new_transactions: ERROR: Channel with ID {CHANNEL_ID} not found.")
             return
 
-        try:
-            # Call the function to get new messages and update the database
-            messages_to_send = post_fiat_task_generation_system.output_messages_to_send_and_write_incremental_info_to_foundation_discord_db()
+        # Call the function to get new messages and update the database
+        messages_to_send = post_fiat_task_generation_system.sync_and_format_new_transactions()
 
-            # Send each new message to the Discord channel
-            for message in messages_to_send:
-                await channel.send(message)
+        # DEBUGGING
+        len_messages_to_send = len(messages_to_send)
+        if len_messages_to_send > 0:
+            logger.debug(f"MyClient.check_and_notify_new_transactions: Sending {len_messages_to_send} messages to the Discord channel") 
 
-        except Exception as e:
-            print(f"An error occurred while checking for new transactions: {str(e)}")
+        # Send each new message to the Discord channel
+        for message in messages_to_send:
+            await channel.send(message)
 
     async def transaction_checker(self):
         await self.wait_until_ready()
@@ -1277,44 +2283,39 @@ Note: XRP wallets need 15 XRP to transact.
                     if channel:
                         if target_user_id in self.user_seeds:
                             seed = self.user_seeds[target_user_id]
-                            user_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                            logger.debug(f"MyClient.death_march_reminder: Spawning wallet to fetch info for {target_user_id}")
+                            user_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
                             user_address = user_wallet.classic_address
                             tactical_string = self.post_fiat_task_generation_system.get_o1_coaching_string_for_account(user_address)
                             
                             # Send the message to the channel
                             await self.send_long_message_to_channel(channel, f"<@{target_user_id}> Death March Update:\n{tactical_string}")
                         else:
-                            print(f"No seed found for user {target_user_id}")
+                            logger.debug(f"MyClient.death_march_reminder: No seed found for user {target_user_id}")
                     else:
-                        print(f"Channel with ID {channel_id} not found")
+                        logger.debug(f"MyClient.death_march_reminder: Channel with ID {channel_id} not found")
                 else:
-                    print("Outside of allowed time range. Skipping Death March reminder.")
+                    logger.debug("MyClient.death_march_reminder: Outside of allowed time range. Skipping Death March reminder.")
             except Exception as e:
-                print(f"An error occurred in death_march_reminder: {str(e)}")
-            
+                logger.error(f"MyClient.death_march_reminder: An error occurred: {str(e)}")
+
             # Wait for 30 minutes before the next reminder (10 seconds for testing)
             await asyncio.sleep(30*60)  # Change to 1800 (30 minutes) for production
             
     async def on_message(self, message):
         if message.author.id == self.user.id:
             return
-        
-        #if message.author.id != 402536023483088896: 
-            #print('IT IS ALEX')# Check if the user ID matches goodalexander's ID
-        #    return
 
         user_id = message.author.id
         if user_id not in self.conversations:
             self.conversations[user_id] = []
-        
-
 
         self.conversations[user_id].append({
             "role": "user",
             "content": message.content})
 
         conversation = self.conversations[user_id]
-        if len(self.conversations[user_id]) > MAX_HISTORY:
+        if len(self.conversations[user_id]) > constants.MAX_HISTORY:
             del self.conversations[user_id][0]  # Remove the oldest message
 
         if message.content.startswith('!odv'):
@@ -1322,9 +2323,9 @@ Note: XRP wallets need 15 XRP to transact.
             system_content_message = [{"role": "system", "content": odv_system_prompt}]
             ref_convo = system_content_message + conversation
             api_args = {
-            "model": default_openai_model,
+            "model": self.default_openai_model,
             "messages": ref_convo}
-            op_df = self.open_ai_request_tool.create_writable_df_for_chat_completion(api_args=api_args)
+            op_df = self.openai_request_tool.create_writable_df_for_chat_completion(api_args=api_args)
             content = op_df['choices__message__content'][0]
             gpt_response = content
             self.conversations[user_id].append({
@@ -1338,11 +2339,12 @@ Note: XRP wallets need 15 XRP to transact.
                 seed = self.user_seeds[user_id]
                 
                 try:
-                    generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
-                    user_wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
-                    full_user_context = generic_pft_utilities.get_full_user_context_string(user_wallet.classic_address)
+                    logger.debug(f"MyClient.tactics: Spawning wallet to fetch info for {message.author.name}")
+                    user_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+                    memo_history = self.generic_pft_utilities.get_account_memo_history(user_wallet.classic_address)
+                    full_user_context = self.user_task_parser.get_full_user_context_string(user_wallet.classic_address, memo_history=memo_history)
                     
-                    open_ai_request_tool = OpenAIRequestTool(pw_map=password_map_loader.pw_map)
+                    openai_request_tool = OpenAIRequestTool()
                     
                     user_prompt = f"""You are ODV Tactician module.
                     The User has the following transaction context as well as strategic context
@@ -1356,14 +2358,14 @@ Note: XRP wallets need 15 XRP to transact.
                     """
                     
                     api_args = {
-                        "model": 'chatgpt-4o-latest',
+                        "model": constants.DEFAULT_OPEN_AI_MODEL,
                         "messages": [
                             {"role": "system", "content": odv_system_prompt},
                             {"role": "user", "content": user_prompt}
                         ]
                     }
                     
-                    writable_df = open_ai_request_tool.create_writable_df_for_chat_completion(api_args=api_args)
+                    writable_df = openai_request_tool.create_writable_df_for_chat_completion(api_args=api_args)
                     tactical_string = writable_df['choices__message__content'][0]
                     
                     await self.send_long_message(message, tactical_string)
@@ -1382,20 +2384,24 @@ Note: XRP wallets need 15 XRP to transact.
                 
                 try:
                     # Get user's wallet address
-                    user_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                    logger.debug(f"MyClient.coach: Spawning wallet to fetch info for {message.author.name}")
+                    user_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
                     wallet_address = user_wallet.classic_address
 
                     # Check PFT balance
                     pft_balance = self.generic_pft_utilities.get_account_pft_balance(wallet_address)
-                    if pft_balance < 25000:
-                        await message.reply(
-                            f"You need at least 25,000 PFT to use the coach command. Your current balance is {pft_balance:,.2f} PFT.", 
-                            mention_author=True
-                        )
-                        return
+                    logger.debug(f"MyClient.coach: PFT balance for {message.author.name} is {pft_balance}")
+                    if not (config.RuntimeConfig.USE_TESTNET and config.RuntimeConfig.DISABLE_PFT_REQUIREMENTS):
+                        if pft_balance < 25000:
+                            await message.reply(
+                                f"You need at least 25,000 PFT to use the coach command. Your current balance is {pft_balance:,.2f} PFT.", 
+                                mention_author=True
+                            )
+                            return
 
                     # Get user's full context
-                    full_context = self.generic_pft_utilities.get_full_user_context_string(account_address=wallet_address)
+                    memo_history = self.generic_pft_utilities.get_account_memo_history(account_address=wallet_address)
+                    full_context = self.user_task_parser.get_full_user_context_string(account_address=wallet_address, memo_history=memo_history)
                     
                     # Get chat history
                     chat_history = []
@@ -1433,7 +2439,7 @@ My specific question/request is: {user_query}"""
                     await message.add_reaction('⏳')
 
                     # Make the API call using o1_preview_simulated_request
-                    response = self.open_ai_request_tool.o1_preview_simulated_request(
+                    response = await self.openai_request_tool.o1_preview_simulated_request_async(
                         system_prompt=odv_system_prompt,
                         user_prompt=user_prompt
                     )
@@ -1455,6 +2461,8 @@ My specific question/request is: {user_query}"""
                     
                 except Exception as e:
                     await message.remove_reaction('⏳', self.user)
+                    logger.error(f"MyClient.coach: An error occurred while processing your request: {str(e)}")
+                    logger.error(traceback.format_exc())
                     error_msg = f"An error occurred while processing your request: {str(e)}"
                     await message.reply(error_msg, mention_author=True)
             else:
@@ -1465,10 +2473,9 @@ My specific question/request is: {user_query}"""
                 seed = self.user_seeds[user_id]
                 
                 try:
-                    #generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
-                    user_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                    logger.debug(f"MyClient.blackprint: Spawning wallet to fetch info for {message.author.name}")
+                    user_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
                     user_address = user_wallet.classic_address
-                    #full_user_context = self.generic_pft_utilities.get_full_user_context_string(user_wallet.classic_address)
                     tactical_string = self.post_fiat_task_generation_system.generate_coaching_string_for_account(user_address)
                     
                     await self.send_long_message(message, tactical_string)
@@ -1485,10 +2492,9 @@ My specific question/request is: {user_query}"""
                 seed = self.user_seeds[user_id]
                 
                 try:
-                    #generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
-                    user_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                    logger.debug(f"MyClient.deathmarch: Spawning wallet to fetch info for {message.author.name}")
+                    user_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
                     user_address = user_wallet.classic_address
-                    #full_user_context = self.generic_pft_utilities.get_full_user_context_string(user_wallet.classic_address)
                     tactical_string = self.post_fiat_task_generation_system.get_o1_coaching_string_for_account(user_address)
                     
                     await self.send_long_message(message, tactical_string)
@@ -1504,10 +2510,9 @@ My specific question/request is: {user_query}"""
                 seed = self.user_seeds[user_id]
                 
                 try:
-                    #generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
-                    user_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                    logger.debug(f"MyClient.redpill: Spawning wallet to fetch info for {message.author.name}")
+                    user_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
                     user_address = user_wallet.classic_address
-                    #full_user_context = self.generic_pft_utilities.get_full_user_context_string(user_wallet.classic_address)
                     tactical_string = self.post_fiat_task_generation_system.o1_redpill(user_address)
                     
                     await self.send_long_message(message, tactical_string)
@@ -1523,10 +2528,9 @@ My specific question/request is: {user_query}"""
                 seed = self.user_seeds[user_id]
                 
                 try:
-                    #generic_pft_utilities = GenericPFTUtilities(pw_map=password_map_loader.pw_map, node_name='postfiatfoundation')
-                    user_wallet = self.generic_pft_utilities.spawn_user_wallet_from_seed(seed=seed)
+                    logger.debug(f"MyClient.docrewrite: Spawning wallet to fetch info for {message.author.name}")
+                    user_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
                     user_address = user_wallet.classic_address
-                    #full_user_context = self.generic_pft_utilities.get_full_user_context_string(user_wallet.classic_address)
                     tactical_string = self.post_fiat_task_generation_system.generate_document_rewrite_instructions(user_address)
                     
                     await self.send_long_message(message, tactical_string)
@@ -1544,7 +2548,7 @@ My specific question/request is: {user_query}"""
 
         if message.content.startswith('!wallet_info'):
             wallet_to_get = message.content.replace('!wallet_info','').strip()
-            account_info = generic_pft_utilities.generate_basic_balance_info_string_for_account_address(account_address=wallet_to_get)
+            account_info = self.generate_basic_balance_info_string(address=wallet_to_get, owns_wallet=False)
             await self.send_long_message(message, account_info)
 
         if message.content.startswith('!store_seed'):
@@ -1569,7 +2573,7 @@ My specific question/request is: {user_query}"""
                 user_name = message.author.name
                 memo_to_send = generic_pft_utilities.construct_standardized_xrpl_memo(memo_data=message_to_send, memo_format = user_name, memo_type=task_id)
                 seed = self.user_seeds[user_id]
-                response = post_fiat_task_generation_system.discord__send_postfiat_request(user_request= message_to_send, user_name=user_name, seed=seed)
+                response = post_fiat_task_generation_system.discord__send_postfiat_request(user_request= message_to_send, user_name=user_name, user_seed=seed)
                 transaction_info = generic_pft_utilities.extract_transaction_info_from_response_object(response=response)
                 clean_string = transaction_info['clean_string']
                 await self.send_long_message(message, f"Task Requested with Details {clean_string}")
@@ -1580,9 +2584,10 @@ My specific question/request is: {user_query}"""
             # Retrieve and show the stored seed for the user
             if user_id in self.user_seeds:
                 seed = self.user_seeds[user_id]
-                wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed)
+                logger.debug(f"MyClient.my_wallet: Spawning wallet to fetch info for {message.author.name}")
+                wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
                 wallet_address = wallet.address
-                account_info = generic_pft_utilities.generate_basic_balance_info_string_for_account_address(account_address=wallet_address)
+                account_info = self.generate_basic_balance_info_string(address=wallet_address)
                 await self.send_long_message(message, f"Based on your seed your linked {account_info}")
             else:
                 await message.reply("No seed found for your account.", mention_author=True)
@@ -1595,15 +2600,16 @@ My specific question/request is: {user_query}"""
                 await message.reply("You must store a seed before initiating.", mention_author=True)
                 return
             seed = self.user_seeds[user_id]
-            wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed)
+            logger.debug(f"MyClient.pf_initiate: Spawning wallet to initiate for {message.author.name}")
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
             wallet_address = wallet.classic_address
-            xrp_balance = generic_pft_utilities.get_account_xrp_balance(account_address=wallet_address)
-            if xrp_balance < 12:
-                await message.reply("You must fund your wallet with at least 15 XRP before initiating.", mention_author=True)
+            xrp_balance = generic_pft_utilities.get_xrp_balance(address=wallet_address)
+            if xrp_balance < constants.MIN_XRP_BALANCE:
+                await message.reply(f"You must fund your wallet with at least {constants.MIN_XRP_BALANCE} XRP before initiating.", mention_author=True)
                 return
 
-            full_memo_detail = generic_pft_utilities.get_memo_detail_df_for_account(account_address=wallet_address,pft_only=False)
-            if len(full_memo_detail[full_memo_detail['memo_type']=="INITIATION_RITE"]) > 0:
+            memo_history = generic_pft_utilities.get_account_memo_history(account_address=wallet_address,pft_only=False)
+            if len(memo_history[memo_history['memo_type']=="INITIATION_RITE"]) > 0:
                 await message.reply("You have already performed an initiation rite with this wallet.", mention_author=True)
                 return
 
@@ -1612,21 +2618,446 @@ My specific question/request is: {user_query}"""
             if user_id not in self.user_seeds:
                 await message.reply("You must store a seed before getting outstanding tasks.", mention_author=True)
                 return
-            wallet = generic_pft_utilities.spawn_user_wallet_from_seed(seed)
+            logger.debug(f"MyClient.pf_outstanding: Spawning wallet to fetch tasks for {message.author.name}")
+            wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
             wallet_address = wallet.classic_address
-            output_message = generic_pft_utilities.create_full_outstanding_pft_string(account_address=wallet_address)
-            #escaped_output = f"""```{output_message}```"""
-            #await self.send_long_message(message, escaped_output)
+            output_message = self.create_full_outstanding_pft_string(account_address=wallet_address)
             await self.send_long_escaped_message(message, output_message)
 
-   
+    def generate_basic_balance_info_string(self, address: str, owns_wallet: bool = True) -> str:
+        """Generate account information summary including balances and stats.
         
+        Args:
+            wallet: Either an XRPL wallet object (for full access including encrypted docs) 
+                or an address string (for public info only)
+                
+        Returns:
+            str: Formatted account information string
+        """
+        account_info = AccountInfo(address=address)
 
-        #if message.content.startswith('!pf_message'):
+        try:
+            memo_history = generic_pft_utilities.get_account_memo_history(account_address=address)
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guild_messages = True
+            if not memo_history.empty:
 
-client = MyClient(intents=intents)
-client.run(password_map_loader.pw_map['discordbot_secret'])
+                # transaction count
+                account_info.transaction_count = len(memo_history)
+
+                # Likely username
+                account_info.username = list(memo_history[memo_history['direction']=='OUTGOING']['memo_format'].mode())[0]
+
+                # Reward statistics
+                reward_data = self.get_reward_data(all_account_info=memo_history)
+                if not reward_data['reward_ts'].empty:
+                    account_info.monthly_pft_avg = float(reward_data['reward_ts'].tail(4).mean().iloc[0])
+                    account_info.weekly_pft_avg = float(reward_data['reward_ts'].tail(1).mean().iloc[0])
+
+            # Get balances
+            try:
+                account_info.xrp_balance = self.generic_pft_utilities.get_xrp_balance(address)
+                account_info.pft_balance = self.generic_pft_utilities.get_pft_balance(address)
+            except Exception as e:
+                # Account probably not activated yet
+                account_info.xrp_balance = 0
+                account_info.pft_balance = 0
+
+            # Get google doc link
+            if owns_wallet:
+                account_info.google_doc_link = self.generic_pft_utilities.get_latest_outgoing_context_doc_link(address)
+
+        except Exception as e:
+            logger.error(f"Error generating account info for {address}: {e}")
+
+        return self._format_account_info(account_info)
+    
+    def _format_account_info(self, info: AccountInfo) -> str:
+        """Format AccountInfo into readable string."""
+        output = f"""ACCOUNT INFO for {info.address}
+                    LIKELY ALIAS:     {info.username}
+                    XRP BALANCE:      {info.xrp_balance}
+                    PFT BALANCE:      {info.pft_balance}
+                    NUM PFT MEMO TX:  {info.transaction_count}
+                    PFT MONTHLY AVG:  {info.monthly_pft_avg}
+                    PFT WEEKLY AVG:   {info.weekly_pft_avg}"""
+        
+        if info.google_doc_link:
+            output += f"\n\nCONTEXT DOC:      {info.google_doc_link}"
+        
+        return output
+    
+    def format_tasks_for_discord(self, input_text: str):
+        """
+        Format task list for Discord with proper formatting and emoji indicators.
+        Handles three sections: NEW TASKS, ACCEPTED TASKS, and TASKS PENDING VERIFICATION.
+        Returns a list of formatted chunks ready for Discord sending.
+        """
+        # Handle empty input
+        if not input_text or input_text.strip() == "":
+            return ["```ansi\n\u001b[1;33m=== TASK STATUS ===\u001b[0m\n\u001b[0;37mNo tasks found.\u001b[0m\n```"]
+
+        # Split into sections
+        sections = input_text.split('\n')
+        current_section = None
+        formatted_parts = []
+        current_chunk = ["```ansi"]
+        current_chunk_size = len(current_chunk[0])
+
+        def add_to_chunks(content):
+            nonlocal current_chunk, current_chunk_size
+            content_size = len(content) + 1  # +1 for newline
+            
+            if current_chunk_size + content_size > 1900:
+                current_chunk.append("```")
+                formatted_parts.append("\n".join(current_chunk))
+                current_chunk = ["```ansi"]
+                current_chunk_size = len(current_chunk[0])
+                
+            current_chunk.append(content)
+            current_chunk_size += content_size
+
+        def format_task_id(task_id: str) -> tuple[str, str]:
+            """Format task ID and extract date"""
+            try:
+                datetime_str = task_id.split('__')[0]
+                date_obj = datetime.datetime.strptime(datetime_str, '%Y-%m-%d_%H:%M')
+                formatted_date = date_obj.strftime('%d %b %Y %H:%M')
+                return task_id, formatted_date
+            except (ValueError, IndexError):
+                return task_id, task_id
+        
+        # Process input text line by line
+        task_data = {}
+        for line in sections:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Check for section headers
+            if line in ["NEW TASKS", "ACCEPTED TASKS", "TASKS PENDING VERIFICATION"]:
+                if current_section:  # Add spacing between sections
+                    add_to_chunks("")
+                current_section = line
+                add_to_chunks(f"\u001b[1;33m=== {current_section} ===\u001b[0m")
+                continue
+
+            # Process task information
+            if line.startswith("Task ID: "):
+                task_id = line.replace("Task ID: ", "").strip()
+                task_data = {"id": task_id}
+                task_id, formatted_date = format_task_id(task_id)
+                add_to_chunks(f"\u001b[1;36m📌 Task {task_id}\u001b[0m")
+                add_to_chunks(f"\u001b[0;37mDate: {formatted_date}\u001b[0m")
+                continue
+
+            if line.startswith("Proposal: "):
+                proposal = line.replace("Proposal: ", "").strip()
+                proposal = proposal.replace("PROPOSED PF ___", "").strip()
+                priority_match = re.search(r'\.\. (\d+)$', proposal)
+                if priority_match:
+                    priority = priority_match.group(1)
+                    proposal = proposal.replace(f".. {priority}", "").strip()
+                    add_to_chunks(f"\u001b[0;32mPriority: {priority}\u001b[0m")
+                add_to_chunks(f"\u001b[1;37mProposal:\u001b[0m\n{proposal}")
+                continue
+
+            if line.startswith("Acceptance: "):
+                acceptance = line.replace("Acceptance: ", "").strip()
+                add_to_chunks(f"\u001b[1;37mAcceptance:\u001b[0m\n{acceptance}")
+                continue
+
+            if line.startswith("Verification Prompt: "):
+                verification = line.replace("Verification Prompt: ", "").strip()
+                add_to_chunks(f"\u001b[1;37mVerification Prompt:\u001b[0m\n{verification}")
+                continue
+
+            if line.startswith("-" * 10):  # Separator line
+                add_to_chunks("─" * 50)
+                continue
+
+        # Finalize last chunk
+        current_chunk.append("```")
+        formatted_parts.append("\n".join(current_chunk))
+        
+        return formatted_parts
+        
+    def format_pending_tasks(self, pending_proposals_df):
+        """
+        Convert pending_proposals_df to a more legible string format for Discord.
+        
+        Args:
+            pending_proposals_df: DataFrame containing pending proposals
+            
+        Returns:
+            Formatted string representation of the pending proposals
+        """
+        formatted_tasks = []
+        for idx, row in pending_proposals_df.iterrows():
+            task_str = f"Task ID: {idx}\n"
+            task_str += f"Proposal: {row['proposal']}\n"
+            task_str += "-" * 50  # Separator
+            formatted_tasks.append(task_str)
+        
+        formatted_task_string =  "\n".join(formatted_tasks)
+        output_string="NEW TASKS\n" + formatted_task_string
+        return output_string
+
+    def format_accepted_tasks(self, accepted_proposals_df):
+        """
+        Convert accepted_proposals_df to a legible string format for Discord.
+        
+        Args:
+            accepted_proposals_df: DataFrame containing outstanding tasks
+            
+        Returns:
+            Formatted string representation of the tasks
+        """
+        formatted_tasks = []
+        for idx, row in accepted_proposals_df.iterrows():
+            task_str = f"Task ID: {idx}\n"
+            task_str += f"Proposal: {row['proposal']}\n"
+            task_str += f"Acceptance: {row['acceptance']}\n"
+            task_str += "-" * 50  # Separator
+            formatted_tasks.append(task_str)
+        
+        formatted_task_string =  "\n".join(formatted_tasks)
+        output_string="ACCEPTED TASKS\n" + formatted_task_string
+        return output_string
+    
+    def format_verification_tasks(self, verification_proposals_df):
+        """
+        Format the verification_requirements dataframe into a string.
+
+        Args:
+            verification_proposals_df (pd.DataFrame): DataFrame containing tasks pending verification
+
+        Returns:
+        str: Formatted string of verification requirements
+        """
+        formatted_output = "TASKS PENDING VERIFICATION\n"
+        for idx, row in verification_proposals_df.iterrows():
+            formatted_output += f"Task ID: {idx}\n"
+            formatted_output += f"Proposal: {row['proposal']}\n"
+            formatted_output += f"Verification Prompt: {row['verification']}\n"
+            formatted_output += "-" * 50 + "\n"
+        return formatted_output
+    
+    def create_full_outstanding_pft_string(self, account_address):
+        """ 
+        This takes in an account address and outputs the current state of its outstanding tasks.
+        Returns empty string for accounts with no PFT-related transactions.
+        """ 
+        memo_history = generic_pft_utilities.get_account_memo_history(account_address=account_address, pft_only=True)
+        if memo_history.empty:
+            return ""
+        
+        memo_history.sort_values('datetime', inplace=True)
+        pending_proposals = post_fiat_task_generation_system.get_pending_proposals(account=memo_history)
+        accepted_proposals = post_fiat_task_generation_system.get_accepted_proposals(account=memo_history)
+        verification_proposals = post_fiat_task_generation_system.get_verification_proposals(account=memo_history)
+
+        pending_string = self.format_pending_tasks(pending_proposals)
+        accepted_string = self.format_accepted_tasks(accepted_proposals)
+        verification_string = self.format_verification_tasks(verification_proposals)
+
+        full_postfiat_outstanding_string=f"{pending_string}\n{accepted_string}\n{verification_string}"
+        return full_postfiat_outstanding_string
+
+    def _calculate_weekly_reward_totals(self, specific_rewards):
+        """Calculate weekly reward totals with proper date handling.
+        
+        Returns DataFrame with weekly_total column indexed by date"""
+        # Calculate daily totals
+        daily_totals = specific_rewards[['directional_pft', 'simple_date']].groupby('simple_date').sum()
+
+        if daily_totals.empty:
+            logger.warning("No rewards data available to calculate weekly totals.")
+            return pd.DataFrame(columns=['weekly_total'])
+
+        # Extend date range to today
+        today = pd.Timestamp.today().normalize()
+        start_date = daily_totals.index.min()
+
+        if pd.isna(start_date):
+            logger.warning("Start date is NaT, cannot calculate weekly totals.")
+            return pd.DataFrame(columns=['weekly_total'])
+        
+        date_range = pd.date_range(
+            start=start_date,
+            end=today,
+            freq='D'
+        )
+
+        # Fill missing dates and calculate weekly totals
+        extended_daily_totals = daily_totals.reindex(date_range, fill_value=0)
+        extended_daily_totals = extended_daily_totals.resample('D').last().fillna(0)
+        extended_daily_totals['weekly_total'] = extended_daily_totals.rolling(7).sum()
+
+        # Return weekly totals
+        weekly_totals = extended_daily_totals.resample('W').last()[['weekly_total']]
+        weekly_totals.index.name = 'date'
+
+        # if weekly totals are NaN, set them to 0
+        weekly_totals = weekly_totals.fillna(0)
+
+        return weekly_totals
+    
+    def _pair_rewards_with_tasks(self, specific_rewards, all_account_info):
+        """Pair rewards with their original requests and proposals.
+        
+        Returns DataFrame with columns: memo_data, directional_pft, datetime, memo_type, request, proposal
+        """
+        # Get reward details
+        reward_details = specific_rewards[
+            ['memo_data', 'directional_pft', 'datetime', 'memo_type']
+        ].sort_values('datetime')
+
+        # Get original requests and proposals
+        task_requests = all_account_info[
+            all_account_info['memo_data'].apply(lambda x: constants.TaskType.REQUEST_POST_FIAT.value in x)
+        ].groupby('memo_type').first()['memo_data']
+
+        proposal_patterns = constants.TASK_PATTERNS[constants.TaskType.PROPOSAL]
+        task_proposals = all_account_info[
+            all_account_info['memo_data'].apply(lambda x: any(pattern in str(x) for pattern in proposal_patterns))
+        ].groupby('memo_type').first()['memo_data']
+
+        # Map requests and proposals to rewards
+        reward_details['request'] = reward_details['memo_type'].map(task_requests).fillna('No Request String')
+        reward_details['proposal'] = reward_details['memo_type'].map(task_proposals)
+
+        return reward_details
+
+    def get_reward_data(self, all_account_info):
+        """Get reward time series and task completion history.
+        
+        Args:
+            all_account_info: DataFrame containing account memo details
+            
+        Returns:
+            dict with keys:
+                - reward_ts: DataFrame of weekly reward totals
+                - reward_summaries: DataFrame containing rewards paired with original requests/proposals
+        """
+        # Get basic reward data
+        reward_responses = all_account_info[all_account_info['directional_pft'] > 0]
+        specific_rewards = reward_responses[
+            reward_responses.memo_data.apply(lambda x: "REWARD RESPONSE" in x)
+        ]
+
+        # Get weekly totals
+        weekly_totals = self._calculate_weekly_reward_totals(specific_rewards)
+
+        # Get reward summaries with context
+        reward_summaries = self._pair_rewards_with_tasks(
+            specific_rewards=specific_rewards,
+            all_account_info=all_account_info
+        )
+
+        return {
+            'reward_ts': weekly_totals,
+            'reward_summaries': reward_summaries
+        }
+
+    @staticmethod
+    def format_reward_summary(reward_summary_df):
+        """
+        Convert reward summary dataframe into a human-readable string.
+        :param reward_summary_df: DataFrame containing reward summary information
+        :return: Formatted string representation of the rewards
+        """
+        formatted_rewards = []
+        for _, row in reward_summary_df.iterrows():
+            reward_str = f"Date: {row['datetime']}\n"
+            reward_str += f"Request: {row['request']}\n"
+            reward_str += f"Proposal: {row['proposal']}\n"
+            reward_str += f"Reward: {row['directional_pft']} PFT\n"
+            reward_str += f"Response: {row['memo_data'].replace(constants.TaskType.REWARD.value, '')}\n"
+            reward_str += "-" * 50  # Separator
+            formatted_rewards.append(reward_str)
+        
+        output_string = "REWARD SUMMARY\n\n" + "\n".join(formatted_rewards)
+        return output_string
+
+@dataclass
+class AccountInfo:
+    address: str
+    username: str = ''
+    xrp_balance: float = 0
+    pft_balance: float = 0
+    transaction_count: int = 0
+    monthly_pft_avg: float = 0
+    weekly_pft_avg: float = 0
+    google_doc_link: Optional[str] = None
+
+def init_bot():
+    """Initialize and return the Discord bot with required intents"""
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.guild_messages = True
+    return MyClient(intents=intents)
+
+def configure_runtime():
+    """Configure runtime settings based on user input"""
+
+    # Network selection
+    print(f"Network Configuration:\n1. Mainnet\n2. Testnet")
+    network_choice = input("Select network (1/2) [default=2]: ").strip() or "2"
+    RuntimeConfig.USE_TESTNET = network_choice == "2"
+    network_config = get_network_config()
+
+    # Local node configuration with network-specific context
+    if network_config.local_rpc_url:
+        print(f"\nLocal node configuration:")
+        print(f"Local {network_config.name} node URL: {network_config.local_rpc_url}")
+        use_local = input("Do you have a local node configured? (y/n) [default=n]: ").strip() or "n"
+        RuntimeConfig.HAS_LOCAL_NODE = use_local == "y"
+    else:
+        print(f"\nNo local node configuration available for {network_config.name}")
+        RuntimeConfig.HAS_LOCAL_NODE = False
+
+    logger.debug(f"\nInitializing services for {network_config.name}...")
+    logger.info(f"Using {'local' if RuntimeConfig.HAS_LOCAL_NODE else 'public'} endpoints...")
+    
+
+def init_services():
+    """Initialize and return core services"""
+    openai_request_tool = OpenAIRequestTool()
+    post_fiat_task_generation_system = PostFiatTaskGenerationSystem()
+    generic_pft_utilities = GenericPFTUtilities()
+    generic_pft_utilities.run_transaction_history_updates()
+
+    return (
+        openai_request_tool,
+        post_fiat_task_generation_system,
+        generic_pft_utilities
+    )
+
+if __name__ == "__main__":
+    # Initialize credential manager
+    password = getpass.getpass("Enter your password: ")
+    cred_manager = CredentialManager(password=password)
+
+    # Initialize performance monitor
+    monitor = PerformanceMonitor(time_window=60)
+    monitor.start()
+
+    # Configure logger
+    configure_logger(
+        log_to_file=True,
+        output_directory=Path.cwd() / "nodetools",
+        log_filename="nodetools.log",
+        level="DEBUG"
+    )
+
+    configure_runtime()
+
+    # Initialize services
+    open_ai_request_tool, post_fiat_task_generation_system, generic_pft_utilities = init_services()
+
+    logger.debug("---Services initialized successfully!---")
+
+    # Initialize and run the bot
+    client = init_bot()
+    discord_credential_key = "discordbot_testnet_secret" if RuntimeConfig.USE_TESTNET else "discordbot_secret"
+    client.run(cred_manager.get_credential(discord_credential_key))
