@@ -3,9 +3,36 @@ import pandas as pd
 from xrpl.wallet import Wallet
 from xrpl.models import Memo
 from decimal import Decimal
+from nodetools.configuration.configuration import NetworkConfig, NodeConfig
+from nodetools.utilities.db_manager import DBConnectionManager
+from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
 
 class GenericPFTUtilities(Protocol):
     """Protocol defining the interface for GenericPFTUtilities implementations"""
+
+    @property
+    def network_config(self) -> NetworkConfig:
+        """Get the network configuration"""
+        ...
+
+    @property
+    def node_config(self) -> NodeConfig:
+        """Get the node configuration"""
+        ...
+
+    @property
+    def db_connection_manager(self) -> DBConnectionManager:
+        """Get the database connection manager"""
+        ...
+
+    @property
+    def xrpl_monitor(self) -> XRPLWebSocketMonitor:
+        """Get the XRPL monitor"""
+        ...
+
+    def sync_pft_transaction_history(self):
+        """Sync transaction history for all PFT holders"""
+        ...
 
     def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
         """Get memo history for a given account"""
@@ -33,7 +60,7 @@ class GenericPFTUtilities(Protocol):
         """Get all compressed messages for a given account"""
         ...
 
-    def get_post_fiat_holder_df(self) -> pd.DataFrame:
+    def get_pft_holder_df(self) -> pd.DataFrame:
         """Get a DataFrame of all post-fiat holders"""
         ...
 

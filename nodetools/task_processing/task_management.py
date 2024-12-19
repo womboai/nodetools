@@ -82,7 +82,7 @@ class PostFiatTaskGenerationSystem:
             self.stop_threads = False
             self.default_model = constants.DEFAULT_OPEN_AI_MODEL
 
-            self.run_queue_processing()  # Initialize queue processing
+            # self.run_queue_processing()  # Initialize queue processing
             logger.info(f"\n----------------------------PostFiatTaskGenerationSystem Initialized---------------------------\n")
             self.__class__._initialized = True
 

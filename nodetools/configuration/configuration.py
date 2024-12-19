@@ -15,6 +15,7 @@ class NetworkConfig:
     public_rpc_url: str
     explorer_tx_url_mask: str
     local_rpc_url: Optional[str] = None
+    local_ws_url: Optional[str] = None
 
 @dataclass
 class NodeConfig:
@@ -50,6 +51,7 @@ XRPL_MAINNET = NetworkConfig(
     name="mainnet",
     issuer_address="rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW",
     websockets=[
+        "wss://xrpl.postfiat.org:6007",
         "wss://xrplcluster.com", 
         "wss://xrpl.ws/", 
         "wss://s1.ripple.com/", 

@@ -3025,7 +3025,6 @@ def init_services():
     openai_request_tool = OpenAIRequestTool()
     post_fiat_task_generation_system = PostFiatTaskGenerationSystem()
     generic_pft_utilities = GenericPFTUtilities()
-    generic_pft_utilities.run_transaction_history_updates()
 
     return (
         openai_request_tool,
@@ -3052,8 +3051,13 @@ if __name__ == "__main__":
 
     configure_runtime()
 
+    # Instantiate services
+    openai_request_tool = OpenAIRequestTool()
+    post_fiat_task_generation_system = PostFiatTaskGenerationSystem()
+    generic_pft_utilities = GenericPFTUtilities()
+
     # Initialize services
-    open_ai_request_tool, post_fiat_task_generation_system, generic_pft_utilities = init_services()
+    generic_pft_utilities.initialize()
 
     logger.debug("---Services initialized successfully!---")
 

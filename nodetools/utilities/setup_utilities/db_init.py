@@ -329,6 +329,18 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
                     memos TEXT
                 );
                 """,
+                "transaction_processing_results":
+                """
+                CREATE TABLE IF NOT EXISTS transaction_processing_results (
+                    hash VARCHAR(255) PRIMARY KEY,
+                    processed BOOLEAN NOT NULL,
+                    rule_name VARCHAR(255),
+                    response_tx_hash VARCHAR(255),
+                    notes TEXT,
+                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (hash) REFERENCES postfiat_tx_cache(hash)
+                );
+                """,
                 "foundation_discord":
                 """
                 CREATE TABLE IF NOT EXISTS foundation_discord (

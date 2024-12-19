@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import Optional, Union
+from typing import Optional, Union, Any
 import binascii
 import datetime 
 import random
@@ -33,6 +33,11 @@ import nodetools.configuration.configuration as config
 from nodetools.utilities.exceptions import *
 from loguru import logger
 import traceback
+from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
+from nodetools.utilities.state_manager import NodeToolsStateManager
+from nodetools.utilities.transaction_repository import TransactionRepository
+import asyncio
+import contextlib
 
 nest_asyncio.apply()
 
@@ -40,6 +45,12 @@ class GenericPFTUtilities:
     """Handles general PFT utilities and operations"""
     _instance = None
     _initialized = False
+
+    TX_JSON_FIELDS = [
+        'Account', 'DeliverMax', 'Destination', 'Fee', 'Flags',
+        'LastLedgerSequence', 'Sequence', 'SigningPubKey', 
+        'TransactionType', 'TxnSignature', 'date', 'ledger_index', 'Memos'
+    ]
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -57,27 +68,73 @@ class GenericPFTUtilities:
             self.node_name = self.node_config.node_name
 
             # Determine endpoint with fallback logic
-            self.primary_endpoint = (
+            self.https_url = (
                 self.network_config.local_rpc_url 
                 if config.RuntimeConfig.HAS_LOCAL_NODE and self.network_config.local_rpc_url is not None
                 else self.network_config.public_rpc_url
             )
-            logger.debug(f"Using endpoint: {self.primary_endpoint}")
-            # Initialize other components
+            logger.debug(f"Using https endpoint: {self.https_url}")
+
+            # Initialize other core components
             self.db_connection_manager = DBConnectionManager()
+            self.transaction_repository = TransactionRepository(self.db_connection_manager, self.node_name)
             self.credential_manager = CredentialManager()
             self.open_ai_request_tool = OpenAIRequestTool()
             self.monitor = PerformanceMonitor()
             self.message_encryption = MessageEncryption(pft_utilities=self)
-            self.establish_post_fiat_tx_cache_as_hash_unique()  # TODO: Examine this
-            self._holder_df_lock = threading.Lock()
-            self._post_fiat_holder_df = None
 
             # Register auto-handshake addresses from node config
             for address in self.node_config.auto_handshake_addresses:
                 self.message_encryption.register_auto_handshake_wallet(address)
 
+            self._holder_df_lock = threading.Lock()
+            self._pft_holder_df = None
+
+            # Initialize XRPL monitor and state manager
+            self.xrpl_monitor = XRPLWebSocketMonitor(self)
+            self.state_manager = NodeToolsStateManager(self, self.transaction_repository)
+            self._state_manager_thread = None
+            self._state_manager_loop = None
+
             self.__class__._initialized = True
+
+    def _run_state_manager(self):
+        """Run state manager in its own event loop"""
+        try:
+            # Create new event loop for this thread
+            self._state_manager_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._state_manager_loop)
+            
+            # Run state manager
+            self._state_manager_loop.run_until_complete(self.state_manager.start())
+            self._state_manager_loop.run_forever()
+        except Exception as e:
+            logger.error(f"GenericPFTUtilities._run_state_manager: State manager thread error: {e}")
+            logger.error(traceback.format_exc())
+        finally:
+            self._state_manager_loop.close()
+
+    def initialize(self):
+        """Initialize components that require async operations"""
+        # Start state manager in separate thread
+        self._state_manager_thread = threading.Thread(
+            target=self._run_state_manager,
+            name="StateManagerThread",
+            daemon=True  # Thread will exit when main program exits
+        )
+        self._state_manager_thread.start()
+        logger.debug("GenericPFTUtilities.initialize: State manager thread started")
+
+    def shutdown(self):
+        """Clean shutdown of async components"""
+        if self._state_manager_loop:
+            # Schedule loop stop from within the loop
+            self._state_manager_loop.call_soon_threadsafe(self._state_manager_loop.stop)
+            
+            # Wait for thread to finish
+            if self._state_manager_thread and self._state_manager_thread.is_alive():
+                self._state_manager_thread.join(timeout=5)
+                logger.debug("GenericPFTUtilities.shutdown: State manager thread stopped")
 
     @staticmethod
     def convert_ripple_timestamp_to_datetime(ripple_timestamp = 768602652):
@@ -103,24 +160,6 @@ class GenericPFTUtilities:
             return ascii_string
         except UnicodeDecodeError:
             return bytes_object  # Return the raw bytes if it cannot decode as utf-8
-
-    def output_post_fiat_holder_df(self) -> pd.DataFrame:
-        """ This function outputs a detail of all accounts holding PFT tokens
-        with a float of their balances as pft_holdings. note this is from
-        the view of the issuer account so balances appear negative so the pft_holdings 
-        are reverse signed.
-        """
-        client = xrpl.clients.JsonRpcClient(self.primary_endpoint)
-        response = client.request(xrpl.models.requests.AccountLines(
-            account=self.pft_issuer,
-            ledger_index="validated",
-            peer=None,
-            limit=None))
-        full_post_fiat_holder_df = pd.DataFrame(response.result)
-        for xfield in ['account','balance','currency','limit_peer']:
-            full_post_fiat_holder_df[xfield] = full_post_fiat_holder_df['lines'].apply(lambda x: x[xfield])
-        full_post_fiat_holder_df['pft_holdings']=full_post_fiat_holder_df['balance'].astype(float)*-1
-        return full_post_fiat_holder_df
 
     @staticmethod
     def generate_random_utf8_friendly_hash(length=6):
@@ -275,7 +314,7 @@ class GenericPFTUtilities:
         Returns:
             bool: True if the transaction was successful, False otherwise
         """
-        client = xrpl.clients.JsonRpcClient(self.primary_endpoint)
+        client = xrpl.clients.JsonRpcClient(self.https_url)
         try:
             tx_request = xrpl.models.requests.Tx(
                 transaction=tx_hash,
@@ -291,29 +330,30 @@ class GenericPFTUtilities:
             return False
 
     @staticmethod
-    def convert_memo_dict__generic(memo_dict):
-        # TODO: Replace with MemoBuilder once MemoBuilder is implemented in Pftpyclient
-        """Constructs a memo object with user, task_id, and full_output from hex-encoded values."""
-        MemoFormat= ''
-        MemoType=''
-        MemoData=''
-        try:
-            MemoFormat = GenericPFTUtilities.hex_to_text(memo_dict['MemoFormat'])
-        except:
-            pass
-        try:
-            MemoType = GenericPFTUtilities.hex_to_text(memo_dict['MemoType'])
-        except:
-            pass
-        try:
-            MemoData = GenericPFTUtilities.hex_to_text(memo_dict['MemoData'])
-        except:
-            pass
-        return {
-            'MemoFormat': MemoFormat,
-            'MemoType': MemoType,
-            'MemoData': MemoData
+    def decode_xrpl_memo(memo_dict):
+        """Convert hex-encoded memo fields to readable text.
+        
+        Args:
+            memo_dict: Dictionary containing hex-encoded memo fields
+                (MemoFormat, MemoType, MemoData)
+                
+        Returns:
+            dict: Dictionary with decoded text values for each memo field
+        """
+        memo_fields = {
+            'MemoFormat': '',
+            'MemoType': '',
+            'MemoData': ''
         }
+        
+        for field in memo_fields:
+            try:
+                if field in memo_dict:
+                    memo_fields[field] = GenericPFTUtilities.hex_to_text(memo_dict[field])
+            except Exception as e:
+                logger.debug(f"Failed to decode {field}: {e}")
+                
+        return memo_fields
     
     # TODO: Replace with MemoBuilder once ready
     @staticmethod
@@ -390,34 +430,10 @@ class GenericPFTUtilities:
             memo_format=user
         )
 
-    # def send_PFT_with_info(self, sending_wallet, amount, memo, destination_address, url=None):
-    #     # TODO: Replace with send_memo
-    #     """ This sends PFT tokens to a destination address with memo information
-    #     memo should be 1kb or less in size and needs to be in hex format
-    #     """
-    #     if url is None:
-    #         url = self.primary_endpoint
-
-    #     client = xrpl.clients.JsonRpcClient(url)
-    #     amount_to_send = xrpl.models.amounts.IssuedCurrencyAmount(
-    #         currency="PFT",
-    #         issuer=self.pft_issuer,
-    #         value=str(amount)
-    #     )
-    #     payment = xrpl.models.transactions.Payment(
-    #         account=sending_wallet.address,
-    #         amount=amount_to_send,
-    #         destination=destination_address,
-    #         memos=[memo]
-    #     )
-    #     response = xrpl.transaction.submit_and_wait(payment, client, sending_wallet)
-
-    #     return response
-
     def send_xrp_with_info__seed_based(self,wallet_seed, amount, destination, memo, destination_tag=None):
         # TODO: Replace with send_xrp (reference pftpyclient/task_manager/basic_tasks.py)
         sending_wallet =sending_wallet = xrpl.wallet.Wallet.from_seed(wallet_seed)
-        client = xrpl.clients.JsonRpcClient(self.primary_endpoint)
+        client = xrpl.clients.JsonRpcClient(self.https_url)
         payment = xrpl.models.transactions.Payment(
             account=sending_wallet.address,
             amount=xrpl.utils.xrp_to_drops(Decimal(amount)),
@@ -438,97 +454,6 @@ class GenericPFTUtilities:
         wallet = xrpl.wallet.Wallet.from_seed(seed)
         logger.debug(f'-- Spawned wallet with address {wallet.address}')
         return wallet
-
-    def get_account_transactions(self, account_address='r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n',
-                                 ledger_index_min=-1,
-                                 ledger_index_max=-1, limit=10,public=True):
-        if public == False:
-            client = xrpl.clients.JsonRpcClient(self.primary_endpoint)  #hitting local rippled server
-        if public == True:
-            client = xrpl.clients.JsonRpcClient(self.public_rpc_url) 
-        all_transactions = []  # List to store all transactions
-        marker = None  # Initialize marker to None
-        previous_marker = None  # Track the previous marker
-        max_iterations = 1000  # Safety limit for iterations
-        iteration_count = 0  # Count iterations
-
-        while max_iterations > 0:
-            iteration_count += 1
-            logger.debug(f"GenericPFTUtilities.get_account_transactions: Iteration: {iteration_count}")
-            logger.debug(f"GenericPFTUtilities.get_account_transactions: Current Marker: {marker}")
-
-            request = AccountTx(
-                account=account_address,
-                ledger_index_min=ledger_index_min,  # Use -1 for the earliest ledger index
-                ledger_index_max=ledger_index_max,  # Use -1 for the latest ledger index
-                limit=limit,                        # Adjust the limit as needed
-                marker=marker,                      # Use marker for pagination
-                forward=True                        # Set to True to return results in ascending order
-            )
-
-            response = client.request(request)
-            transactions = response.result.get("transactions", [])
-            logger.debug(f"GenericPFTUtilities.get_account_transactions: Transactions fetched this batch: {len(transactions)}")
-            all_transactions.extend(transactions)  # Add fetched transactions to the list
-
-            if "marker" in response.result:  # Check if a marker is present for pagination
-                if response.result["marker"] == previous_marker:
-                    logger.warning("GenericPFTUtilities.get_account_transactions: Pagination seems stuck, stopping the loop.")
-                    break  # Break the loop if the marker does not change
-                previous_marker = marker
-                marker = response.result["marker"]  # Update marker for the next batch
-                logger.debug("GenericPFTUtilities.get_account_transactions: More transactions available. Fetching next batch...")
-            else:
-                logger.debug("GenericPFTUtilities.get_account_transactions: No more transactions available.")
-                break  # Exit loop if no more transactions
-
-            max_iterations -= 1  # Decrement the iteration counter
-
-        if max_iterations == 0:
-            logger.warning("GenericPFTUtilities.get_account_transactions: Reached the safety limit for iterations. Stopping the loop.")
-
-        return all_transactions
-    
-    def get_account_transactions__exhaustive(self,account_address='r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n',
-                                ledger_index_min=-1,
-                                ledger_index_max=-1,
-                                max_attempts=3,
-                                retry_delay=.2):
-        client = xrpl.clients.JsonRpcClient(self.primary_endpoint)
-        all_transactions = []  # List to store all transactions
-
-        # Fetch transactions using marker pagination
-        marker = None
-        attempt = 0
-        while attempt < max_attempts:
-            try:
-                request = xrpl.models.requests.account_tx.AccountTx(
-                    account=account_address,
-                    ledger_index_min=ledger_index_min,
-                    ledger_index_max=ledger_index_max,
-                    limit=1000,
-                    marker=marker,
-                    forward=True
-                )
-                response = client.request(request)
-                transactions = response.result["transactions"]
-                all_transactions.extend(transactions)
-
-                if "marker" not in response.result:
-                    break
-                marker = response.result["marker"]
-
-            except Exception as e:
-                logger.error(f"GenericPFTUtilities.get_account_transactions: Error occurred while fetching transactions (attempt {attempt + 1}): {str(e)}")
-                attempt += 1
-                if attempt < max_attempts:
-                    logger.debug(f"GenericPFTUtilities.get_account_transactions: Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                else:
-                    logger.warning("GenericPFTUtilities.get_account_transactions: Max attempts reached. Transactions may be incomplete.")
-                    break
-
-        return all_transactions
     
     @PerformanceMonitor.measure('get_account_memo_history')
     def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
@@ -576,7 +501,7 @@ class GenericPFTUtilities:
         df = pd.read_sql(query, dbconnx, params=params, parse_dates=['simple_date'])
         
         # Handle remaining transformations that must stay in Python
-        df['converted_memos'] = df['main_memo_data'].apply(self.convert_memo_dict__generic)
+        df['converted_memos'] = df['main_memo_data'].apply(self.decode_xrpl_memo)
         df['memo_format'] = df['converted_memos'].apply(lambda x: x.get('MemoFormat', ''))
         df['memo_type'] = df['converted_memos'].apply(lambda x: x.get('MemoType', ''))
         df['memo_data'] = df['converted_memos'].apply(lambda x: x.get('MemoData', ''))
@@ -861,7 +786,7 @@ class GenericPFTUtilities:
 
     def _send_memo_single(self, wallet: Wallet, destination: str, memo: Memo, pft_amount: Decimal):
         """ Sends a single memo to a destination """
-        client = xrpl.clients.JsonRpcClient(self.primary_endpoint)
+        client = xrpl.clients.JsonRpcClient(self.https_url)
         
         payment_args = {
             "account": wallet.address,
@@ -1257,208 +1182,287 @@ class GenericPFTUtilities:
             logger.error(f"GenericPFTUtilities.get_all_account_compressed_messages: Error processing memo data for {account_address}: {e}")
             return pd.DataFrame()
 
-    def establish_post_fiat_tx_cache_as_hash_unique(self):
-        dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(username=self.node_name)
-        
-        with dbconnx.connect() as connection:
-            # Check if the table exists
-            table_exists = connection.execute(sqlalchemy.text("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = 'postfiat_tx_cache'
-                );
-            """)).scalar()
-            
-            if not table_exists:
-                # Create the table if it doesn't exist
-                connection.execute(sqlalchemy.text("""
-                    CREATE TABLE postfiat_tx_cache (
-                        hash VARCHAR(255) PRIMARY KEY,
-                        -- Add other columns as needed, for example:
-                        account VARCHAR(255),
-                        destination VARCHAR(255),
-                        amount DECIMAL(20, 8),
-                        memo TEXT,
-                        timestamp TIMESTAMP
-                    );
-                """))
-                logger.debug("GenericPFTUtilities.establish_post_fiat_tx_cache_as_hash_unique: Table 'postfiat_tx_cache' created.")
-            
-            # Add unique constraint on hash if it doesn't exist
-            constraint_exists = connection.execute(sqlalchemy.text("""
-                SELECT constraint_name
-                FROM information_schema.table_constraints
-                WHERE table_name = 'postfiat_tx_cache' 
-                AND constraint_type = 'UNIQUE' 
-                AND constraint_name = 'unique_hash';
-            """)).fetchone()
-            
-            if constraint_exists is None:
-                connection.execute(sqlalchemy.text("""
-                    ALTER TABLE postfiat_tx_cache
-                    ADD CONSTRAINT unique_hash UNIQUE (hash);
-                """))
-                logger.debug("GenericPFTUtilities.establish_post_fiat_tx_cache_as_hash_unique: Unique constraint added to 'hash' column.")
-            
-            connection.commit()
+    def fetch_account_transactions(
+            self,
+            account_address: str,
+            ledger_index_min: int = -1,
+            ledger_index_max: int = -1,
+            max_attempts: int = 3,
+            retry_delay: float = 0.2,
+            limit: int = 1000
+        ) -> list[dict]:
+        """Fetch transactions for an account from the XRPL"""
+        client = xrpl.clients.JsonRpcClient(self.https_url)
+        all_transactions = []  # List to store all transactions
 
-        dbconnx.dispose()
-
-    def generate_postgres_writable_df_for_address(self, account_address):
-        # Fetch transaction history and prepare DataFrame
-        tx_hist = self.get_account_transactions__exhaustive(account_address=account_address)
-        if len(tx_hist)==0:
-            return pd.DataFrame()
-        else:
-            full_transaction_history = pd.DataFrame(
-                tx_hist
-            )
-            tx_json_extractions = ['Account', 'DeliverMax', 'Destination', 
-                                   'Fee', 'Flags', 'LastLedgerSequence', 
-                                   'Sequence', 'SigningPubKey', 'TransactionType', 
-                                   'TxnSignature', 'date', 'ledger_index', 'Memos']
-            
-            def extract_field(json_data, field):
-                try:
-                    value = json_data.get(field)
-                    if isinstance(value, dict):
-                        return str(value)  # Convert dict to string
-                    return value
-                except AttributeError:
-                    return None
-            for field in tx_json_extractions:
-                full_transaction_history[field.lower()] = full_transaction_history['tx_json'].apply(lambda x: extract_field(x, field))
-            def process_memos(memos):
-                """
-                Process the memos column to prepare it for PostgreSQL storage.
-                :param memos: List of memo dictionaries or None
-                :return: JSON string representation of memos or None
-                """
-                if memos is None:
-                    return None
-                # Ensure memos is a list
-                if not isinstance(memos, list):
-                    memos = [memos]
-                # Extract only the 'Memo' part from each dictionary
-                processed_memos = [memo.get('Memo', memo) for memo in memos]
-                # Convert to JSON string
-                return json.dumps(processed_memos)
-            # Apply the function to the 'memos' column
-            full_transaction_history['memos'] = full_transaction_history['memos'].apply(process_memos)
-            full_transaction_history['meta'] = full_transaction_history['meta'].apply(json.dumps)
-            full_transaction_history['tx_json'] = full_transaction_history['tx_json'].apply(json.dumps)
-            return full_transaction_history
-
-    def sync_pft_transaction_history_for_account(self, account_address):
-        # Fetch transaction history and prepare DataFrame
-        tx_hist = self.generate_postgres_writable_df_for_address(account_address=account_address)
-        dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(username=self.node_name)
-        
-        if tx_hist is not None:
+        # Fetch transactions using marker pagination
+        marker = None
+        attempt = 0
+        while attempt < max_attempts:
             try:
-                with dbconnx.begin() as conn:
-                    total_rows_inserted = 0
-                    for start in range(0, len(tx_hist), 100):
-                        chunk = tx_hist.iloc[start:start + 100]
-                        
-                        # Fetch existing hashes from the database to avoid duplicates
-                        existing_hashes = pd.read_sql_query(
-                            "SELECT hash FROM postfiat_tx_cache WHERE hash IN %(hashes)s",
-                            conn,
-                            params={"hashes": tuple(chunk['hash'].tolist())}
-                        )['hash'].tolist()
-                        
-                        # Filter out rows with existing hashes
-                        new_rows = chunk[~chunk['hash'].isin(existing_hashes)]
-                        
-                        if not new_rows.empty:
-                            rows_inserted = len(new_rows)
-                            new_rows.to_sql(
-                                'postfiat_tx_cache', 
-                                conn, 
-                                if_exists='append', 
-                                index=False,
-                                method='multi'
-                            )
-                            total_rows_inserted += rows_inserted
-                            logger.debug(f"GenericPFTUtilities.sync_pft_transaction_history_for_account: Inserted {rows_inserted} new rows into postfiat_tx_cache.")
-            
-            except sqlalchemy.exc.InternalError as e:
-                if "current transaction is aborted" in str(e):
-                    logger.warning("GenericPFTUtilities.sync_pft_transaction_history_for_account: Transaction aborted. Attempting to reset...")
-                    with dbconnx.connect() as connection:
-                        connection.execute(sqlalchemy.text("ROLLBACK"))
-                    logger.warning("GenericPFTUtilities.sync_pft_transaction_history_for_account: Transaction reset. Please try the operation again.")
-                else:
-                    logger.error(f"GenericPFTUtilities.sync_pft_transaction_history_for_account: An error occurred: {e}")
-            
-            except Exception as e:
-                logger.error(f"GenericPFTUtilities.sync_pft_transaction_history_for_account: An unexpected error occurred: {e}")
-            
-            finally:
-                dbconnx.dispose()
-        else:
-            logger.debug("GenericPFTUtilities.sync_pft_transaction_history_for_account: No transaction history to write.")
+                request = xrpl.models.requests.account_tx.AccountTx(
+                    account=account_address,
+                    ledger_index_min=ledger_index_min,
+                    ledger_index_max=ledger_index_max,
+                    limit=limit,
+                    marker=marker,
+                    forward=True
+                )
+                response = client.request(request)
+                transactions = response.result["transactions"]
+                all_transactions.extend(transactions)
 
+                if "marker" not in response.result:
+                    break
+                marker = response.result["marker"]
+
+            except Exception as e:
+                logger.error(f"GenericPFTUtilities.get_account_transactions: Error occurred while fetching transactions (attempt {attempt + 1}): {str(e)}")
+                attempt += 1
+                if attempt < max_attempts:
+                    logger.debug(f"GenericPFTUtilities.get_account_transactions: Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.warning("GenericPFTUtilities.get_account_transactions: Max attempts reached. Transactions may be incomplete.")
+                    break
+
+        return all_transactions
+
+    @staticmethod
+    def _extract_field(json_data: dict, field: str) -> Any:
+        """Extract a field from JSON data, converting dicts to strings.
+    
+        Args:
+            json_data: JSON dictionary to extract from
+            field: Field name to extract
+            
+        Returns:
+            Field value or None if not found/invalid
+        """
+        try:
+            value = json_data.get(field)
+            return str(value) if isinstance(value, dict) else value
+        except AttributeError:
+            return None
+        
+    @staticmethod
+    def _process_memos(memos: Union[dict, list, None]) -> Optional[str]:
+        """Process memos for PostgreSQL storage.
+        
+        Args:
+            memos: List of memo dictionaries or single memo dict
+            
+        Returns:
+            JSON string representation of memos or None
+        """
+        if memos is None:
+            return None
+            
+        # Ensure memos is a list
+        memos = [memos] if not isinstance(memos, list) else memos
+        
+        # Extract only the 'Memo' part from each dictionary
+        processed_memos = [memo.get('Memo', memo) for memo in memos]
+        return json.dumps(processed_memos)
+
+    def fetch_formatted_transaction_history(self, account_address: str) -> pd.DataFrame:
+        """Fetch and format transaction history for an account.
+        
+        Retrieves transactions from XRPL and transforms them into a standardized
+        format suitable for database storage.
+        
+        Args:
+            account_address: XRPL account address to fetch transactions for
+                
+        Returns:
+            DataFrame containing processed transaction data with standardized columns
+        """
+        # Fetch transaction history and prepare DataFrame
+        tx_hist = self.fetch_account_transactions(account_address=account_address)
+        if not tx_hist:
+            return pd.DataFrame()
+        
+        # Create DataFrame and extract fields
+        df = pd.DataFrame(tx_hist)
+
+        # Process each field
+        for field in self.TX_JSON_FIELDS:
+            df[field.lower()] = df['tx_json'].apply(lambda x: self._extract_field(x, field))
+
+        # Process special columns
+        df['memos'] = df['memos'].apply(self._process_memos)
+        df['meta'] = df['meta'].apply(json.dumps)
+        df['tx_json'] = df['tx_json'].apply(json.dumps)
+        
+        return df
+    
+    def _batch_insert_transactions(self, transaction_df: pd.DataFrame, batch_size: int = 100) -> int:
+        """Insert transaction records in batches, skipping duplicates via SQL.
+        
+        Uses PostgreSQL's ON CONFLICT DO NOTHING for duplicate handling and 
+        xmax system column to track new insertions within the transaction.
+        
+        Args:
+            transaction_df: DataFrame containing transaction records
+            batch_size: Number of records to process per batch
+            
+        Returns:
+            int: Total number of new records inserted
+        """
+        # logger.debug(f"GenericPFTUtilities._batch_insert_transactions: Inserting {len(transaction_df)} transactions")
+        # total_inserts_attempted = len(transaction_df)
+        total_rows_inserted = 0
+
+        engine = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(username=self.node_name)
+
+        insert_stmt = sqlalchemy.text("""
+            INSERT INTO postfiat_tx_cache (
+                close_time_iso, hash, ledger_hash, ledger_index, meta, 
+                tx_json, validated, account, delivermax, destination, 
+                fee, flags, lastledgersequence, sequence, signingpubkey, 
+                transactiontype, txnsignature, date, memos
+            ) VALUES (
+                :close_time_iso, :hash, :ledger_hash, :ledger_index, :meta,
+                :tx_json, :validated, :account, :delivermax, :destination,
+                :fee, :flags, :lastledgersequence, :sequence, :signingpubkey,
+                :transactiontype, :txnsignature, :date, :memos
+            ) ON CONFLICT (hash) DO NOTHING
+        """)
+
+        try:
+            with engine.connect() as conn:
+                with conn.begin():
+                    for batch in self._get_transaction_batches(transaction_df, batch_size):
+                        conn.execute(insert_stmt, batch.to_dict('records'))
+
+                    # Use string concatenation to build the array literal
+                    hash_array = "ARRAY[" + ",".join(f"'{h}'" for h in transaction_df['hash']) + "]"
+                    
+                    # Use the array literal directly in the query
+                    inserted = conn.execute(sqlalchemy.text(f"""
+                        SELECT COUNT(*) FROM postfiat_tx_cache 
+                        WHERE hash = ANY({hash_array})
+                        AND xmin::text = txid_current()::text
+                    """)).scalar()
+
+                    total_rows_inserted += inserted
+
+        except sqlalchemy.exc.InternalError as e:
+            self._handle_transaction_error(e, conn)
+            raise
+        finally:
+            engine.dispose()
+
+        # logger.debug(f"GenericPFTUtilities._batch_insert_transactions: Inserted {total_rows_inserted} transactions ({total_inserts_attempted} attempted)")
+        
+        return total_rows_inserted
+    
+    def _get_transaction_batches(self, df: pd.DataFrame, batch_size: int):
+        """Generate batches of transactions from DataFrame."""
+        for start in range(0, len(df), batch_size):
+            yield df.iloc[start:start + batch_size]
+
+    def _handle_transaction_error(self, error: Exception, conn) -> None:
+        """Handle database transaction errors.
+        
+        Args:
+            error: The exception that occurred
+            conn: Database connection
+        """
+        if "current transaction is aborted" in str(error):
+            logger.warning("Transaction aborted, attempting rollback...")
+            with conn.connect() as connection:
+                connection.execute(sqlalchemy.text("ROLLBACK"))
+            logger.warning("Transaction reset completed")
+        else:
+            logger.error("Database error occurred: %s", error)
+
+    def fetch_pft_trustline_data(self) -> pd.DataFrame:
+        """Get a DataFrame containing all PFT token holder account information.
+        
+        Queries the XRPL for all accounts that have trustlines with the PFT issuer account.
+        The balances are from the issuer's perspective, so they are negated to show actual
+        holder balances (e.g., if issuer shows -100, holder has +100).
+
+        Returns:
+            pd.DataFrame: DataFrame with columns:
+                - account (str): XRPL account address of the token holder
+                - balance (str): Raw balance string from XRPL
+                - currency (str): Currency code (should be 'PFT')
+                - limit_peer (str): Trustline limit
+                - pft_holdings (float): Actual token balance (negated from issuer view)
+                - lines (dict): Raw trustline data from XRPL
+        """
+        # Create XRPL client and get account lines
+        client = xrpl.clients.JsonRpcClient(self.https_url)
+        response = client.request(
+            xrpl.models.requests.AccountLines(
+                account=self.pft_issuer,
+                ledger_index="validated"
+            )
+        )
+
+        # Extract only needed fields from lines into list of dicts and create DataFrame
+        holder_data = [
+            {
+                'account': line['account'],
+                'balance': line['balance'],
+                'currency': line['currency'],
+                'limit_peer': line['limit_peer']
+            }
+            for line in response.result['lines']
+        ]
+        df = pd.DataFrame(holder_data)
+
+        # Add calculated pft_holdings column
+        df['pft_holdings'] = pd.to_numeric(df['balance']) * -1
+
+        return df
+    
+    def sync_pft_transaction_history_for_account(self, account_address: str):
+        """Sync transaction history for an account to the postfiat_tx_cache table.
+        generate_postgres_writable_df_for_address
+        Args:
+            account_address: XRPL account address to sync
+            
+        Returns:
+            int: Number of new transactions synced
+        """
+        tx_hist = self.fetch_formatted_transaction_history(account_address=account_address)
+        if tx_hist is None or tx_hist.empty:
+            return 0
+
+        return self._batch_insert_transactions(tx_hist)
+    
     def sync_pft_transaction_history(self):
-        """ Syncs transaction history for all post fiat holders """
-        with self._holder_df_lock:
-            self._post_fiat_holder_df = self.output_post_fiat_holder_df()
-            all_accounts = list(self._post_fiat_holder_df['account'].unique())
+        """Sync transaction history for all PFT token holders.
+        
+        Updates the internal holder DataFrame and syncs transaction history 
+        for each holder account. Uses thread-safe access to holder DataFrame.
+        
+        Note: This operation can be time-consuming for many holder accounts.
+        """
+        self.set_pft_holder_df(self.fetch_pft_trustline_data())
+        all_accounts = self.get_pft_holder_df()['account'].unique().tolist()
+        logger.info(f"GenericPFTUtilities.sync_pft_transaction_history: Syncing transaction history for {len(all_accounts)} accounts")
 
         for account in all_accounts:
             self.sync_pft_transaction_history_for_account(account_address=account)
 
-    def get_post_fiat_holder_df(self):
-        """Thread-safe getter for post_fiat_holder_df"""
+    def get_pft_holder_df(self):
+        """Thread-safe getter for pft_holder_df"""
         with self._holder_df_lock:
-            return self._post_fiat_holder_df.copy()
-
-    def run_transaction_history_updates(self):
-        """
-        Runs transaction history updates using a single coordinated thread
-        Updates happen every TRANSACTION_HISTORY_UPDATE_INTERVAL seconds using the primary endpoint
-        """
-        self._last_update = 0
-        self._update_lock = threading.Lock()
-        self._pft_accounts = None
-        TRANSACTION_HISTORY_UPDATE_INTERVAL = constants.TRANSACTION_HISTORY_UPDATE_INTERVAL
-        TRANSACTION_HISTORY_SLEEP_TIME = constants.TRANSACTION_HISTORY_SLEEP_TIME
-
-        def update_loop():
-            while True:
-                try:
-                    with self._update_lock:
-                        now = time.time()
-                        if now - self._last_update >= TRANSACTION_HISTORY_UPDATE_INTERVAL:
-                            logger.debug("GenericPFTUtilities.run_transaction_history_updates.update_loop: Syncing PFT account holder transaction history...")
-                            self.sync_pft_transaction_history()
-                            self._last_update = now
-
-                except Exception as e:
-                    logger.error(f"GenericPFTUtilities.run_transaction_history_updates.update_loop: Error in transaction history update loop: {e}")
-
-                time.sleep(TRANSACTION_HISTORY_SLEEP_TIME)
-
-        update_thread = threading.Thread(target=update_loop)
-        update_thread.daemon = True
-        update_thread.start()
-
-    # def get_all_cached_transactions_related_to_account(self, account_address):
-    #     dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(username=self.node_name)
-    #     query = f"""
-    #     SELECT * FROM postfiat_tx_cache
-    #     WHERE account = '{account_address}' OR destination = '{account_address}'
-    #     """
-    #     full_transaction_history = pd.read_sql(query, dbconnx)
-    #     full_transaction_history['meta']= full_transaction_history['meta'].apply(lambda x: json.loads(x))
-    #     full_transaction_history['tx_json']= full_transaction_history['tx_json'].apply(lambda x: json.loads(x))
-    #     return full_transaction_history
+            return self._pft_holder_df.copy()
+        
+    def set_pft_holder_df(self, df: pd.DataFrame):
+        """Thread-safe setter for pft_holder_df"""
+        with self._holder_df_lock:
+            self._pft_holder_df = df
 
     # TODO: How is this different from get_account_memo_history? 
     def get_all_transactions_for_active_wallets(self):
         """ This gets all the transactions for active post fiat wallets""" 
-        full_balance_df = self.get_post_fiat_holder_df()
+        full_balance_df = self.get_pft_holder_df()
         all_active_foundation_users = full_balance_df[full_balance_df['balance'].astype(float)<=-2000].copy()
         
         # Get unique wallet addresses from the dataframe
@@ -1495,7 +1499,7 @@ class GenericPFTUtilities:
         live_memo_tx = validated_tx[validated_tx['has_memos'] == True].copy()
         live_memo_tx['main_memo_data']=live_memo_tx['tx_json'].apply(lambda x: x['Memos'][0]['Memo'])
         live_memo_tx['converted_memos']=live_memo_tx['main_memo_data'].apply(lambda x: 
-                                                                            self.convert_memo_dict__generic(x))
+                                                                            self.decode_xrpl_memo(x))
         #live_memo_tx['message_type']=np.where(live_memo_tx['destination']==account_address, 'INCOMING','OUTGOING')
         live_memo_tx['datetime'] = pd.to_datetime(live_memo_tx['close_time_iso']).dt.tz_localize(None)
         if pft_only:
@@ -1773,21 +1777,21 @@ class GenericPFTUtilities:
             logger.error(f"GenericPFTUtilities.dump_google_doc_links: Error dumping Google Doc links: {e}")
             raise
 
-    def format_refusal_frame(self, refusal_frame_constructor):
-        """
-        Format the refusal frame constructor into a nicely formatted string.
+    # def format_refusal_frame(self, refusal_frame_constructor):
+    #     """
+    #     Format the refusal frame constructor into a nicely formatted string.
         
-        :param refusal_frame_constructor: DataFrame containing refusal data
-        :return: Formatted string representation of the refusal frame
-        """
-        formatted_string = ""
-        for idx, row in refusal_frame_constructor.iterrows():
-            formatted_string += f"Task ID: {idx}\n"
-            formatted_string += f"Refusal Reason: {row['refusal']}\n"
-            formatted_string += f"Proposal: {row['proposal']}\n"
-            formatted_string += "-" * 50 + "\n"
+    #     :param refusal_frame_constructor: DataFrame containing refusal data
+    #     :return: Formatted string representation of the refusal frame
+    #     """
+    #     formatted_string = ""
+    #     for idx, row in refusal_frame_constructor.iterrows():
+    #         formatted_string += f"Task ID: {idx}\n"
+    #         formatted_string += f"Refusal Reason: {row['refusal']}\n"
+    #         formatted_string += f"Proposal: {row['proposal']}\n"
+    #         formatted_string += "-" * 50 + "\n"
         
-        return formatted_string
+    #     return formatted_string
 
     def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
         """Get the most recent messages from a user's memo history.
@@ -1853,7 +1857,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         Raises:
             Exception: If there is an error getting the PFT balance
         """
-        client = JsonRpcClient(self.primary_endpoint)
+        client = JsonRpcClient(self.https_url)
         account_lines = AccountLines(
             account=address,
             ledger_index="validated"
@@ -1881,7 +1885,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
             XRPAccountNotFoundException: If the account is not found
             Exception: If there is an error getting the XRP balance
         """
-        client = JsonRpcClient(self.primary_endpoint)
+        client = JsonRpcClient(self.https_url)
         acct_info = AccountInfo(
             account=address,
             ledger_index="validated"
@@ -2012,28 +2016,6 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
     #         url=None)
     #     printable_string = self.extract_transaction_info_from_response_object(action_response)['clean_string']
     #     return printable_string
-    
-    def get_pft_holder_df(self) -> pd.DataFrame:
-        """Get dataframe of all PFT token holders.
-        
-        Returns:
-            DataFrame: PFT holder information
-        """
-        client = xrpl.clients.JsonRpcClient(self.primary_endpoint)
-        response = client.request(xrpl.models.requests.AccountLines(
-            account=self.pft_issuer,
-            ledger_index="validated",
-        ))
-        if not response.is_successful():
-            raise Exception(f"Error fetching PFT holders: {response.result.get('error')}")
-
-        df = pd.DataFrame(response.result)
-        for field in ['account','balance','currency','limit_peer']:
-            df[field] = df['lines'].apply(lambda x: x[field])
-
-        df['pft_holdings']=df['balance'].astype(float)*-1
-
-        return df
         
     def has_trust_line(self, wallet: xrpl.wallet.Wallet) -> bool:
         """Check if wallet has PFT trustline.
@@ -2084,7 +2066,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         Raises:
             Exception: If there is an error creating the trust line
         """
-        client = xrpl.clients.JsonRpcClient(self.primary_endpoint)
+        client = xrpl.clients.JsonRpcClient(self.https_url)
         trust_set_tx = xrpl.models.transactions.TrustSet(
             account=wallet.classic_address,
             limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
@@ -2585,7 +2567,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         Returns:
             float: The PFT balance for the account
         """
-        client = JsonRpcClient(self.primary_endpoint)
+        client = JsonRpcClient(self.https_url)
         try:
             account_lines = AccountLines(
                 account=account_address,
