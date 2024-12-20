@@ -7,7 +7,7 @@ class SystemMemoType(Enum):
     HANDSHAKE = 'HANDSHAKE'
     INITIATION_RITE = 'INITIATION_RITE'
     GOOGLE_DOC_CONTEXT_LINK = 'google_doc_context_link'
-    INITIATION_GRANT = 'discord_wallet_funding'
+    INITIATION_GRANT = 'discord_wallet_funding'  # TODO: Deprecate this
 
 # Task types where the memo_type = task_id, requiring further disambiguation in the memo_data
 class TaskType(Enum):

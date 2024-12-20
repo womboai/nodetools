@@ -1,87 +1,46 @@
-from typing import List, Dict, Any, Set, Optional
-from dataclasses import dataclass
+from typing import Dict, Any, Set, Optional
 from loguru import logger
-from nodetools.models.models import TransactionRule
+from nodetools.models.models import BusinessLogicProvider
 from nodetools.protocols.transaction_repository import TransactionRepository
 import traceback
+import asyncio
 
-@dataclass
-class ProcessingResult:
-    processed: bool
-    rule_name: str
-    response_tx_hash: Optional[str] = None
-    notes: Optional[str] = None
+from nodetools.utilities.transaction_orchestrator import ProcessingResult
+from nodetools.utilities.transaction_orchestrator import TransactionReviewer
 
-class TransactionProcessor:
-    def __init__(self, rules: List[TransactionRule]):
-        self.rules = rules
-
-    async def process_transaction(self, tx: Dict[str, Any], all_txs: Set[Dict[str, Any]]) -> ProcessingResult:
-        """Process a single transaction against all rules"""
-        for rule in self.rules:
-            try:
-                # 1. Check if transaction matches rule's criteria
-                if await rule.matches(tx):
-                    # 2. Get the pattern ID and configuration
-                    pattern_id = rule.get_pattern_id(tx)
-                    if not pattern_id:
-                        return ProcessingResult(
-                            processed=True,  # We've reviewed it and found no matching pattern
-                            rule_name=rule.__class__.__name__,
-                            notes="Matched rule but no matching pattern found"
-                        )
-    
-                    pattern = rule.transaction_graph.patterns[pattern_id]
-    
-                    # 3. Check if response is required
-                    if not pattern.requires_response:
-                        return ProcessingResult(
-                            processed=True,  # We've reviewed it and no response needed
-                            rule_name=rule.__class__.__name__,
-                            notes="No response required"
-                        )
-
-                    # 4. Look for required response
-                    response_tx = await rule.find_response(tx, all_txs)
-                    if not response_tx:
-                        return ProcessingResult(
-                            processed=False,  # We need to keep checking this one until we find a response
-                            rule_name=rule.__class__.__name__,
-                            notes="Required response not found"
-                        )
-
-                    # 5. Response found
-                    return ProcessingResult(
-                        processed=True,  # We've reviewed it and found the required response
-                        rule_name=rule.__class__.__name__,
-                        response_tx_hash=response_tx.get("hash"),
-                        notes="Response found"
-                    )
-
-            except Exception as e:
-                logger.error(f"Error processing rule {rule.__class__.__name__}: {e}")
-                logger.error(traceback.format_exc())
-                continue
-
-        # No matching rules found
-        return ProcessingResult(
-            processed=True,  # We've reviewed it and found it doesn't match any rules
-            rule_name="NoRule",
-            notes="No matching rules found"
-        )
-    
 class ProcessorManager:
+
+    @classmethod
+    def create_from_business_logic(
+        cls,
+        repository: TransactionRepository,
+        business_logic: BusinessLogicProvider
+    ) -> 'ProcessorManager':
+        """Factory method to create a ProcessorManager from a BusinessLogicProvider"""
+        processor = TransactionReviewer(business_logic.rules, repository)
+        return cls(repository, processor)
+
     def __init__(
             self,
             repository: TransactionRepository,
-            processor: TransactionProcessor
+            processor: TransactionReviewer
     ):
         self.repository = repository
         self.processor = processor
+        self._historical_queue = asyncio.Queue()
+        self._realtime_queue = asyncio.Queue()
 
-    async def process_unverified_transactions(self, batch_size: Optional[int] = None) -> int:
+    async def queue_historical_transaction(self, tx: Dict[str, Any]):
+        """Queue a historical transaction for processing"""
+        await self._historical_queue.put(tx)
+
+    async def queue_realtime_transaction(self, tx: Dict[str, Any]):
+        """Queue a real-time transaction for processing"""
+        await self._realtime_queue.put(tx)
+
+    async def process_unverified_transactions(self) -> int:
         """
-        Process unverified transactions in chronological order.
+        Process historicalunverified transactions in chronological order.
         Returns number of transactions processed.
         """
         try:
@@ -89,7 +48,6 @@ class ProcessorManager:
             # Get unverified transactions ordered by timestamp
             unverified_txs = await self.repository.get_unverified_transactions(
                 order_by="close_time_iso ASC",
-                limit=batch_size,
                 include_processed=True   # NOTE: This is a temporary measure for debugging
             )
             
@@ -97,12 +55,17 @@ class ProcessorManager:
                 logger.info("No unverified transactions found")
                 return 0
 
-            processed_count = 0
-
-            # Process each transaction
+            # Queue all historical transactions
             for tx in unverified_txs:
+                await self.queue_historical_transaction(tx)
+
+            # Process all historical transactions
+            processed_count = 0
+            while not self._historical_queue.empty():
+                tx = await self._historical_queue.get()
+                
                 try:
-                    result = await self.processor.process_transaction(tx, unverified_txs)
+                    result = await self.processor.review_transaction(tx)
                     await self.repository.store_processing_result(tx['hash'], result)
                     processed_count += 1
                     

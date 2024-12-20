@@ -1,7 +1,7 @@
 from typing import Protocol, TYPE_CHECKING, List, Dict, Any, Optional
 
 if TYPE_CHECKING:
-    from nodetools.models.processor import ProcessingResult
+    from nodetools.utilities.transaction_orchestrator import ProcessingResult
 
 class TransactionRepository(Protocol):
     """Protocol for transaction repository"""
@@ -54,4 +54,20 @@ class TransactionRepository(Protocol):
         """
         ...
 
+    async def execute_query(
+        self,
+        query: str,
+        params: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Execute a custom query with parameters.
+        
+        Args:
+            query: SQL query string
+            params: Optional dictionary of query parameters
+            
+        Returns:
+            List of dictionaries containing query results
+        """
+        ...
     

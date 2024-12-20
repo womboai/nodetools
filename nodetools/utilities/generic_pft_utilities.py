@@ -34,7 +34,7 @@ from nodetools.utilities.exceptions import *
 from loguru import logger
 import traceback
 from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
-from nodetools.utilities.state_manager import NodeToolsStateManager
+from nodetools.utilities.transaction_orchestrator import TransactionOrchestrator
 from nodetools.utilities.transaction_repository import TransactionRepository
 import asyncio
 import contextlib
@@ -92,7 +92,7 @@ class GenericPFTUtilities:
 
             # Initialize XRPL monitor and state manager
             self.xrpl_monitor = XRPLWebSocketMonitor(self)
-            self.state_manager = NodeToolsStateManager(self, self.transaction_repository)
+            self.state_manager = TransactionOrchestrator(self, self.transaction_repository)
             self._state_manager_thread = None
             self._state_manager_loop = None
 
@@ -455,8 +455,34 @@ class GenericPFTUtilities:
         logger.debug(f'-- Spawned wallet with address {wallet.address}')
         return wallet
     
-    @PerformanceMonitor.measure('get_account_memo_history')
     def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
+        """Synchronous version: Get transaction history with memos for an account.
+        
+        Args:
+            account_address: XRPL account address to get history for
+            pft_only: If True, only return PFT transactions. Defaults to True.
+            
+        Returns:
+            DataFrame containing transaction history with memo details
+        """ 
+        # # Get call stack info
+        # stack = traceback.extract_stack()
+        # caller = stack[-2]  # -2 gets the caller of this method
+        # logger.debug(
+        #     f"get_account_memo_history called for {account_address} "
+        #     f"from {caller.filename}:{caller.lineno} in {caller.name}"
+        # )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # No running event loop
+            return asyncio.run(self.get_account_memo_history_async(account_address, pft_only))
+        else:
+            # If we're already in an event loop
+            return loop.run_until_complete(self.get_account_memo_history_async(account_address, pft_only))
+    
+    @PerformanceMonitor.measure('get_account_memo_history')
+    async def get_account_memo_history_async(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
         """Get transaction history with memos for an account.
         
         Args:
@@ -466,46 +492,16 @@ class GenericPFTUtilities:
         Returns:
             DataFrame containing transaction history with memo details
         """    
-        dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(username = self.node_name)
-
-        query = """
-        SELECT 
-            *,
-            CASE
-                WHEN destination = %s THEN 'INCOMING'
-                ELSE 'OUTGOING'
-            END as direction,
-            CASE
-                WHEN destination = %s THEN pft_absolute_amount
-                ELSE -pft_absolute_amount
-            END as directional_pft,
-            CASE
-                WHEN account = %s THEN destination
-                ELSE account
-            END as user_account,
-            destination || '__' || hash as unique_key
-        FROM memo_detail_view
-        WHERE account = %s OR destination = %s
-        """
-
-        # TODO: Add filtering on successful transactions only (tx_json_parsed::text LIKE '%"TransactionResult":"tesSUCCESS%"')
-
-        if pft_only:
-            query += " AND tx_json_parsed::text LIKE %s"
-            params = (account_address, account_address, account_address, account_address, 
-                    account_address, f"%{self.pft_issuer}%")
-        else:
-            params = (account_address, account_address, account_address, account_address, 
-                    account_address)
-
-        df = pd.read_sql(query, dbconnx, params=params, parse_dates=['simple_date'])
+        pft_issuer = self.pft_issuer if pft_only else None
+        results = await self.transaction_repository.get_account_memo_history(
+            account_address=account_address,
+            pft_issuer=pft_issuer
+        )
         
-        # Handle remaining transformations that must stay in Python
-        df['converted_memos'] = df['main_memo_data'].apply(self.decode_xrpl_memo)
-        df['memo_format'] = df['converted_memos'].apply(lambda x: x.get('MemoFormat', ''))
-        df['memo_type'] = df['converted_memos'].apply(lambda x: x.get('MemoType', ''))
-        df['memo_data'] = df['converted_memos'].apply(lambda x: x.get('MemoData', ''))
-
+        df = pd.DataFrame(results)
+        # Convert simple_date column to datetime after DataFrame creation
+        if 'simple_date' in df.columns:
+            df['simple_date'] = pd.to_datetime(df['simple_date'])
         return df
     
     def process_queue_transaction(
@@ -1309,8 +1305,8 @@ class GenericPFTUtilities:
         Returns:
             int: Total number of new records inserted
         """
-        # logger.debug(f"GenericPFTUtilities._batch_insert_transactions: Inserting {len(transaction_df)} transactions")
-        # total_inserts_attempted = len(transaction_df)
+        # total_records = len(transaction_df)
+        # logger.debug(f"GenericPFTUtilities._batch_insert_transactions: Inserting {total_records} transactions")
         total_rows_inserted = 0
 
         engine = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(username=self.node_name)
@@ -1444,10 +1440,26 @@ class GenericPFTUtilities:
         """
         self.set_pft_holder_df(self.fetch_pft_trustline_data())
         all_accounts = self.get_pft_holder_df()['account'].unique().tolist()
-        logger.info(f"GenericPFTUtilities.sync_pft_transaction_history: Syncing transaction history for {len(all_accounts)} accounts")
+        total_accounts = len(all_accounts)
+        rows_inserted = 0
+        logger.info(f"Starting transaction history sync for {total_accounts} accounts")
 
+        accounts_processed = 0
         for account in all_accounts:
-            self.sync_pft_transaction_history_for_account(account_address=account)
+            try:
+                rows_inserted += self.sync_pft_transaction_history_for_account(account_address=account)
+                accounts_processed += 1
+                
+                # Log progress every 5 accounts
+                if accounts_processed % 5 == 0:
+                    progress = (accounts_processed / total_accounts) * 100
+                    logger.debug(f"Progress: {progress:.1f}% - Processed {accounts_processed}/{total_accounts} accounts, {rows_inserted} rows inserted")
+                    
+            except Exception as e:
+                logger.error(f"Error processing account {account}: {e}")
+                continue
+                
+        logger.info(f"Completed transaction history sync. Processed {accounts_processed}/{total_accounts} accounts")
 
     def get_pft_holder_df(self):
         """Thread-safe getter for pft_holder_df"""

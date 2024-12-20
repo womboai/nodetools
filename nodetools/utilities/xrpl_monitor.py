@@ -1,9 +1,6 @@
-from enum import Enum, auto
 import asyncio
-import threading
 import time
 import random
-import pandas as pd
 from xrpl.asyncio.clients import AsyncWebsocketClient
 import xrpl.models.requests
 from loguru import logger
@@ -26,10 +23,11 @@ class XRPLWebSocketMonitor:
         self.ws_url_index = 0
         self.url = self.ws_urls[self.ws_url_index]
 
-        # Initialize asyncio elements
-        self.loop = asyncio.new_event_loop()
+        # Client and queue
         self.client = None
-        self._stop_event = threading.Event()
+        self.queue = None
+        self._monitor_task = None
+        self._shutdown = False
 
         # Error handling parameters
         self.reconnect_delay = 1
@@ -42,26 +40,18 @@ class XRPLWebSocketMonitor:
         self.LEDGER_TIMEOUT = 30
         self.CHECK_INTERVAL = 4
 
-    def start(self):
-        """Start the monitor in a separate thread"""
-        self.monitor_thread = threading.Thread(target=self._run_monitor, daemon=True)
-        self.monitor_thread.start()
+    def start(self, queue: asyncio.Queue):
+        """Start the monitor as an asyncio task"""
+        self.queue = queue
+        self._shutdown = False
+        self._monitor_task = asyncio.create_task(self.monitor())
+        return self._monitor_task
 
-    def stop(self):
-        """Signal the monitor to stop"""
-        self._stop_event.set()
-
-    def _run_monitor(self):
-        """Main monitor thread entry point"""
-        asyncio.set_event_loop(self.loop)
-        try:
-            self.loop.run_until_complete(self.monitor())
-        except Exception as e:
-            if not self._stop_event.is_set():
-                logger.error(f"Unhandled exception in XRPL monitor: {e}")
-                logger.error(traceback.format_exc())
-        finally:
-            self.loop.close()
+    async def stop(self):
+        """Signal the monitor to stop and wait for it to complete"""
+        self._shutdown = True
+        if self._monitor_task:
+            await self._monitor_task
 
     async def handle_connection_error(self, error_msg: str) -> bool:
         """Handle connection errors with exponential backoff"""
@@ -88,7 +78,7 @@ class XRPLWebSocketMonitor:
 
     async def monitor(self):
         """Main monitoring loop with error handling"""
-        while not self._stop_event.is_set():
+        while not self._shutdown:
             try:
                 await self._monitor_xrpl()
                 # Reset reconnection parameters on successful connection
@@ -98,9 +88,11 @@ class XRPLWebSocketMonitor:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                if self._stop_event.is_set():
+                if self._shutdown:
                     break
-                await self.handle_connection_error(f"XRPL monitor error: {e}")
+                should_continue = await self.handle_connection_error(f"XRPL monitor error: {e}")
+                if not should_continue:
+                    break
 
     async def _monitor_xrpl(self):
         """Monitor XRPL for updates"""
@@ -123,7 +115,7 @@ class XRPLWebSocketMonitor:
 
             try:
                 async for message in self.client:
-                    if self._stop_event.is_set():
+                    if self._shutdown:
                         break
 
                     try:
@@ -166,12 +158,7 @@ class XRPLWebSocketMonitor:
                 "validated": tx_message.get("validated", False)
             }
 
-            # Create DataFrame in same format as existing code
-            tx_df = pd.DataFrame([formatted_tx])
-            
-            # Process through existing pipeline
-            if not tx_df.empty:
-                self.pft_utilities.sync_pft_transaction_history()
+            await self.queue.put(formatted_tx)
 
         except Exception as e:
             logger.error(f"Error processing transaction update: {e}")
