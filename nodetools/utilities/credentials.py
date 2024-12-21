@@ -42,11 +42,16 @@ class CredentialManager:
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            password = kwargs.get('password')
-            if args:
-                password = args[0]
+            password = kwargs.get('password', args[0] if args else None)
             if password is None:
                 raise ValueError("Password is required for first CredentialManager instance")
+            
+            # Verify password before allowing instantiation
+            temp_instance = super().__new__(cls)
+            temp_instance.db_path = get_database_path()
+            if not temp_instance.verify_password(password):
+                raise ValueError("Invalid password")
+            
             cls._instance = super().__new__(cls)
         return cls._instance
 
@@ -107,7 +112,6 @@ class CredentialManager:
                     fernet.decrypt(row[0].encode())
                     return True
         except Exception as e:
-            print(f"Failed to verify password: {e}")
             return False
         
     def get_credential(self, credential):

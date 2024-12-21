@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Set, Optional, Dict, Any, Pattern, List
 from enum import Enum
+from loguru import logger
 
 class TransactionType(Enum):
     REQUEST = "request"
@@ -63,7 +64,6 @@ class MemoPattern:
 @dataclass
 class TransactionPattern:
     memo_pattern: MemoPattern
-    # requires_response: bool
     transaction_type: TransactionType
     valid_responses: Set[MemoPattern]
 
@@ -78,6 +78,7 @@ class TransactionPattern:
 class TransactionGraph:
     def __init__(self):
         self.patterns: Dict[str, TransactionPattern] = {}
+        self.memo_pattern_to_id: Dict[MemoPattern, str] = {}
 
     def add_pattern(
             self,
@@ -96,6 +97,8 @@ class TransactionGraph:
             transaction_type=transaction_type, 
             valid_responses=valid_responses, 
         )
+        # Update the reverse lookup
+        self.memo_pattern_to_id[memo_pattern] = pattern_id
 
     def is_valid_response(self, request_pattern_id: str, response_tx: Dict[str, Any]) -> bool:
         if request_pattern_id not in self.patterns:
@@ -109,10 +112,33 @@ class TransactionGraph:
 
     def find_matching_pattern(self, tx: Dict[str, Any]) -> Optional[str]:
         """Find the first pattern ID whose pattern matches the transaction"""
+
+        # # Only debug for specific transaction
+        # debug_hash = "B365144B26EB46686ED700F78E30B26316C59F18BB5CA628A166772F4E0F200E"
+        # is_debug_tx = tx.get('hash') == debug_hash
+        
+        # if is_debug_tx:
+        #     logger.debug(f"Finding pattern for transaction {debug_hash}")
+        #     logger.debug(f"Transaction memo_type: {tx.get('memo_type')}")
+
         for pattern_id, pattern in self.patterns.items():
+
+            # # DEBUGGING
+            # if is_debug_tx:
+            #     logger.debug(f"Testing pattern '{pattern_id}' with memo_type: {pattern.memo_pattern.memo_type}")
+            #     if pattern.memo_pattern.matches(tx):
+            #         logger.debug(f"Found matching pattern: {pattern_id}")
+            #         return pattern_id
+            #     logger.debug(f"Pattern '{pattern_id}' did not match")
+            #     continue
+
             if pattern.memo_pattern.matches(tx):
                 return pattern_id
         return None
+    
+    def get_pattern_id_by_memo_pattern(self, memo_pattern: MemoPattern) -> Optional[str]:
+        """Get the pattern ID for a given memo pattern"""
+        return self.memo_pattern_to_id.get(memo_pattern)
 
 @dataclass
 class ResponseQuery:
@@ -122,17 +148,13 @@ class ResponseQuery:
 
 class TransactionRule(ABC):
     """Base class for transaction processing rules"""
-    def __init__(self, transaction_graph: TransactionGraph):
-        self.transaction_graph = transaction_graph
-
     @abstractmethod
-    async def matches(self, tx: Dict[str, Any]) -> bool:
-        """Determine if this rule applies to the transaction"""
+    async def validate(self, tx: Dict[str, Any]) -> bool:
+        """
+        Validate any additional business rules for a transaction
+        This is separate from the transaction pattern matching
+        """
         pass
-
-    def get_pattern_id(self, tx: Dict[str, Any]) -> Optional[str]:
-        """Get the pattern ID for this transaction"""
-        return self.transaction_graph.find_matching_pattern(tx)
 
     @property
     @abstractmethod
@@ -153,19 +175,12 @@ class ResponseRule(TransactionRule):
     """Base class for rules that handle response transactions"""
     transaction_type = TransactionType.RESPONSE
 
-    async def find_response(self, request_tx: Dict[str, Any]) -> Optional[ResponseQuery]:
-        """Response transactions never need to find responses"""
-        return None
-
 class StandaloneRule(TransactionRule):
     """Base class for rules that handle standalone transactions"""
     transaction_type = TransactionType.STANDALONE
-
-    async def find_response(self, request_tx: Dict[str, Any]) -> Optional[ResponseQuery]:
-        """Standalone transactions never need to find responses"""
-        return None
     
 @dataclass
 class BusinessLogicProvider:
     """Centralizes all business logic configuration"""
-    rules: List[TransactionRule]
+    transaction_graph: TransactionGraph
+    pattern_rule_map: Dict[str, TransactionRule]  # Maps pattern_id to rule instance

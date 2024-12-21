@@ -28,6 +28,7 @@ from nodetools.chatbots.odv_sprint_planner import ODVSprintPlannerO1
 from nodetools.chatbots.odv_context_doc_improvement import ODVContextDocImprover
 from nodetools.ai.openrouter import OpenRouterTool
 from nodetools.chatbots.corbanu_beta import CorbanuChatBot
+import sys
 
 class MyClient(discord.Client):
     def __init__(self, *args, **kwargs):
@@ -3033,35 +3034,61 @@ def init_services():
     )
 
 if __name__ == "__main__":
-    # Initialize credential manager
-    password = getpass.getpass("Enter your password: ")
-    cred_manager = CredentialManager(password=password)
+    generic_pft_utilities = None
 
-    # Initialize performance monitor
-    monitor = PerformanceMonitor(time_window=60)
-    monitor.start()
+    try:
+        # Startup phase
+        try:
+            while True:
+                try:
+                    password = getpass.getpass("Enter your password: ")
+                    cred_manager = CredentialManager(password=password)
+                    break
+                except Exception as e:
+                    print("Invalid password. Please try again.")
 
-    # Configure logger
-    configure_logger(
-        log_to_file=True,
-        output_directory=Path.cwd() / "nodetools",
-        log_filename="nodetools.log",
-        level="DEBUG"
-    )
+            # Initialize performance monitor
+            monitor = PerformanceMonitor(time_window=60)
+            monitor.start()
 
-    configure_runtime()
+            # Configure logger
+            configure_logger(
+                log_to_file=True,
+                output_directory=Path.cwd() / "nodetools",
+                log_filename="nodetools.log",
+                level="DEBUG"
+            )
 
-    # Instantiate services
-    openai_request_tool = OpenAIRequestTool()
-    post_fiat_task_generation_system = PostFiatTaskGenerationSystem()
-    generic_pft_utilities = GenericPFTUtilities()
+            configure_runtime()
 
-    # Initialize services
-    generic_pft_utilities.initialize()
+        except KeyboardInterrupt:
+            print("\nStartup cancelled")
+            sys.exit(0)
 
-    logger.debug("---Services initialized successfully!---")
+        # Instantiate services
+        openai_request_tool = OpenAIRequestTool()
+        post_fiat_task_generation_system = PostFiatTaskGenerationSystem()
+        generic_pft_utilities = GenericPFTUtilities()
 
-    # Initialize and run the bot
-    client = init_bot()
-    discord_credential_key = "discordbot_testnet_secret" if RuntimeConfig.USE_TESTNET else "discordbot_secret"
-    client.run(cred_manager.get_credential(discord_credential_key))
+        # Initialize services
+        generic_pft_utilities.initialize()
+
+        logger.debug("---Services initialized successfully!---")
+
+        # Initialize and run the bot
+        client = init_bot()
+        discord_credential_key = "discordbot_testnet_secret" if RuntimeConfig.USE_TESTNET else "discordbot_secret"
+        client.run(cred_manager.get_credential(discord_credential_key))
+
+    except KeyboardInterrupt:
+        # if generic_pft_utilities:
+        #     print("\nShutting down gracefully...")
+        #     try:
+        #         # Clean up resources
+        #         generic_pft_utilities.shutdown()
+        #         print("Shutdown complete")
+        #     except Exception as e:
+        #         print(f"Error during shutdown: {e}")
+        # else:
+        #     print("Cancelled")
+        sys.exit(0)

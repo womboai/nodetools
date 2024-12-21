@@ -92,49 +92,57 @@ class GenericPFTUtilities:
 
             # Initialize XRPL monitor and state manager
             self.xrpl_monitor = XRPLWebSocketMonitor(self)
-            self.state_manager = TransactionOrchestrator(self, self.transaction_repository)
-            self._state_manager_thread = None
-            self._state_manager_loop = None
+            self.transaction_orchestrator = TransactionOrchestrator(self, self.transaction_repository)
+            self._transaction_orchestrator_task = None
 
             self.__class__._initialized = True
 
-    def _run_state_manager(self):
-        """Run state manager in its own event loop"""
-        try:
-            # Create new event loop for this thread
-            self._state_manager_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._state_manager_loop)
-            
-            # Run state manager
-            self._state_manager_loop.run_until_complete(self.state_manager.start())
-            self._state_manager_loop.run_forever()
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities._run_state_manager: State manager thread error: {e}")
-            logger.error(traceback.format_exc())
-        finally:
-            self._state_manager_loop.close()
-
     def initialize(self):
         """Initialize components that require async operations"""
-        # Start state manager in separate thread
-        self._state_manager_thread = threading.Thread(
-            target=self._run_state_manager,
-            name="StateManagerThread",
-            daemon=True  # Thread will exit when main program exits
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # No running event loop
+            # Create new event loop if none exists
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        # Create task in the loop
+        self._transaction_orchestrator_task = loop.create_task(
+            self.transaction_orchestrator.start(),
+            name="TransactionOrchestratorTask"
         )
-        self._state_manager_thread.start()
-        logger.debug("GenericPFTUtilities.initialize: State manager thread started")
+        logger.debug("GenericPFTUtilities.initialize: Transaction orchestrator started")
 
     def shutdown(self):
         """Clean shutdown of async components"""
-        if self._state_manager_loop:
-            # Schedule loop stop from within the loop
-            self._state_manager_loop.call_soon_threadsafe(self._state_manager_loop.stop)
-            
-            # Wait for thread to finish
-            if self._state_manager_thread and self._state_manager_thread.is_alive():
-                self._state_manager_thread.join(timeout=5)
-                logger.debug("GenericPFTUtilities.shutdown: State manager thread stopped")
+        if self._transaction_orchestrator_task:
+            try:
+                # First stop the orchestrator
+                self.transaction_orchestrator.stop()
+                
+                # Get or create event loop
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                # Give tasks time to cleanup (5 seconds max)
+                try:
+                    loop.run_until_complete(asyncio.wait_for(
+                        self._transaction_orchestrator_task, 
+                        timeout=5.0
+                    ))
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout waiting for orchestrator to shutdown gracefully")
+                except asyncio.CancelledError:
+                    pass
+                
+            except Exception as e:
+                logger.error(f"GenericPFTUtilities.shutdown: Error during transaction orchestrator shutdown: {e}")
+            finally:
+                self._transaction_orchestrator_task = None
+                logger.debug("GenericPFTUtilities.shutdown: Transaction orchestrator stopped")
 
     @staticmethod
     def convert_ripple_timestamp_to_datetime(ripple_timestamp = 768602652):
@@ -455,6 +463,7 @@ class GenericPFTUtilities:
         logger.debug(f'-- Spawned wallet with address {wallet.address}')
         return wallet
     
+    @PerformanceMonitor.measure('get_account_memo_history')
     def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
         """Synchronous version: Get transaction history with memos for an account.
         
@@ -481,7 +490,6 @@ class GenericPFTUtilities:
             # If we're already in an event loop
             return loop.run_until_complete(self.get_account_memo_history_async(account_address, pft_only))
     
-    @PerformanceMonitor.measure('get_account_memo_history')
     async def get_account_memo_history_async(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
         """Get transaction history with memos for an account.
         
@@ -1430,6 +1438,7 @@ class GenericPFTUtilities:
 
         return self._batch_insert_transactions(tx_hist)
     
+    @PerformanceMonitor.measure('sync_pft_transaction_history')
     def sync_pft_transaction_history(self):
         """Sync transaction history for all PFT token holders.
         
