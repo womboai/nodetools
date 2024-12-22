@@ -10,7 +10,7 @@ import pandas as pd
 import uuid
 import re
 from loguru import logger
-import nodetools.configuration.constants as constants
+import nodetools.configuration.constants as global_constants
 from typing import Optional
 
 class UserContext:
@@ -92,7 +92,6 @@ class NewTaskGeneration:
 
     def __init__(
             self,
-            task_management_system: PostFiatTaskGenerationSystem,
             generic_pft_utilities: GenericPFTUtilities,
             openrouter_tool: OpenRouterTool
         ):
@@ -107,7 +106,6 @@ class NewTaskGeneration:
             self.user_context = UserContext()
             self.openrouter_tool = openrouter_tool
             self.user_task_parser = UserTaskParser(
-                task_management_system=task_management_system,
                 generic_pft_utilities=generic_pft_utilities
             )
             self.__class__._initialized = True
@@ -165,7 +163,7 @@ class NewTaskGeneration:
         
         # Set proposal strings, reward amounts, PFT amounts
         REWARD_AMOUNT = 900  # TODO: Make this dynamic
-        output_df['pf_proposal_string'] = constants.TaskType.PROPOSAL.value + output_df['content'].apply(
+        output_df['pf_proposal_string'] = global_constants.TaskType.PROPOSAL.value + output_df['content'].apply(
             lambda x: self.extract_final_output(x)
         ) + ' .. ' + str(REWARD_AMOUNT)
         output_df['reward'] = REWARD_AMOUNT
@@ -206,7 +204,7 @@ class NewTaskGeneration:
     def run_batch_task_generation(
             self,
             task_map: dict,
-            model: Optional[str] = constants.DEFAULT_OPENROUTER_MODEL,
+            model: Optional[str] = global_constants.DEFAULT_OPENROUTER_MODEL,
             get_google_doc: bool = True,
             get_historical_memos: bool = True
         ):

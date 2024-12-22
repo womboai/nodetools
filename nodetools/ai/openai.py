@@ -7,7 +7,7 @@ import nest_asyncio
 from nodetools.utilities.db_manager import DBConnectionManager
 from nodetools.utilities.credentials import CredentialManager
 import uuid
-import nodetools.configuration.constants as constants
+import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
 from loguru import logger
 import httpx
@@ -29,7 +29,7 @@ class OpenAIRequestTool:
             openrouter_key = cred_manager.get_credential('openrouter')
             self.using_openrouter = openrouter_key is not None
             if openrouter_key:
-                base_url = constants.OPENROUTER_BASE_URL
+                base_url = global_constants.OPENROUTER_BASE_URL
                 self.api_key = openrouter_key
             else:
                 base_url = None  # Use default OpenAI URL

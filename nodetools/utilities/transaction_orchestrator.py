@@ -6,12 +6,28 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 import asyncio
 from loguru import logger
-from nodetools.models.models import TransactionRule, TransactionType
+from nodetools.models.models import (
+    ResponseRule, 
+    TransactionType, 
+    TransactionPattern, 
+    ResponseGenerator, 
+    ResponseParameters,
+    Dependencies
+)
 from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
 from nodetools.protocols.transaction_repository import TransactionRepository
+from nodetools.protocols.credentials import CredentialManager
+from nodetools.protocols.openrouter import OpenRouterTool
+from nodetools.configuration.configuration import NodeConfig
 from nodetools.task_processing.task_management_rules import create_business_logic, BusinessLogicProvider
 import traceback
 import time
+
+def format_duration(seconds: float) -> str:
+    """Format a duration in H:m:s format"""
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 @dataclass
 class ProcessingResult:
@@ -20,6 +36,7 @@ class ProcessingResult:
     rule_name: str
     response_tx_hash: Optional[str] = None
     notes: Optional[str] = None
+    needs_rereview: bool = False
 
 class TransactionReviewer:
     """
@@ -34,19 +51,13 @@ class TransactionReviewer:
     async def review_transaction(self, tx: Dict[str, Any]) -> ProcessingResult:
         """Review a single transaction against all rules"""
 
-        # # Only debug for specific transaction
-        # debug_hash = "B365144B26EB46686ED700F78E30B26316C59F18BB5CA628A166772F4E0F200E"
-        # is_debug_tx = tx.get('hash') == debug_hash
-
-        # if is_debug_tx:
-        #     logger.debug(f"Reviewing transaction {debug_hash}")
-        #     logger.debug(f"Transaction memo_type: {tx.get('memo_type')}")
+        logger.debug(f"Reviewing transaction {tx.get('hash')}: {tx}")
+        logger.debug(f"Transaction memo_type: {tx.get('memo_type')}")
 
         # First find matching pattern
         pattern_id = self.graph.find_matching_pattern(tx)
 
-        # if is_debug_tx:
-        #     logger.debug(f"Found matching pattern_id: {pattern_id}")
+        logger.debug(f"Found matching pattern_id: {pattern_id}")
 
         if not pattern_id:
             return ProcessingResult(
@@ -57,8 +68,7 @@ class TransactionReviewer:
         
         pattern = self.graph.patterns[pattern_id]
 
-        # if is_debug_tx:
-        #     logger.debug(f"Found pattern: {pattern}")
+        logger.debug(f"Found pattern: {pattern}")
 
         # Get the corresponding rule for this pattern
         rule = self.pattern_rule_map[pattern_id]
@@ -74,13 +84,14 @@ class TransactionReviewer:
 
             if await rule.validate(tx):  # Pure business rule validation
                 
-                # if is_debug_tx:
-                #     logger.debug(f"Rule {rule.__class__.__name__} validated transaction")
+                logger.debug(f"Rule {rule.__class__.__name__} validated transaction")
 
                 # Process based on the pattern's transaction type
                 match pattern.transaction_type:
                     # Response or standalone transactions don't need responses
                     case TransactionType.RESPONSE | TransactionType.STANDALONE:
+                        logger.debug(f"Processed {pattern.transaction_type.value} transaction")
+
                         return ProcessingResult(
                             processed=True, 
                             rule_name=rule.__class__.__name__,
@@ -97,19 +108,22 @@ class TransactionReviewer:
                         )
                         response_tx = result[0] if result else None
 
+                        logger.debug(f"Response query for rule {rule.__class__.__name__}: {response_query.query}")
+                        logger.debug(f"Response params for rule {rule.__class__.__name__}: {response_query.params}")
+
                         if not response_tx:
 
-                            # # DEBUGGING
-                            # if is_debug_tx:
-                            #     logger.debug(f"No response found for tx {tx['hash']} using rule {rule.__class__.__name__}")
-                            #     logger.debug(f"Response query for rule {rule.__class__.__name__}: {response_query.query}")
-                            #     logger.debug(f"Response params for rule {rule.__class__.__name__}: {response_query.params}")
+                            # DEBUGGING
+                            logger.debug(f"No response found for tx {tx['hash']} using rule {rule.__class__.__name__}")
 
                             return ProcessingResult(
                                 processed=False,  # We've reviewed it and found no response
                                 rule_name=rule.__class__.__name__,
-                                notes="Required response not found"
+                                notes="Required response not found",
+                                needs_rereview=True
                             )
+
+                        logger.debug(f"Response found for tx {tx['hash']} using rule {rule.__class__.__name__}")
 
                         # 5. Response found
                         return ProcessingResult(
@@ -121,6 +135,8 @@ class TransactionReviewer:
                     
             else:
                 # Rule validation failed
+                logger.debug(f"Rule {rule.__class__.__name__} failed validation for transaction {tx['hash']}")
+
                 return ProcessingResult(
                     processed=True,  # We've reviewed it and determined it failed validation
                     rule_name=rule.__class__.__name__,
@@ -138,37 +154,73 @@ class ResponseRoutingResult:
     pattern_id: str
     notes: Optional[str] = None
 
-class TransactionResponseManager:
+@dataclass
+class QueueConfig:
+    """Configuration for a response queue and its generator"""
+    queue: asyncio.Queue
+    pattern: TransactionPattern
+    rule: ResponseRule
+
+class ResponseQueueRouter:
     """
     Manages the routing of transactions that need responses to appropriate processing queues.
     Also tracks pending responses and triggers re-review when responses are confirmed.
     """
-    def __init__(self, business_logic: BusinessLogicProvider, review_queue: asyncio.Queue):
+    def __init__(
+            self, 
+            business_logic: BusinessLogicProvider, 
+            review_queue: asyncio.Queue,
+            transaction_repository: TransactionRepository,
+            shutdown_event: asyncio.Event
+        ):
         self.graph = business_logic.transaction_graph
         self.pattern_rule_map = business_logic.pattern_rule_map
-        self._shutdown = False
         self.review_queue = review_queue
+        self.transaction_repository = transaction_repository
+        self._shutdown_event = shutdown_event
 
         # Track pending responses and their review queues
         self.pending_responses: Dict[str, Dict[str, Any]] = {}  # tx_hash -> original_tx
 
-        # Create queues based on response patterns from rules
-        self.response_queues: Dict[str, asyncio.Queue] = self._initialize_response_queues()
+        # Add pending re-reviews tracking
+        self.pending_rereviews: Dict[str, Dict[str, Any]] = {}
+        self.MAX_RETRY_COUNT = 10
+        self.RETRY_DELAY = 5  # seconds
+
+        # Initialize queue configurations
+        self.queue_configs: Dict[str, QueueConfig] = self._initialize_queue_configs()
         self.processing_counts: Dict[str, int] = {
-            pattern_id: 0 for pattern_id in self.response_queues.keys()
+            pattern_id: 0 for pattern_id in self.queue_configs.keys()
         }
 
-    def _initialize_response_queues(self) -> Dict[str, asyncio.Queue]:
-        """Initialize queues based on response patterns in business rules"""
-        response_patterns: Dict[str, asyncio.Queue] = {}
+        # Start retry task
+        self.retry_task = asyncio.create_task(self._retry_pending_reviews())
+
+    def _initialize_queue_configs(self) -> Dict[str, asyncio.Queue]:
+        """Initialize queue configurations based on response patterns in business rules"""
+        configs: Dict[str, QueueConfig] = {}
 
         # Create a queue for each RESPONSE type pattern in the graph
         for pattern_id, pattern in self.graph.patterns.items():
             if pattern.transaction_type == TransactionType.RESPONSE:
-                logger.debug(f"TransactionResponseManager: Adding response queue for pattern '{pattern_id}'")
-                response_patterns[pattern_id] = asyncio.Queue()
+                rule = self.pattern_rule_map[pattern_id]
+                if isinstance(rule, ResponseRule):
+                    configs[pattern_id] = QueueConfig(
+                        queue=asyncio.Queue(),
+                        pattern=pattern,
+                        rule=rule
+                    )
+                    logger.debug(f"TransactionResponseManager: Adding queue config for pattern '{pattern_id}'")
     
-        return response_patterns
+        return configs
+    
+    def get_queue_config(self, pattern_id: str) -> Optional[QueueConfig]:
+        """Get the queue configuration for a given pattern ID"""
+        return self.queue_configs.get(pattern_id)
+    
+    def get_all_queue_configs(self) -> Dict[str, QueueConfig]:
+        """Get all queue configurations"""
+        return self.queue_configs
     
     async def route_transaction(self, tx: Dict[str, Any]) -> bool:
         """Route transaction to appropriate response queue based on its matching rule"""
@@ -179,7 +231,7 @@ class TransactionResponseManager:
                 self.pending_responses[tx['hash']] = tx
 
                 # Route transaction to appropriate response queue
-                await self.response_queues[result.pattern_id].put(tx)
+                await self.queue_configs[result.pattern_id].queue.put(tx)
                 logger.debug(f"Routed transaction {tx['hash']} to {result.pattern_id} queue")
                 return True
             return False
@@ -241,25 +293,236 @@ class TransactionResponseManager:
         )
     
     async def confirm_response_sent(self, request_tx_hash: str):
-        """
-        Called by response consumers after successfully submitting a response.
-        Triggers re-review of the original transaction.
-        """
+        """Queue transaction for re-review with retry mechanism"""
         if request_tx_hash in self.pending_responses:
             original_tx = self.pending_responses.pop(request_tx_hash)
-            await self.review_queue.put(original_tx)
-            logger.debug(f"Re-queued transaction {request_tx_hash} for review after response")
+            
+            # Add to pending re-reviews with retry count
+            self.pending_rereviews[request_tx_hash] = {
+                'tx': original_tx,
+                'retries': 0,
+                'next_retry': time.time() + self.RETRY_DELAY
+            }
+            logger.debug(f"Queued {request_tx_hash} for re-review with retries")
+    
+    async def _retry_pending_reviews(self):
+        """Background task to retry pending re-reviews"""
+        while not self._shutdown_event.is_set():
+            try:
+                current_time = time.time()
+                
+                # Get all transactions that need retry
+                for tx_hash, info in list(self.pending_rereviews.items()):
+                    if current_time >= info['next_retry']:
+                        try:
+                            # Check if specific transaction exists in decoded_memos view
+                            tx = await self.transaction_repository.get_decoded_transaction(tx_hash)
+                            
+                            if tx:
+                                # Found in database with decoded memos, queue for review
+                                await self.review_queue.put(tx)  # Use the complete decoded transaction
+                                logger.debug(f"Re-queued transaction {tx_hash} for review after {info['retries']} retries")
+                                self.pending_rereviews.pop(tx_hash)
+                            else:
+                                # Not found, increment retry count
+                                info['retries'] += 1
+                                if info['retries'] >= self.MAX_RETRY_COUNT:
+                                    logger.warning(f"Max retries reached for {tx_hash}, giving up")
+                                    self.pending_rereviews.pop(tx_hash)
+                                else:
+                                    # Schedule next retry with exponential backoff
+                                    info['next_retry'] = current_time + (self.RETRY_DELAY * (2 ** info['retries']))
+                                    logger.debug(f"Scheduling retry {info['retries']} for {tx_hash}")
+                        
+                        except Exception as e:
+                            logger.error(f"Error during retry for {tx_hash}: {e}")
+                            logger.error(traceback.format_exc())
+                
+                # Sleep briefly to prevent busy-waiting
+                await asyncio.sleep(1.0)
+                
+            except Exception as e:
+                logger.error(f"Error in retry loop: {e}")
+                logger.error(traceback.format_exc())
+                await asyncio.sleep(5.0)  # Longer sleep on error
     
     def get_queue_sizes(self) -> Dict[str, int]:
         """Get current size of all response queues"""
         return {
-            pattern_id: queue.qsize() 
-            for pattern_id, queue in self.response_queues.items()
+            pattern_id: config.queue.qsize() 
+            for pattern_id, config in self.queue_configs.items()
         }
 
+class ResponseProcessor:
+    """Queue consumer that generates and submits responses to transactions.
+    
+    Handles the core consume-evaluate-respond loop while delegating the actual
+    response generation to a ResponseGenerator provided by the rule.
+    """
+    def __init__(
+            self,
+            queue: asyncio.Queue,
+            response_manager: ResponseQueueRouter,
+            generator: ResponseGenerator,
+            credential_manager: CredentialManager,
+            generic_pft_utilities: GenericPFTUtilities,
+            shutdown_event: asyncio.Event,
+            pattern_id: str
+        ):
+        self.queue = queue
+        self.response_manager = response_manager
+        self.generator = generator
+        self.credential_manager = credential_manager
+        self.generic_pft_utilities = generic_pft_utilities
+        self._shutdown_event = shutdown_event
+        self.pattern_id = pattern_id
+        self.processed_count = 0
+        self.last_log_time = time.time()
+        self.last_activity_time = time.time()
+        self.LOG_INTERVAL = 60  # Log progress every minute
+        self.IDLE_LOG_INTERVAL = 300  # Log idle status every 5 minutes
+
+    async def run(self):
+        """Process transactions from the queue until shutdown"""
+        while not self._shutdown_event.is_set():
+            try:
+                # Get transaction from queue
+                tx = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+
+                # Process the transaction
+                success = await self._process_transaction(tx)
+
+                if success:
+                    self.processed_count += 1
+                    self.last_activity_time = time.time()
+                    await self.response_manager.confirm_response_sent(tx['hash'])
+
+                self.queue.task_done()
+
+                # Log progress if interval elapsed
+                current_time = time.time()
+                if current_time - self.last_log_time > self.LOG_INTERVAL:
+                    queue_size = self.queue.qsize()
+                    logger.info(
+                        f"Consumer_{self.pattern_id}: "
+                        f"Processed {self.processed_count} transactions. "
+                        f"Current queue size: {queue_size}"
+                    )
+                    self.last_log_time = current_time
+
+            except asyncio.TimeoutError:
+                # Log idle status if interval elapsed
+                current_time = time.time()
+                idle_duration = current_time - self.last_activity_time
+                if idle_duration > self.IDLE_LOG_INTERVAL:
+                    logger.info(
+                        f"Consumer_{self.pattern_id}: "
+                        f"Idle for {format_duration(idle_duration)}. "
+                        f"Total processed: {self.processed_count}"
+                    )
+                    self.last_activity_time = current_time  # Reset to avoid spam
+                continue
+
+            except Exception as e:
+                logger.error(f"BaseConsumer.run: Error processing transaction: {e}")
+                logger.error(traceback.format_exc())
+
+    async def _process_transaction(self, tx: Dict[str, Any]) -> bool:
+        """Process a single transaction using the generator"""
+        try:
+            # Evaluate the request
+            evaluation = await self.generator.evaluate_request(tx)
+
+            # Construct response parameters
+            response_params: ResponseParameters = await self.generator.construct_response(tx, evaluation)
+
+            # Get appropriate wallet based on source
+            node_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(
+                self.credential_manager.get_credential(f'{response_params.source}__v1xrpsecret')
+            )
+
+            # Send response transaction
+            return await self.generic_pft_utilities.process_queue_transaction(
+                wallet=node_wallet,
+                memo=response_params.memo,
+                destination=response_params.destination,
+                pft_amount=response_params.pft_amount
+            )
+
+        except Exception as e:
+            logger.error(f"BaseConsumer._process_transaction: Error processing transaction: {e}")
+            logger.error(traceback.format_exc())
+            return False
+
     def stop(self):
-        """Stop the response manager"""
+        """Signal the consumer to stop processing"""
         self._shutdown = True
+
+class ResponseProcessorManager:
+    """Manages the lifecycle of async queue consumers"""
+    def __init__(
+            self, 
+            response_manager: ResponseQueueRouter,
+            node_config: NodeConfig,
+            credential_manager: CredentialManager,
+            generic_pft_utilities: GenericPFTUtilities,
+            openrouter: OpenRouterTool,
+            transaction_repository: TransactionRepository
+        ):
+        self.response_manager = response_manager
+        self.dependencies = Dependencies(
+            node_config=node_config,
+            credential_manager=credential_manager,
+            generic_pft_utilities=generic_pft_utilities,
+            openrouter=openrouter,
+            transaction_repository=transaction_repository
+        )
+        self.consumers: Dict[str, ResponseProcessor] = {}
+        self._tasks: List[asyncio.Task] = []
+        self._shutdown_event = asyncio.Event()
+
+    async def start(self):
+        """Initialize and start consumers for all response queues"""
+        try:
+            # Get queue configurations from response manager
+            queue_configs = self.response_manager.get_all_queue_configs()
+
+            for pattern_id, config in queue_configs.items():
+                # Each rule creates its generator with all necessary dependencies
+                generator = config.rule.get_response_generator(self.dependencies)
+
+                # Create consumer
+                consumer = ResponseProcessor(
+                    queue=config.queue,
+                    response_manager=self.response_manager,
+                    generator=generator,
+                    credential_manager=self.dependencies.credential_manager,
+                    generic_pft_utilities=self.dependencies.generic_pft_utilities,
+                    shutdown_event=self._shutdown_event,
+                    pattern_id=pattern_id
+                )
+
+                # Store consumer
+                self.consumers[pattern_id] = consumer
+
+                # Create and store task
+                task = asyncio.create_task(
+                    consumer.run(),
+                    name=f"Consumer_{pattern_id}"
+                )
+                self._tasks.append(task)
+                logger.debug(f"ResponseProcessorManager: Started ResponseProcessor for pattern: {pattern_id}")
+
+        except Exception as e:
+            logger.error(f"Error starting consumers: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+    async def stop(self):
+        """Signal all consumers to stop"""
+        self._shutdown_event.set()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
 
 class TransactionOrchestrator:
     """
@@ -272,28 +535,22 @@ class TransactionOrchestrator:
     def __init__(
             self, 
             generic_pft_utilities: GenericPFTUtilities, 
-            transaction_repository: TransactionRepository
+            transaction_repository: TransactionRepository,
+            credential_manager: CredentialManager,
+            node_config: NodeConfig,
+            openrouter: OpenRouterTool
     ):
         self.generic_pft_utilities = generic_pft_utilities
         self.transaction_repository = transaction_repository
-        self._shutdown = False
+        self.credential_manager = credential_manager
+        self.node_config = node_config
+        self.openrouter = openrouter
         self.review_queue = asyncio.Queue()     # Queue for transactions needing review
         self.routing_queue = asyncio.Queue()    # Queue for transactions needing responses
         self.reviewer: TransactionReviewer = None  # will be initialized in start()
-        self.response_manager: TransactionResponseManager = None  # will be initialized in start()
-
-    @classmethod
-    def create_from_business_logic(
-        cls,
-        generic_pft_utilities: GenericPFTUtilities,
-        transaction_repository: TransactionRepository
-    ) -> 'TransactionOrchestrator':
-        """Factory method to create an Orchestrator with business logic"""
-        instance = cls(generic_pft_utilities, transaction_repository)
-        business_logic = create_business_logic()
-        instance.reviewer = TransactionReviewer(business_logic.rules, transaction_repository)
-        instance.response_manager = TransactionResponseManager(business_logic.rules)
-        return instance
+        self.response_manager: ResponseQueueRouter = None  # will be initialized in start()
+        self.consumer_manager: ResponseProcessorManager = None  # will be initialized in start()
+        self._shutdown_event = asyncio.Event()
 
     async def start(self):
         """Coordinate transaction processing"""
@@ -304,9 +561,20 @@ class TransactionOrchestrator:
                     repository=self.transaction_repository
                 )
             if not self.response_manager:
-                self.response_manager = TransactionResponseManager(
+                self.response_manager = ResponseQueueRouter(
                     business_logic=create_business_logic(),
-                    review_queue=self.review_queue
+                    review_queue=self.review_queue,
+                    transaction_repository=self.transaction_repository,
+                    shutdown_event=self._shutdown_event
+                )
+            if not self.consumer_manager:
+                self.consumer_manager = ResponseProcessorManager(
+                    response_manager=self.response_manager,
+                    node_config=self.node_config,
+                    credential_manager=self.credential_manager,
+                    generic_pft_utilities=self.generic_pft_utilities,
+                    openrouter=self.openrouter,
+                    transaction_repository=self.transaction_repository
                 )
 
             # Start websocket with review queue
@@ -326,21 +594,24 @@ class TransactionOrchestrator:
             for tx in unverified_txs:
                 await self.review_queue.put(tx)
 
-            # Start review and processing tasks
+            # Start all processing tasks
             logger.debug("TransactionOrchestrator: Starting review task")
             review_task = asyncio.create_task(self._review_loop())
-            logger.debug("TransactionOrchestrator: Starting processing task")
-            processing_task = asyncio.create_task(self._route_loop())
+            logger.debug("TransactionOrchestrator: Starting response routing task")
+            route_task = asyncio.create_task(self._route_loop())
+            logger.debug("TransactionOrchestrator: Starting consumer manager")
+            consumer_task = asyncio.create_task(self._consumer_loop())
 
             try:
-                await asyncio.gather(review_task, processing_task)
+                await asyncio.gather(review_task, route_task, consumer_task)
             except asyncio.CancelledError:
                 logger.info("TransactionOrchestrator: Received shutdown signal")
                 # Cancel child tasks
                 review_task.cancel()
-                processing_task.cancel()
+                route_task.cancel()
+                consumer_task.cancel()
                 # Wait for tasks to complete
-                await asyncio.gather(review_task, processing_task, return_exceptions=True)
+                await asyncio.gather(review_task, route_task, consumer_task, return_exceptions=True)
                 logger.info("TransactionOrchestrator: Shutdown complete")
 
         except Exception as e:
@@ -357,7 +628,7 @@ class TransactionOrchestrator:
         IDLE_LOG_INTERVAL = 300  # Log idle status every 5 minutes
 
         try:
-            while not self._shutdown:
+            while not self._shutdown_event.is_set():
                 try:
                     # Wait for next transaction with timeout
                     tx = await asyncio.wait_for(self.review_queue.get(), timeout=IDLE_LOG_INTERVAL)
@@ -381,7 +652,7 @@ class TransactionOrchestrator:
                 except asyncio.TimeoutError:
                     current_time = time.time()
                     idle_duration = current_time - last_activity_time
-                    logger.info(f"TransactionOrchestrator: Review loop idle for {self.format_duration(idle_duration)}. Total reviewed: {reviewed_count}")
+                    logger.info(f"TransactionOrchestrator: Review loop idle for {format_duration(idle_duration)}. Total reviewed: {reviewed_count}")
                     continue
                     
                 except Exception as e:
@@ -399,7 +670,7 @@ class TransactionOrchestrator:
         IDLE_LOG_INTERVAL = 300  # Log idle status every 5 minutes
 
         try:
-            while not self._shutdown:
+            while not self._shutdown_event.is_set():
                 try:
                     # Wait for next transaction with timeout
                     tx = await asyncio.wait_for(self.routing_queue.get(), timeout=IDLE_LOG_INTERVAL)
@@ -430,7 +701,7 @@ class TransactionOrchestrator:
                     idle_duration = current_time - last_activity_time
                     pending_count = len(self.response_manager.pending_responses)
                     logger.info(
-                        f"TransactionOrchestrator: Process loop idle for {self.format_duration(idle_duration)}.\n"
+                        f"TransactionOrchestrator: Process loop idle for {format_duration(idle_duration)}.\n"
                         f"  - Total routed: {routed_count}\n"
                         f"  - Pending responses: {pending_count}"
                     )
@@ -442,13 +713,20 @@ class TransactionOrchestrator:
         finally:
             logger.debug("TransactionOrchestrator: Route loop shutdown complete")
 
-    def stop(self):
-        """Stop state management process"""
-        logger.info("NodeToolsStateManager: Stopping state management")
-        self._shutdown = True
+    async def _consumer_loop(self):
+        """Manage consumer lifecycle"""
+        try:
+            await self.consumer_manager.start()
+            await self._shutdown_event.wait()  # Wait for shutdown signal
+        except Exception as e:
+            logger.error(f"Error in consumer loop: {e}")
+            logger.error(traceback.format_exc())
+        finally:
+            await self.consumer_manager.stop()
+            logger.debug("TransactionOrchestrator: Consumer loop shutdown complete")
 
-    def format_duration(self, seconds: float) -> str:
-        """Format a duration in H:m:s format"""
-        hours, remainder = divmod(int(seconds), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    def stop(self):
+        """Stop all transaction processing tasks"""
+        logger.info("TransactionOrchestrator: Stopping all transaction processing tasks")
+        self._shutdown_event.set()
+

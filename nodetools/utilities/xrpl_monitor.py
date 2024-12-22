@@ -9,14 +9,20 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
+    from nodetools.protocols.transaction_repository import TransactionRepository
 
 class XRPLWebSocketMonitor:
     """Monitors XRPL websocket for real-time transaction updates"""
 
-    def __init__(self, generic_pft_utilities: 'GenericPFTUtilities'):
+    def __init__(
+            self, 
+            generic_pft_utilities: 'GenericPFTUtilities',
+            transaction_repository: 'TransactionRepository'
+        ):
         self.pft_utilities = generic_pft_utilities
         self.network_config = generic_pft_utilities.network_config
         self.node_config = generic_pft_utilities.node_config
+        self.transaction_repository = transaction_repository
 
         # Websocket configuration
         self.ws_urls = self.network_config.websockets
@@ -25,7 +31,7 @@ class XRPLWebSocketMonitor:
 
         # Client and queue
         self.client = None
-        self.queue = None
+        self.review_queue = None
         self._monitor_task = None
         self._shutdown = False
 
@@ -42,7 +48,7 @@ class XRPLWebSocketMonitor:
 
     def start(self, queue: asyncio.Queue):
         """Start the monitor as an asyncio task"""
-        self.queue = queue
+        self.review_queue = queue
         self._shutdown = False
         self._monitor_task = asyncio.create_task(self.monitor())
         return self._monitor_task
@@ -149,16 +155,22 @@ class XRPLWebSocketMonitor:
     async def _process_transaction(self, tx_message):
         """Process transaction updates from websocket"""
         try:
-            
-            formatted_tx = {
-                "tx_json": tx_message.get("tx_json", {}),
-                "meta": tx_message.get("meta", {}),
-                "hash": tx_message.get("hash"),
-                "ledger_index": tx_message.get("ledger_index"),
-                "validated": tx_message.get("validated", False)
-            }
 
-            await self.queue.put(formatted_tx)
+            logger.debug(f"Processing transaction update: {tx_message}")
+
+            # First store the transaction in the cache
+            if self.transaction_repository.store_transaction(tx_message):
+                # Retrieve the complete transaction record from the database
+                # to ensure consistent format, which includes decoded memo fields
+                tx = await self.transaction_repository.get_unverified_transactions(limit=1)
+
+                if tx and tx[0]['hash'] == tx_message['hash']:
+                    # Place complete transaction record into review queue
+                    await self.review_queue.put(tx[0])
+                else:
+                    logger.error(f"Failed to retrieve stored transaction {tx_message['hash']} from database")
+            else:
+                logger.error(f"Failed to store transaction {tx_message['hash']} in database")
 
         except Exception as e:
             logger.error(f"Error processing transaction update: {e}")

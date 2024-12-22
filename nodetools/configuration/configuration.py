@@ -4,7 +4,7 @@ from loguru import logger
 import json
 import os
 from pathlib import Path
-import nodetools.configuration.constants as constants
+import nodetools.configuration.constants as global_constants
 
 @dataclass
 class NetworkConfig:
@@ -43,7 +43,7 @@ class RuntimeConfig:
     HAS_LOCAL_NODE: bool = False
     # TESTNET ONLY - only use these in conjunction with USE_TESTNET (i.e. USE_TESTNET & ENABLE_REINITIATIONS must both be true)
     USE_OPENROUTER_AUTOROUTER: bool = True
-    ENABLE_REINITIATIONS: bool = False
+    ENABLE_REINITIATIONS: bool = True
     DISABLE_PFT_REQUIREMENTS: bool = False
 
 # Network configurations
@@ -100,7 +100,7 @@ def get_network_config() -> NetworkConfig:
 
 def get_node_config() -> NodeConfig:
     """Get current node configuration based on runtime settings"""
-    config_dir = constants.CONFIG_DIR
+    config_dir = global_constants.CONFIG_DIR
     config_dir.mkdir(exist_ok=True)
     network = 'testnet' if RuntimeConfig.USE_TESTNET else 'mainnet'
     config_file = config_dir / f"pft_node_{network}_config.json"
@@ -108,7 +108,7 @@ def get_node_config() -> NodeConfig:
     if not config_file.exists():
         # Fall back to default configs temporarily
         logger.warning(f"No configuration file found at {config_file}, using default configuration")
-        return constants.TESTNET_NODE if RuntimeConfig.USE_TESTNET else constants.MAINNET_NODE
+        return global_constants.TESTNET_NODE if RuntimeConfig.USE_TESTNET else global_constants.MAINNET_NODE
     
     return load_node_config(config_file)
 

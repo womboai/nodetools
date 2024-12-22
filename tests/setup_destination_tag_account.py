@@ -1,12 +1,12 @@
 import xrpl
-import nodetools.configuration.constants as constants
+import nodetools.configuration.constants as global_constants
 import getpass
 
 def setup_destination_tag_account(wallet_seed: str):
     """Sets up a testnet account with RequireDest flag enabled."""
 
     # Connect to testnet
-    client = xrpl.clients.JsonRpcClient(constants.TESTNET_URL)
+    client = xrpl.clients.JsonRpcClient(global_constants.TESTNET_URL)
 
     # Create a wallet from the seed
     wallet = xrpl.wallet.Wallet.from_seed(wallet_seed)

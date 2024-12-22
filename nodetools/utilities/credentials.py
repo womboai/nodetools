@@ -6,7 +6,7 @@ from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.fernet import Fernet
 import time
 from enum import Enum
-import nodetools.configuration.constants as constants
+import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
 from nodetools.utilities.ecdh import ECDHUtils
 
@@ -16,7 +16,7 @@ KEY_EXPIRY = -1  # No expiration by default
 
 def get_credentials_directory():
     """Returns the path to the credentials directory, creating it if it doesn't exist"""
-    creds_dir = constants.CONFIG_DIR
+    creds_dir = global_constants.CONFIG_DIR
     creds_dir.mkdir(exist_ok=True)
     return creds_dir
 
@@ -114,8 +114,8 @@ class CredentialManager:
         except Exception as e:
             return False
         
-    def get_credential(self, credential):
-        """Get a specific credential by type"""
+    def get_credential(self, credential_key: str) -> str:
+        """Get a specific credential"""
         self._check_key_expiry()
 
         with sqlite3.connect(self.db_path) as conn:
@@ -123,7 +123,7 @@ class CredentialManager:
             cursor.execute("""
                 SELECT encrypted_value FROM credentials 
                 WHERE key = ?;
-            """, (credential,))
+            """, (credential_key,))
             row = cursor.fetchone()
             if row:
                 return self._decrypt_value(row[0])

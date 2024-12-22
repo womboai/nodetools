@@ -5,7 +5,7 @@ from cryptography.fernet import Fernet
 import pandas as pd
 from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
 import nodetools.configuration.configuration as config
-import nodetools.configuration.constants as constants
+import nodetools.configuration.constants as global_constants
 from nodetools.utilities.ecdh import ECDHUtils
 import re
 from loguru import logger
@@ -222,7 +222,7 @@ class MessageEncryption:
 
             # Filter for handshakes
             handshakes = memo_history[
-                memo_history['memo_type'] == constants.SystemMemoType.HANDSHAKE.value
+                memo_history['memo_type'] == global_constants.SystemMemoType.HANDSHAKE.value
             ]
 
             if handshakes.empty:
@@ -274,11 +274,11 @@ class MessageEncryption:
             DataFrame containing pending handshake requests
         """
         return memo_history[
-            (memo_history['memo_type'] == constants.SystemMemoType.HANDSHAKE.value) &
+            (memo_history['memo_type'] == global_constants.SystemMemoType.HANDSHAKE.value) &
             (memo_history['destination'] == channel_counterparty) &
             ~memo_history['account'].isin(  # Exclude accounts that have received responses
                 memo_history[
-                    (memo_history['memo_type'] == constants.SystemMemoType.HANDSHAKE.value) &
+                    (memo_history['memo_type'] == global_constants.SystemMemoType.HANDSHAKE.value) &
                     (memo_history['account'] == channel_counterparty)
                 ]['destination'].unique()
             )

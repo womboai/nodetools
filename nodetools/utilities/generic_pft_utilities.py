@@ -25,10 +25,10 @@ from xrpl.models.requests import AccountInfo, AccountLines, AccountTx
 from nodetools.utilities.encryption import MessageEncryption
 from nodetools.performance.monitor import PerformanceMonitor
 from nodetools.utilities.transaction_requirements import TransactionRequirementService
-from nodetools.ai.openai import OpenAIRequestTool
+from nodetools.ai.openrouter import OpenRouterTool
 from nodetools.utilities.db_manager import DBConnectionManager
 from nodetools.utilities.credentials import CredentialManager
-import nodetools.configuration.constants as constants
+import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
 from nodetools.utilities.exceptions import *
 from loguru import logger
@@ -79,7 +79,7 @@ class GenericPFTUtilities:
             self.db_connection_manager = DBConnectionManager()
             self.transaction_repository = TransactionRepository(self.db_connection_manager, self.node_name)
             self.credential_manager = CredentialManager()
-            self.open_ai_request_tool = OpenAIRequestTool()
+            self.openrouter = OpenRouterTool()
             self.monitor = PerformanceMonitor()
             self.message_encryption = MessageEncryption(pft_utilities=self)
 
@@ -90,9 +90,20 @@ class GenericPFTUtilities:
             self._holder_df_lock = threading.Lock()
             self._pft_holder_df = None
 
-            # Initialize XRPL monitor and state manager
-            self.xrpl_monitor = XRPLWebSocketMonitor(self)
-            self.transaction_orchestrator = TransactionOrchestrator(self, self.transaction_repository)
+            # Initialize XRPL monitor
+            self.xrpl_monitor = XRPLWebSocketMonitor(
+                generic_pft_utilities=self,
+                transaction_repository=self.transaction_repository
+            )
+
+            # Initialize transaction orchestrator
+            self.transaction_orchestrator = TransactionOrchestrator(
+                generic_pft_utilities=self, 
+                transaction_repository=self.transaction_repository,
+                credential_manager=self.credential_manager,
+                node_config=self.node_config,
+                openrouter=self.openrouter,
+            )
             self._transaction_orchestrator_task = None
 
             self.__class__._initialized = True
@@ -115,11 +126,14 @@ class GenericPFTUtilities:
 
     def shutdown(self):
         """Clean shutdown of async components"""
+        tasks = []
+        
         if self._transaction_orchestrator_task:
+            self.transaction_orchestrator.stop()
+            tasks.append(self._transaction_orchestrator_task)
+    
+        if tasks:
             try:
-                # First stop the orchestrator
-                self.transaction_orchestrator.stop()
-                
                 # Get or create event loop
                 try:
                     loop = asyncio.get_running_loop()
@@ -130,19 +144,19 @@ class GenericPFTUtilities:
                 # Give tasks time to cleanup (5 seconds max)
                 try:
                     loop.run_until_complete(asyncio.wait_for(
-                        self._transaction_orchestrator_task, 
+                        asyncio.gather(*tasks), 
                         timeout=5.0
                     ))
                 except asyncio.TimeoutError:
-                    logger.warning("Timeout waiting for orchestrator to shutdown gracefully")
+                    logger.warning("Timeout waiting for components to shutdown gracefully")
                 except asyncio.CancelledError:
                     pass
                 
             except Exception as e:
-                logger.error(f"GenericPFTUtilities.shutdown: Error during transaction orchestrator shutdown: {e}")
+                logger.error(f"GenericPFTUtilities.shutdown: Error during component shutdown: {e}")
             finally:
                 self._transaction_orchestrator_task = None
-                logger.debug("GenericPFTUtilities.shutdown: Transaction orchestrator stopped")
+                logger.debug("GenericPFTUtilities.shutdown: All components stopped")
 
     @staticmethod
     def convert_ripple_timestamp_to_datetime(ripple_timestamp = 768602652):
@@ -188,7 +202,7 @@ class GenericPFTUtilities:
         return len(text_bytes)
         
     @staticmethod
-    def split_text_into_chunks(text, max_chunk_size=constants.MAX_MEMO_CHUNK_SIZE):
+    def split_text_into_chunks(text, max_chunk_size=global_constants.MAX_MEMO_CHUNK_SIZE):
         chunks = []
         text_bytes = text.encode('utf-8')
         for i in range(0, len(text_bytes), max_chunk_size):
@@ -310,6 +324,7 @@ class GenericPFTUtilities:
             )
         except Exception as e:
             logger.error(f"Error verifying transaction response: {e}")
+            logger.error(traceback.format_exc())
             return False
 
     def verify_transaction_hash(self, tx_hash: str) -> bool:
@@ -335,6 +350,7 @@ class GenericPFTUtilities:
         
         except Exception as e:
             logger.error(f"Error verifying transaction hash {tx_hash}: {e}")
+            logger.error(traceback.format_exc())
             return False
 
     @staticmethod
@@ -368,7 +384,7 @@ class GenericPFTUtilities:
     def construct_google_doc_context_memo(user, google_doc_link):               
         return GenericPFTUtilities.construct_memo(
             user=user, 
-            memo_type=constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value, 
+            memo_type=global_constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value, 
             memo_data=google_doc_link
         ) 
 
@@ -434,7 +450,7 @@ class GenericPFTUtilities:
         """Constructs a handshake memo for encrypted communication"""
         return GenericPFTUtilities.construct_standardized_xrpl_memo(
             memo_data=ecdh_public_key,
-            memo_type=constants.SystemMemoType.HANDSHAKE.value,
+            memo_type=global_constants.SystemMemoType.HANDSHAKE.value,
             memo_format=user
         )
 
@@ -512,31 +528,26 @@ class GenericPFTUtilities:
             df['simple_date'] = pd.to_datetime(df['simple_date'])
         return df
     
-    def process_queue_transaction(
+    async def process_queue_transaction(
             self,
             wallet: Wallet,
             memo: str,
             destination: str,
-            tracking_set: set,
-            tracking_tuple: tuple,
             pft_amount: Optional[Union[int, float, Decimal]] = None
         ) -> bool:
-        """Send and track a node-initiated transaction for queue processing.
+        """Send a node-initiated transaction for queue processing.
         
-        This method is specifically designed for node-initiated operations (like rewards and handshake responses)
-        that need to be verified as a final step during queue processing. It should NOT be used for 
-        user-initiated transactions.
+        This method is specifically designed for node-initiated operations (like rewards and handshake responses).
+        It should NOT be used for user-initiated transactions.
         
         Args:
             wallet: XRPL wallet instance for the node
             memo: Formatted memo object for the transaction
             destination: Destination address for transaction
-            tracking_set: Set to add tracking tuple to if successful (for queue verification)
-            tracking_tuple: Tuple of (user_account, memo_type, datetime) for queue tracking
-            amount: Optional PFT amount to send (will be converted to Decimal)
+            pft_amount: Optional PFT amount to send (will be converted to Decimal)
             
         Returns:
-            bool: True if all chunks were sent and verified successfully
+            bool: True if transaction was sent and verified successfully
             
         Note:
             This method is intended for internal node operations only. For user-initiated
@@ -544,7 +555,7 @@ class GenericPFTUtilities:
         """
         try:
             # Convert amount to Decimal if provided
-            pft_amount = Decimal(str(pft_amount)) if pft_amount is not None else None
+            pft_amount = Decimal(pft_amount) if pft_amount is not None else None
 
             # Send transaction
             response = self.send_memo(
@@ -555,72 +566,12 @@ class GenericPFTUtilities:
                 compress=False
             )
 
-            if self.verify_transaction_response(response):
-                tracking_set.add(tracking_tuple)
-                return True
-            else:
-                logger.warning(f"Failed to verify all chunks in transaction to {destination}")
-                return False
+            return self.verify_transaction_response(response)
         
         except Exception as e:
             logger.error(f"GenericPFTUtilities._send_and_track_transactions: Error sending transaction to {destination}: {e}")
+            logger.error(traceback.format_exc())
             return False
-
-    def verify_transactions(
-            self, 
-            items_to_verify: set, 
-            transaction_type: str, 
-            verification_predicate: callable
-        ) -> pd.DataFrame:
-        """Generic verification loop for transactions initiated by the node.
-        
-        Args:
-            items_to_verify: Set of (user_account, memo_type, datetime) tuples
-            transaction_type: String description for logging
-            verification_predicate: Function that takes (txn, user, memo_type, time) 
-                                and returns bool
-        
-        Returns:
-            Set of items that couldn't be verified
-        """
-        if not items_to_verify:
-            return items_to_verify
-        
-        logger.debug(f"GenericPFTUtilities._verify_transactions: Verifying {len(items_to_verify)} {transaction_type}")
-        max_attempts = constants.NODE_TRANSACTION_VERIFICATION_ATTEMPTS
-        attempt = 0
-
-        while attempt < max_attempts and items_to_verify:
-            attempt += 1
-            logger.debug(f"GenericPFTUtilities._verify_transactions: Verification attempt {attempt} of {max_attempts}")
-
-            time.sleep(constants.NODE_TRANSACTION_VERIFICATION_WAIT_TIME)
-
-            # Force sync of database
-            self.sync_pft_transaction_history()
-
-            # Get latest transactions
-            memo_history = self.get_account_memo_history(account_address=self.node_address, pft_only=False)
-
-            # Check all pending items
-            verified_items = set()
-            for user_account, memo_type, request_time in items_to_verify:
-                logger.debug(f"GenericPFTUtilities._verify_transactions: Checking for task {memo_type} for {user_account} at {request_time}")
-
-                # Apply the verification predicate
-                if verification_predicate(memo_history, user_account, memo_type, request_time):
-                    logger.debug(f"GenericPFTUtilities._verify_transactions: Verified {memo_type} for {user_account} after {attempt} attempts")
-                    verified_items.add((user_account, memo_type, request_time))
-
-            # Remove verified items from the set
-            items_to_verify -= verified_items
-
-        if items_to_verify:
-            logger.warning(f"GenericPFTUtilities._verify_transactions: Could not verify {len(items_to_verify)} {transaction_type} after {max_attempts} attempts")
-            for user_account, memo_type, _ in items_to_verify:
-                logger.warning(f"GenericPFTUtilities._verify_transactions: - User: {user_account}, Task: {memo_type}")
-
-        return items_to_verify
     
     def is_encrypted(self, memo: str):
         """Check if a memo is encrypted"""
@@ -724,7 +675,7 @@ class GenericPFTUtilities:
         # Check if this is a system memo type
         is_system_memo = any(
             memo_type == system_type.value 
-            for system_type in constants.SystemMemoType
+            for system_type in global_constants.SystemMemoType
         )
 
         # Handle encryption if requested
@@ -806,7 +757,7 @@ class GenericPFTUtilities:
             )
         else:
             # Send minimum XRP amount for memo-only transactions
-            payment_args["amount"] = xrpl.utils.xrp_to_drops(Decimal(constants.MIN_XRP_PER_TRANSACTION))
+            payment_args["amount"] = xrpl.utils.xrp_to_drops(Decimal(global_constants.MIN_XRP_PER_TRANSACTION))
 
         payment = xrpl.models.transactions.Payment(**payment_args)
 
@@ -964,7 +915,7 @@ class GenericPFTUtilities:
                 # Skip chunk processing for SystemMemoType messages
                 is_system_memo = any(
                     memo_type == system_type.value 
-                    for system_type in constants.SystemMemoType
+                    for system_type in global_constants.SystemMemoType
                 )
 
                 # Handle chunking for non-system messages only
@@ -1569,7 +1520,7 @@ class GenericPFTUtilities:
                 return None
 
             context_docs = memo_history[
-                (memo_history['memo_type'].apply(lambda x: constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value in str(x))) &
+                (memo_history['memo_type'].apply(lambda x: global_constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value in str(x))) &
                 (memo_history['account'] == account_address) &
                 (memo_history['transaction_result'] == "tesSUCCESS")
             ]
@@ -1761,7 +1712,7 @@ class GenericPFTUtilities:
 
             # Filter for Google Doc context links
             doc_links = memo_history[
-                (memo_history['memo_type'] == constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value) &
+                (memo_history['memo_type'] == global_constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value) &
                 (memo_history['transaction_result'] == "tesSUCCESS")
             ]
 
@@ -1780,7 +1731,7 @@ class GenericPFTUtilities:
             # Process using node's address/secret since that's the end we have the key for
             latest_links['google_doc_link'] = latest_links.apply(
                 lambda row: self.process_memo_data(
-                    memo_type=constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value,
+                    memo_type=global_constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value,
                     memo_data=row['memo_data'],
                     channel_address=self.node_address,  # The end we have the key for
                     channel_counterparty=row['account'],         # The other end of the channel
@@ -2124,7 +2075,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         try: 
             memo_history = self.get_account_memo_history(account_address=wallet.classic_address, pft_only=False)
             successful_initiations = memo_history[
-                (memo_history['memo_type'] == constants.SystemMemoType.INITIATION_RITE.value) & 
+                (memo_history['memo_type'] == global_constants.SystemMemoType.INITIATION_RITE.value) & 
                 (memo_history['transaction_result'] == "tesSUCCESS")
             ]
             return len(successful_initiations) > 0
@@ -2157,7 +2108,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         else:
             initiation_memo = self.construct_standardized_xrpl_memo(
                 memo_data=initiation_rite, 
-                memo_type=constants.SystemMemoType.INITIATION_RITE.value, 
+                memo_type=global_constants.SystemMemoType.INITIATION_RITE.value, 
                 memo_format=username
             )
             logger.debug(f"GenericPFTUtilities.handle_initiation_rite: Sending initiation rite transaction from {wallet.classic_address} to node {self.node_address}")
@@ -2235,7 +2186,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         account_name_map = account_modes.groupby('account').first()['memo_format']
         past_month_transactions = all_accounts[all_accounts['datetime']>datetime.datetime.now()-datetime.timedelta(30)]
         node_transactions = past_month_transactions[past_month_transactions['account']==self.node_address].copy()
-        rewards_only=node_transactions[node_transactions['memo_data'].apply(lambda x: constants.TaskType.REWARD.value in str(x))].copy()
+        rewards_only=node_transactions[node_transactions['memo_data'].apply(lambda x: global_constants.TaskType.REWARD.value in str(x))].copy()
         rewards_only['count']=1
         rewards_only['PFT']=rewards_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float)
         account_to_yellow_flag__count = rewards_only[rewards_only['memo_data'].apply(lambda x: 'YELLOW FLAG' in x)][['count','destination']].groupby('destination').sum()['count']
@@ -2322,7 +2273,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         top_score_frame['user_prompt']=top_score_frame.apply(lambda x: x['user_prompt'].replace('__FULL_ACCOUNT_CONTEXT__',x['user_account_details']),axis=1)
         def construct_scoring_api_arg(user_prompt, system_prompt):
             gx ={
-                "model": constants.DEFAULT_OPEN_AI_MODEL,
+                "model": global_constants.DEFAULT_OPEN_AI_MODEL,
                 "temperature":0,
                 "messages": [
                     {"role": "system", "content": system_prompt},
@@ -2334,9 +2285,9 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         
         async_run_map = top_score_frame['api_args'].head(25).to_dict()
         async_run_map__2 = top_score_frame['api_args'].head(25).to_dict()
-        async_output_df1= self.open_ai_request_tool.create_writable_df_for_async_chat_completion(arg_async_map=async_run_map)
+        async_output_df1= self.openrouter.create_writable_df_for_async_chat_completion(arg_async_map=async_run_map)
         time.sleep(15)
-        async_output_df2= self.open_ai_request_tool.create_writable_df_for_async_chat_completion(arg_async_map=async_run_map__2)
+        async_output_df2= self.openrouter.create_writable_df_for_async_chat_completion(arg_async_map=async_run_map__2)
         
         
         def extract_scores(text_data):

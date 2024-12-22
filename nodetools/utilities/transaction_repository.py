@@ -3,14 +3,25 @@ from loguru import logger
 from nodetools.utilities.db_manager import DBConnectionManager
 from nodetools.sql.sql_manager import SQLManager
 import traceback
+import json
 
 if TYPE_CHECKING:
     from nodetools.utilities.transaction_orchestrator import ProcessingResult
 
 class TransactionRepository:
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
     def __init__(self, db_manager: DBConnectionManager, username: str):
-        self.db_manager = db_manager
-        self.username = username
+        if not self.__class__._initialized:
+            self.db_manager = db_manager
+            self.username = username
+            self.__class__._initialized = True
 
     async def get_account_memo_history(
         self,
@@ -194,6 +205,117 @@ class TransactionRepository:
                 
         except Exception as e:
             logger.error(f"TransactionRepository.execute_query: Error executing query: {e}")
+            logger.error(traceback.format_exc())
+            raise
+        finally:
+            conn.close()
+
+    def store_transaction(self, tx_message: Dict[str, Any]) -> bool:
+        """Store a single transaction in the postfiat_tx_cache table.
+        
+        Args:
+            tx_message: Raw transaction message from XRPL websocket
+            
+        Returns:
+            bool: True if transaction was stored successfully
+        """
+        try:
+            # Extract tx_json and format fields
+            tx_json = tx_message.get("tx_json", {}) if isinstance(tx_message.get("tx_json"), dict) else tx_message.get("transaction", {})
+            
+            # Convert nested dictionaries to strings
+            delivermax = tx_json.get("DeliverMax")
+            if isinstance(delivermax, dict):
+                delivermax = json.dumps(delivermax)
+
+            # Prepare transaction data
+            tx_data = {
+                "close_time_iso": tx_message.get("close_time_iso"),
+                "hash": tx_message.get("hash"),
+                "ledger_hash": tx_message.get("ledger_hash"),
+                "ledger_index": tx_message.get("ledger_index"),
+                "meta": json.dumps(tx_message.get("meta", {})),
+                "tx_json": json.dumps(tx_json),
+                "validated": tx_message.get("validated", False),
+                
+                # Extract from tx_json
+                "account": tx_json.get("Account"),
+                "delivermax": delivermax,
+                "destination": tx_json.get("Destination"),
+                "fee": tx_json.get("Fee"),
+                "flags": tx_json.get("Flags"),
+                "lastledgersequence": tx_json.get("LastLedgerSequence"),
+                "sequence": tx_json.get("Sequence"),
+                "signingpubkey": tx_json.get("SigningPubKey"),
+                "transactiontype": tx_json.get("TransactionType"),
+                "txnsignature": tx_json.get("TxnSignature"),
+                "date": tx_json.get("date"),
+                "memos": json.dumps(tx_json.get("Memos", []))
+            }
+
+            conn = self.db_manager.spawn_psycopg2_db_connection(self.username)
+
+            try:
+                with conn.cursor() as cur:
+                    query = """
+                        INSERT INTO postfiat_tx_cache (
+                            close_time_iso, hash, ledger_hash, ledger_index, meta,
+                            tx_json, validated, account, delivermax, destination,
+                            fee, flags, lastledgersequence, sequence, signingpubkey,
+                            transactiontype, txnsignature, date, memos
+                        ) VALUES (
+                            %(close_time_iso)s, %(hash)s, %(ledger_hash)s, %(ledger_index)s, %(meta)s,
+                            %(tx_json)s, %(validated)s, %(account)s, %(delivermax)s, %(destination)s,
+                            %(fee)s, %(flags)s, %(lastledgersequence)s, %(sequence)s, %(signingpubkey)s,
+                            %(transactiontype)s, %(txnsignature)s, %(date)s, %(memos)s
+                        ) ON CONFLICT (hash) DO NOTHING
+                    """
+                    cur.execute(query, tx_data)
+                    conn.commit()
+                    return True
+            finally:
+                conn.close()
+
+        except Exception as e:
+            logger.error(f"Error storing transaction: {e}")
+            logger.error(traceback.format_exc())
+            return False
+        
+    async def get_decoded_transaction(self, tx_hash: str) -> Optional[Dict[str, Any]]:
+        """Get a specific transaction with decoded memos by hash.
+        
+        Args:
+            tx_hash: The transaction hash to look up
+            
+        Returns:
+            Dict containing transaction data with decoded memos if found, None otherwise
+        """
+        try:
+            conn = self.db_manager.spawn_psycopg2_db_connection(self.username)
+            
+            with conn.cursor() as cur:
+                query = """
+                    SELECT 
+                        m.*,
+                        p.processed,
+                        p.rule_name,
+                        p.response_tx_hash,
+                        p.notes,
+                        p.processed_at
+                    FROM decoded_memos m
+                    LEFT JOIN transaction_processing_results p ON m.hash = p.hash
+                    WHERE m.hash = %s
+                """
+                cur.execute(query, (tx_hash,))
+                
+                row = cur.fetchone()
+                if row:
+                    columns = [desc[0] for desc in cur.description]
+                    return dict(zip(columns, row))
+                return None
+                
+        except Exception as e:
+            logger.error(f"TransactionRepository.get_decoded_transaction: Error getting transaction {tx_hash}: {e}")
             logger.error(traceback.format_exc())
             raise
         finally:

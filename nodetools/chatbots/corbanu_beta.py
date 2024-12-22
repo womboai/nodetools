@@ -27,7 +27,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 import json
 from typing import Optional
-import nodetools.configuration.constants as constants
+from nodetools.task_processing.constants import MAX_CHUNK_MESSAGES_IN_CONTEXT
 import time 
 
 class CorbanuChatBot:
@@ -390,7 +390,7 @@ class CorbanuChatBot:
             self,
             account_address: str,
             memo_history: Optional[pd.DataFrame] = None,
-            n_memos_in_context: int = constants.MAX_CHUNK_MESSAGES_IN_CONTEXT,
+            n_memos_in_context: int = MAX_CHUNK_MESSAGES_IN_CONTEXT,
     ) -> str:
         """Get Corbanu context for a user"""
         if memo_history is None:

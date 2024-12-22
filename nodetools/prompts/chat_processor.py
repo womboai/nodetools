@@ -22,7 +22,6 @@ class ChatProcessor:
         self.generic_pft_utilities = generic_pft_utilities
         self.openai_request_tool = openai_request_tool
         self.user_task_parser = UserTaskParser(
-            task_management_system=task_management_system,
             generic_pft_utilities=generic_pft_utilities
         )
 

@@ -15,7 +15,7 @@ import asyncio
 from datetime import datetime, time
 import pytz
 import datetime
-import nodetools.configuration.constants as constants
+import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
 import getpass
 from loguru import logger
@@ -28,6 +28,7 @@ from nodetools.chatbots.odv_sprint_planner import ODVSprintPlannerO1
 from nodetools.chatbots.odv_context_doc_improvement import ODVContextDocImprover
 from nodetools.ai.openrouter import OpenRouterTool
 from nodetools.chatbots.corbanu_beta import CorbanuChatBot
+from nodetools.task_processing.constants import TASK_PATTERNS
 import sys
 
 class MyClient(discord.Client):
@@ -44,12 +45,11 @@ class MyClient(discord.Client):
         self.generic_pft_utilities = GenericPFTUtilities()
         self.post_fiat_task_generation_system = PostFiatTaskGenerationSystem()
         self.user_task_parser = UserTaskParser(
-            task_management_system=self.post_fiat_task_generation_system,
-            generic_pft_utilities=self.generic_pft_utilities
+            generic_pft_utilities=self.generic_pft_utilities,
         )
 
         # Set network-specific attributes
-        self.default_openai_model = constants.DEFAULT_OPEN_AI_MODEL
+        self.default_openai_model = global_constants.DEFAULT_OPEN_AI_MODEL
         self.conversations = {}
         self.user_seeds = {}
         self.doc_improvers = {}
@@ -83,6 +83,8 @@ class MyClient(discord.Client):
         logger.debug(f"MyClient.setup_hook: Slash commands synced to guild ID: {guild_id}")
 
         self.bg_task = self.loop.create_task(self.transaction_checker())
+
+        user_task_parser = self.user_task_parser
 
         @self.tree.command(name="odv_sprint", description="Start an ODV sprint planning session")
         async def odv_sprint(interaction: discord.Interaction):
@@ -731,7 +733,7 @@ class MyClient(discord.Client):
                 return
 
             # Get pending proposals
-            pf_df = post_fiat_task_generation_system.get_pending_proposals(account=memo_history)
+            pf_df = self.user_context_parser.get_pending_proposals(account=memo_history)
 
             # Return immediately if proposal acceptance pairs are empty
             if pf_df.empty:
@@ -841,7 +843,7 @@ class MyClient(discord.Client):
             memo_history = generic_pft_utilities.get_account_memo_history(account_address=wallet.address).copy()
 
             # Get pending proposals
-            pf_df = post_fiat_task_generation_system.get_refuseable_proposals(account=memo_history)
+            pf_df = user_task_parser.get_refuseable_proposals(account=memo_history)
 
             # Return immediately if proposal refusal pairs are empty
             if pf_df.empty:
@@ -1086,7 +1088,7 @@ class MyClient(discord.Client):
         )
         async def pf_leaderboard(interaction: discord.Interaction):
             # Check if the user has permission (matches the specific ID)
-            if interaction.user.id not in constants.DISCORD_SUPER_USER_IDS:
+            if interaction.user.id not in global_constants.DISCORD_SUPER_USER_IDS:
                 await interaction.response.send_message(
                     "You don't have permission to use this command.", 
                     ephemeral=True
@@ -1336,7 +1338,7 @@ class MyClient(discord.Client):
                     commitment_sentence = discord.ui.TextInput(
                         label='Commit to a Long-Term Objective',
                         style=discord.TextStyle.long,
-                        max_length=constants.MAX_COMMITMENT_SENTENCE_LENGTH,
+                        max_length=global_constants.MAX_COMMITMENT_SENTENCE_LENGTH,
                         placeholder="A 1-sentence commitment to a long-term objective"
                     )
 
@@ -1529,7 +1531,7 @@ class MyClient(discord.Client):
             # Fetch the tasks that are accepted but not completed
             memo_history = generic_pft_utilities.get_account_memo_history(wallet.address).copy()
 
-            pf_df = post_fiat_task_generation_system.get_accepted_proposals(account=memo_history)
+            pf_df = user_task_parser.get_accepted_proposals(account=memo_history)
 
             # Return immediately if proposal acceptance pairs are empty
             if pf_df.empty:
@@ -1540,7 +1542,7 @@ class MyClient(discord.Client):
             accepted_tasks = pf_df[
                 (pf_df['acceptance'] != '') & 
                 ~pf_df.index.isin(memo_history[
-                    memo_history['memo_data'].str.contains(constants.TaskType.VERIFICATION_PROMPT.value, na=False)
+                    memo_history['memo_data'].str.contains(global_constants.TaskType.VERIFICATION_PROMPT.value, na=False)
                 ]['memo_type'].unique())
             ].copy()
             
@@ -1900,7 +1902,7 @@ Note: XRP wallets need 15 XRP to transact.
                 await interaction.response.send_message("You have no tasks in the verification queue.", ephemeral=True)
                 return
 
-            outstanding_verification = post_fiat_task_generation_system.get_verification_proposals(account=memo_history)
+            outstanding_verification = user_task_parser.get_verification_proposals(account=memo_history)
             
             # If there are no tasks in the verification queue, notify the user
             if outstanding_verification.empty:
@@ -2074,7 +2076,7 @@ Note: XRP wallets need 15 XRP to transact.
                 await message_obj.edit(content="Encryption handshake initiated. Waiting for onchain confirmation...")
 
                 # Verify handshake completion and response from counterparty (node or remembrancer)
-                for attempt in range(constants.NODE_HANDSHAKE_RESPONSE_USER_VERIFICATION_ATTEMPTS):
+                for attempt in range(global_constants.NODE_HANDSHAKE_RESPONSE_USER_VERIFICATION_ATTEMPTS):
                     logger.debug(f"MyClient.{command_name}: Checking handshake status for {username} with {counterparty} (attempt {attempt+1})")
 
                     user_key, counterparty_key = generic_pft_utilities.get_handshake_for_address(
@@ -2089,7 +2091,7 @@ Note: XRP wallets need 15 XRP to transact.
                     if user_key:
                         await message_obj.edit(content="Handshake sent. Waiting for node to process...")
 
-                    await asyncio.sleep(constants.NODE_HANDSHAKE_RESPONSE_USER_VERIFICATION_INTERVAL)
+                    await asyncio.sleep(global_constants.NODE_HANDSHAKE_RESPONSE_USER_VERIFICATION_INTERVAL)
 
             if not user_key:
                 await message_obj.edit(content="Encryption handshake failed to send. Please reach out to support.")
@@ -2316,7 +2318,7 @@ Note: XRP wallets need 15 XRP to transact.
             "content": message.content})
 
         conversation = self.conversations[user_id]
-        if len(self.conversations[user_id]) > constants.MAX_HISTORY:
+        if len(self.conversations[user_id]) > global_constants.MAX_HISTORY:
             del self.conversations[user_id][0]  # Remove the oldest message
 
         if message.content.startswith('!odv'):
@@ -2359,7 +2361,7 @@ Note: XRP wallets need 15 XRP to transact.
                     """
                     
                     api_args = {
-                        "model": constants.DEFAULT_OPEN_AI_MODEL,
+                        "model": global_constants.DEFAULT_OPEN_AI_MODEL,
                         "messages": [
                             {"role": "system", "content": odv_system_prompt},
                             {"role": "user", "content": user_prompt}
@@ -2605,8 +2607,8 @@ My specific question/request is: {user_query}"""
             wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
             wallet_address = wallet.classic_address
             xrp_balance = generic_pft_utilities.get_xrp_balance(address=wallet_address)
-            if xrp_balance < constants.MIN_XRP_BALANCE:
-                await message.reply(f"You must fund your wallet with at least {constants.MIN_XRP_BALANCE} XRP before initiating.", mention_author=True)
+            if xrp_balance < global_constants.MIN_XRP_BALANCE:
+                await message.reply(f"You must fund your wallet with at least {global_constants.MIN_XRP_BALANCE} XRP before initiating.", mention_author=True)
                 return
 
             memo_history = generic_pft_utilities.get_account_memo_history(account_address=wallet_address,pft_only=False)
@@ -2853,9 +2855,9 @@ My specific question/request is: {user_query}"""
             return ""
         
         memo_history.sort_values('datetime', inplace=True)
-        pending_proposals = post_fiat_task_generation_system.get_pending_proposals(account=memo_history)
-        accepted_proposals = post_fiat_task_generation_system.get_accepted_proposals(account=memo_history)
-        verification_proposals = post_fiat_task_generation_system.get_verification_proposals(account=memo_history)
+        pending_proposals = self.user_task_parser.get_pending_proposals(account=memo_history)
+        accepted_proposals = self.user_task_parser.get_accepted_proposals(account=memo_history)
+        verification_proposals = self.user_task_parser.get_verification_proposals(account=memo_history)
 
         pending_string = self.format_pending_tasks(pending_proposals)
         accepted_string = self.format_accepted_tasks(accepted_proposals)
@@ -2915,10 +2917,10 @@ My specific question/request is: {user_query}"""
 
         # Get original requests and proposals
         task_requests = all_account_info[
-            all_account_info['memo_data'].apply(lambda x: constants.TaskType.REQUEST_POST_FIAT.value in x)
+            all_account_info['memo_data'].apply(lambda x: global_constants.TaskType.REQUEST_POST_FIAT.value in x)
         ].groupby('memo_type').first()['memo_data']
 
-        proposal_patterns = constants.TASK_PATTERNS[constants.TaskType.PROPOSAL]
+        proposal_patterns = global_constants.TASK_PATTERNS[global_constants.TaskType.PROPOSAL]
         task_proposals = all_account_info[
             all_account_info['memo_data'].apply(lambda x: any(pattern in str(x) for pattern in proposal_patterns))
         ].groupby('memo_type').first()['memo_data']
@@ -2973,7 +2975,7 @@ My specific question/request is: {user_query}"""
             reward_str += f"Request: {row['request']}\n"
             reward_str += f"Proposal: {row['proposal']}\n"
             reward_str += f"Reward: {row['directional_pft']} PFT\n"
-            reward_str += f"Response: {row['memo_data'].replace(constants.TaskType.REWARD.value, '')}\n"
+            reward_str += f"Response: {row['memo_data'].replace(global_constants.TaskType.REWARD.value, '')}\n"
             reward_str += "-" * 50  # Separator
             formatted_rewards.append(reward_str)
         

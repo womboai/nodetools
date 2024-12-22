@@ -1,8 +1,17 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Set, Optional, Dict, Any, Pattern, List
+from typing import Set, Optional, Dict, Any, Pattern, TYPE_CHECKING
 from enum import Enum
 from loguru import logger
+from decimal import Decimal
+from xrpl.models import Memo
+
+if TYPE_CHECKING:
+    from nodetools.protocols.credentials import CredentialManager
+    from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
+    from nodetools.protocols.openrouter import OpenRouterTool
+    from nodetools.protocols.transaction_repository import TransactionRepository
+    from nodetools.configuration.configuration import NodeConfig
 
 class TransactionType(Enum):
     REQUEST = "request"
@@ -140,12 +149,6 @@ class TransactionGraph:
         """Get the pattern ID for a given memo pattern"""
         return self.memo_pattern_to_id.get(memo_pattern)
 
-@dataclass
-class ResponseQuery:
-    """Data class to hold query information for finding responses"""
-    query: str
-    params: Dict[str, Any]
-
 class TransactionRule(ABC):
     """Base class for transaction processing rules"""
     @abstractmethod
@@ -162,6 +165,12 @@ class TransactionRule(ABC):
         """Return the type of transaction this rule handles"""
         pass
 
+@dataclass
+class ResponseQuery:
+    """Data class to hold query information for finding responses"""
+    query: str
+    params: Dict[str, Any]
+
 class RequestRule(TransactionRule):
     """Base class for rules that handle request transactions"""
     transaction_type = TransactionType.REQUEST
@@ -171,9 +180,42 @@ class RequestRule(TransactionRule):
         """Get query information for finding a valid response transaction"""
         pass
 
+@dataclass
+class ResponseParameters:
+    """Standardized response parameters for transaction construction"""
+    source: str  # Name of the address that should send the response
+    memo: Memo  # XRPL memo object
+    destination: str  # XRPL destination address
+    pft_amount: Optional[Decimal] = None  # Optional PFT amount for the transaction
+
+class ResponseGenerator(ABC):
+    """Protocol defining how to generate a response"""
+    @abstractmethod
+    async def evaluate_request(self, request_tx: Dict[str, Any]) -> Dict[str, Any]:
+        """Evaluate the request and return response parameters"""
+        pass
+
+    @abstractmethod
+    async def construct_response(
+        self, 
+        request_tx: Dict[str, Any],
+        evaluation_result: Dict[str, Any]
+    ) -> ResponseParameters:
+        """Construct the response memo and parameters"""
+        pass
+
 class ResponseRule(TransactionRule):
     """Base class for rules that handle response transactions"""
     transaction_type = TransactionType.RESPONSE
+
+    @abstractmethod
+    def get_response_generator(self, *args, **kwargs) -> ResponseGenerator:
+        """
+        Get the response generator for this rule type.
+        
+        Each rule implementation should document its required dependencies.
+        """
+        pass
 
 class StandaloneRule(TransactionRule):
     """Base class for rules that handle standalone transactions"""
@@ -184,3 +226,12 @@ class BusinessLogicProvider:
     """Centralizes all business logic configuration"""
     transaction_graph: TransactionGraph
     pattern_rule_map: Dict[str, TransactionRule]  # Maps pattern_id to rule instance
+
+@dataclass
+class Dependencies:
+    """Container for all possible dependencies needed by ResponseGenerators"""
+    node_config: 'NodeConfig'
+    credential_manager: 'CredentialManager'
+    generic_pft_utilities: 'GenericPFTUtilities'
+    openrouter: 'OpenRouterTool'
+    transaction_repository: 'TransactionRepository'

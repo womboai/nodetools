@@ -97,3 +97,13 @@ class GenericPFTUtilities(Protocol):
     def get_all_account_compressed_messages_for_remembrancer(self, account_address: str) -> pd.DataFrame:
         """Convenience method for getting all messages for a user from the remembrancer's perspective"""
         ...
+
+    async def process_queue_transaction(
+            self,
+            wallet: Wallet,
+            memo: str,
+            destination: str,
+            pft_amount: Optional[Union[int, float, Decimal]] = None
+        ) -> bool:
+        """Send and track a node-initiated transaction for queue processing"""
+        ...

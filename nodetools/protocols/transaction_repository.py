@@ -71,3 +71,24 @@ class TransactionRepository(Protocol):
         """
         ...
     
+    async def store_transaction(self, tx_message: Dict[str, Any]) -> bool:
+        """Store a single transaction in the postfiat_tx_cache table.
+        
+        Args:
+            tx_message: Raw transaction message from XRPL websocket
+            
+        Returns:
+            bool: True if transaction was stored successfully
+        """
+        ...
+
+    async def get_decoded_transaction(self, tx_hash: str) -> Optional[Dict[str, Any]]:
+        """Get a specific transaction with decoded memos by hash.
+        
+        Args:
+            tx_hash: The transaction hash to look up
+            
+        Returns:
+            Dict containing transaction data with decoded memos if found, None otherwise
+        """
+        ...

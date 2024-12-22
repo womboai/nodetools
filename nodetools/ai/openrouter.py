@@ -9,6 +9,8 @@ import time
 from asyncio import Semaphore
 from nodetools.utilities.credentials import CredentialManager
 from loguru import logger
+from typing import Dict, Any
+import traceback
 
 class OpenRouterTool:
     """
@@ -291,3 +293,57 @@ class OpenRouterTool:
             return structured_data
         except:
             return {"error": "Could not parse response into structured format", "raw_response": response}
+        
+    async def create_single_chat_completion(
+            self,
+            model: str,
+            system_prompt: str,
+            user_prompt: str,
+            temperature: float = 0
+        ) -> Dict[str, Any]:
+        """
+        Create a single chat completion with system and user prompts.
+        
+        Args:
+            model: The model to use (e.g., "anthropic/claude-3.5-sonnet")
+            system_prompt: The system prompt to set context
+            user_prompt: The user's prompt/question
+            temperature: Sampling temperature (default: 0 for deterministic output)
+            
+        Returns:
+            Dict containing the completion response
+        """
+        try:
+            # Wait for rate limiting
+            await self.wait_for_rate_limit()
+
+            # Create completion
+            completion = await self.async_client.chat.completions.create(
+                extra_headers=self._prepare_headers(),
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=temperature
+            )
+
+            # Add current time to rate limiting tracker
+            self.request_times.append(time.time())
+
+            return {
+                "id": completion.id,
+                "model": completion.model,
+                "choices": [{
+                    "message": {
+                        "content": completion.choices[0].message.content
+                    },
+                    "finish_reason": completion.choices[0].finish_reason
+                }],
+                "usage": completion.usage.model_dump()
+            }
+
+        except Exception as e:
+            logger.error(f"Error in create_single_chat_completion: {e}")
+            logger.error(traceback.format_exc())
+            raise
