@@ -797,7 +797,7 @@ class VerificationPromptGenerator(ResponseGenerator):
             FROM decoded_memos 
             WHERE memo_type = %(memo_type)s
             AND transaction_result = 'tesSUCCESS'
-            AND memo_data ~ %(proposal_pattern)s
+            AND memo_data LIKE %(proposal_pattern)s
             ORDER BY datetime DESC
             LIMIT 1;
         """
@@ -810,6 +810,8 @@ class VerificationPromptGenerator(ResponseGenerator):
         results = await self.transaction_repository.execute_query(query, params)
         
         if not results:
+            logger.warning(f"Results: {results}")
+            logger.warning(f"Used query: {query}\nwith params: {params}")
             raise ValueError(f"No original proposal found for memo_type: {memo_type}")
             
         return results[0]['memo_data']
@@ -825,7 +827,7 @@ class VerificationPromptGenerator(ResponseGenerator):
             original_task
         )
         return {
-            "model": self.default_model,
+            "model": DEFAULT_OPENROUTER_MODEL,
             "temperature": 0,
             "messages": [
                 {"role": "system", "content": verification_system_prompt},
@@ -839,7 +841,7 @@ class VerificationPromptGenerator(ResponseGenerator):
         completion_justification = request_tx['memo_data']
         
         # Get original task description
-        original_task = self._get_original_task_description(memo_type)
+        original_task = await self._get_original_task_description(memo_type)
         
         # Prepare API request
         api_args = self._construct_api_arg_for_verification(
@@ -990,7 +992,7 @@ class RewardResponseGenerator(ResponseGenerator):
             FROM decoded_memos 
             WHERE memo_type = %(memo_type)s
             AND transaction_result = 'tesSUCCESS'
-            AND memo_data ~ %(proposal_pattern)s
+            AND memo_data LIKE %(proposal_pattern)s
             ORDER BY datetime DESC
             LIMIT 1;
         """
@@ -1009,7 +1011,7 @@ class RewardResponseGenerator(ResponseGenerator):
             FROM decoded_memos 
             WHERE memo_type = %(memo_type)s
             AND transaction_result = 'tesSUCCESS'
-            AND memo_data ~ %(prompt_pattern)s
+            AND memo_data LIKE %(prompt_pattern)s
             AND destination = %(destination)s
             ORDER BY datetime DESC
             LIMIT 1;
@@ -1026,11 +1028,11 @@ class RewardResponseGenerator(ResponseGenerator):
 
         # Get recent rewards history
         rewards_query = """
-            SELECT memo_data, directional_pft
+            SELECT memo_data, pft_absolute_amount
             FROM decoded_memos 
             WHERE account = %(account)s
             AND transaction_result = 'tesSUCCESS'
-            AND memo_data ~ %(reward_pattern)s
+            AND memo_data LIKE %(reward_pattern)s
             AND datetime >= NOW() - INTERVAL '%(window)s days'
             ORDER BY datetime DESC;
         """
@@ -1044,7 +1046,7 @@ class RewardResponseGenerator(ResponseGenerator):
         # Format reward history
         reward_history = []
         for reward in rewards_results:
-            reward_amount = abs(float(reward['directional_pft']))
+            reward_amount = abs(Decimal(reward['pft_absolute_amount']))
             reward_history.append(f"{reward['memo_data']} REWARD {reward_amount}")
         reward_history_str = "\n".join(reward_history)
         
@@ -1111,12 +1113,16 @@ class RewardResponseGenerator(ResponseGenerator):
 
     async def evaluate_request(self, request_tx: Dict[str, Any]) -> Dict[str, Any]:
         """Evaluate verification response and determine reward"""
-        memo_type = request_tx['memo_type']
         account = request_tx['account']
 
         # Get all necessary context
-        context = await self._get_task_context(memo_type)
+        context = await self._get_task_context(request_tx)
+
+        logger.debug(f"context: {context}")
+
         verification_details = await self._get_verification_details(account)
+
+        logger.debug(f"verification_details: {verification_details}")
 
         # Prepare prompts
         system_prompt = reward_system_prompt.replace(
@@ -1134,9 +1140,12 @@ class RewardResponseGenerator(ResponseGenerator):
             proposed_reward=context['proposed_reward']
         )
 
+        logger.debug(f"system_prompt: {system_prompt}")
+        logger.debug(f"user_prompt: {user_prompt}")
+
         # Generate reward response
         response = await self.openrouter.create_single_chat_completion(
-            model=self.default_model,
+            model=DEFAULT_OPENROUTER_MODEL,
             system_prompt=system_prompt,
             user_prompt=user_prompt
         )

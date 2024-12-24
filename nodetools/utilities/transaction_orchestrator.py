@@ -597,7 +597,7 @@ class TransactionOrchestrator:
             
             # Get unverified transactions and add them to review queue
             logger.debug("TransactionOrchestrator: Getting unverified transactions")
-            unverified_txs = await self.transaction_repository.get_unverified_transactions(
+            unverified_txs = await self.transaction_repository.get_unprocessed_transactions(
                 order_by="close_time_iso ASC",
                 include_processed=False   # For debugging only
             )

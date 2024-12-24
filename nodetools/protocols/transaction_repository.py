@@ -6,7 +6,7 @@ if TYPE_CHECKING:
 class TransactionRepository(Protocol):
     """Protocol for transaction repository"""
 
-    async def get_unverified_transactions(
+    async def get_unprocessed_transactions(
         self, 
         order_by: str = "close_time_iso ASC",
         limit: Optional[int] = None,

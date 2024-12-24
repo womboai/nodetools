@@ -162,11 +162,13 @@ class XRPLWebSocketMonitor:
             if await self.transaction_repository.insert_transaction(tx_message):
                 # Retrieve the complete transaction record from the database
                 # to ensure consistent format, which includes decoded memo fields
-                tx = await self.transaction_repository.get_unverified_transactions(limit=1)
+                tx = await self.transaction_repository.get_decoded_transaction(tx_message['hash'])
 
-                if tx and tx[0]['hash'] == tx_message['hash']:
+                logger.debug(f"XRPLWebSocketMonitor: Retrieved transaction from database: {tx}")
+
+                if tx and tx['hash'] == tx_message['hash']:
                     # Place complete transaction record into review queue
-                    await self.review_queue.put(tx[0])
+                    await self.review_queue.put(tx)
                 else:
                     logger.error(f"Failed to retrieve stored transaction {tx_message['hash']} from database")
             else:

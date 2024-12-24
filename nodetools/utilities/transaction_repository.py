@@ -74,7 +74,7 @@ class TransactionRepository:
         finally:
             conn.close()
 
-    async def get_unverified_transactions(
+    async def get_unprocessed_transactions(
         self, 
         order_by: str = "close_time_iso ASC",
         limit: Optional[int] = None,
@@ -261,15 +261,24 @@ class TransactionRepository:
                     # Load and execute insert query
                     sql_manager = SQLManager()
                     insert_query = sql_manager.load_query('xrpl', 'insert_transaction')
+
+                    # Replace %(name)s style parameters with $1, $2, etc.
+                    # TODO: This is a hack to get around the fact that psycopg2 doesn't support %(name)s style parameters
+                    insert_query = insert_query.replace("%(hash)s", "$1")
+                    insert_query = insert_query.replace("%(ledger_index)s", "$2")
+                    insert_query = insert_query.replace("%(close_time_iso)s", "$3")
+                    insert_query = insert_query.replace("%(tx_json)s", "$4")
+                    insert_query = insert_query.replace("%(meta)s", "$5")
+                    insert_query = insert_query.replace("%(validated)s", "$6")
                     
                     await conn.execute(
                         insert_query,
-                        hash=tx.get("hash"),
-                        ledger_index=tx.get("ledger_index"),
-                        close_time_iso=tx.get("close_time_iso"),
-                        tx_json=json.dumps(tx.get("tx_json", {})),
-                        meta=json.dumps(tx.get("meta", {})),
-                        validated=tx.get("validated", False)
+                        tx.get("hash"),
+                        tx.get("ledger_index"),
+                        tx.get("close_time_iso"),
+                        json.dumps(tx.get("tx_json", {})),
+                        json.dumps(tx.get("meta", {})),
+                        tx.get("validated", False)
                     )
 
                     # Immediately get processed record
