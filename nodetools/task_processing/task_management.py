@@ -24,7 +24,6 @@ import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
 import matplotlib.ticker as ticker
 import nodetools.configuration.constants as global_constants
-import nodetools.task_processing.constants as node_constants
 from nodetools.utilities.credentials import CredentialManager
 from nodetools.utilities.exceptions import *
 from nodetools.performance.monitor import PerformanceMonitor
@@ -32,18 +31,11 @@ from nodetools.prompts.chat_processor import ChatProcessor
 import nodetools.configuration.configuration as config
 from nodetools.task_processing.user_context_parsing import UserTaskParser
 from nodetools.task_processing.task_creation import NewTaskGeneration
-from nodetools.task_processing.constants import TaskType
+from nodetools.sql.sql_manager import SQLManager
 
 class PostFiatTaskGenerationSystem:
     _instance = None
     _initialized = False
-
-    STATE_COLUMN_MAP = {
-        TaskType.ACCEPTANCE: 'acceptance',
-        TaskType.REFUSAL: 'refusal',
-        TaskType.VERIFICATION_PROMPT: 'verification',
-        TaskType.REWARD: 'reward'
-    }
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -80,6 +72,8 @@ class PostFiatTaskGenerationSystem:
             )
             self.stop_threads = False
             self.default_model = global_constants.DEFAULT_OPEN_AI_MODEL
+
+            self.bot_start_time = datetime.datetime.now(datetime.UTC)
 
             # self.run_queue_processing()  # Initialize queue processing
             logger.info(f"\n----------------------------PostFiatTaskGenerationSystem Initialized---------------------------\n")
@@ -1939,95 +1933,75 @@ class PostFiatTaskGenerationSystem:
             logger.warning(f"Error processing memo data for hash {row.name}: {e}")
             return row['memo_data']  # Return original if processing fails
 
-    # TODO: Consider moving this out of the Task generation system
     def sync_and_format_new_transactions(self):
         """
-        Syncs new XRPL transactions with the foundation discord database and formats them for Discord.
+        Gets newly processed transactions and formats them for Discord notifications.
+        Uses the transaction processing pipeline to avoid duplicate notifications.
         
         Returns:
             list: Formatted messages for new transactions ready to be sent to Discord.
         """
         try:
             # Get existing transaction hashes from database
-            dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(
+            dbconnx = self.db_connection_manager.spawn_psycopg2_db_connection(
                 username=self.generic_pft_utilities.node_name
             )
             try:
-                existing_hashes = set(pd.read_sql('select hash from foundation_discord', dbconnx)['hash'])
-            finally:
-                dbconnx.dispose()
+                with dbconnx.cursor() as cur:
+                    sql_manager = SQLManager()
+                    query = sql_manager.load_query('discord','get_new_processed_transactions')
+                    display_memo_types = [
+                        global_constants.SystemMemoType.INITIATION_RITE.value,
+                        global_constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value
+                    ]
+                    cur.execute(query, (self.bot_start_time, display_memo_types))
 
-            # Get all transactions for the node's address
-            memo_history = self.generic_pft_utilities.get_account_memo_history(
-                account_address=self.generic_pft_utilities.node_address,
-                pft_only=False
-            ).sort_values('datetime')
+                    # Convert to list of dicts
+                    columns = [desc[0] for desc in cur.description]
+                    results = []
+                    for row in cur.fetchall():
+                        results.append(dict(zip(columns, row)))
 
-            # Filter for transactions that we want to display
-            # 1. Transactions with PFT OR 
-            # 2. Specific system memo types we want to display
-            display_memo_types = [
-                global_constants.SystemMemoType.INITIATION_RITE.value,
-                global_constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value
-            ]
-            memo_history = memo_history[
-                (memo_history['directional_pft'] != 0) |  # Has PFT
-                (memo_history['memo_type'].isin(display_memo_types))  # Is a displayed system memo type
-            ]
+                    if not results:
+                        return []
 
-            # Add XRPL explorer URLs
-            url_mask = self.network_config.explorer_tx_url_mask
-            memo_history['url'] = memo_history['hash'].apply(lambda x: url_mask.format(hash=x))
+                    # Process results
+                    url_mask = self.network_config.explorer_tx_url_mask
+                    messages_to_send = []
+                    hashes_to_mark = []
 
-            # Add processed memo data column
-            memo_history['processed_memo_data'] = memo_history.apply(self._process_row, axis=1, memo_history=memo_history)
-        
-            def format_message(row):
-                return (f"Date: {row['datetime']}\n"
-                        f"Account: `{row['account']}`\n"
-                        f"Memo Format: `{row['memo_format']}`\n"
-                        f"Memo Type: `{row['memo_type']}`\n"
-                        f"Memo Data: `{row['processed_memo_data']}`\n"
-                        f"Directional PFT: {row['directional_pft']}\n"
-                        f"URL: {row['url']}")
+                    for row in results:
+                        url = url_mask.format(hash=row['hash'])
 
-            # Format messages and identify new transactions
-            memo_history['formatted_message'] = memo_history.apply(format_message, axis=1)
-            memo_history.set_index('hash',inplace=True)
+                        # Format message
+                        message = (
+                            f"Date: {row['datetime']}\n"
+                            f"Account: `{row['account']}`\n"
+                            f"Memo Format: `{row['memo_format']}`\n"
+                            f"Memo Type: `{row['memo_type']}`\n"
+                            f"Memo Data: `{row['memo_data']}`\n"
+                            f"Directional PFT: {row['pft_absolute_amount']}\n"
+                            f"Rule: {row['rule_name']}\n"
+                            f"URL: {url}"
+                        )
+                        messages_to_send.append(message)
+                        hashes_to_mark.append(row['hash'])
 
-            # Filter for new transactions
-            new_transactions_df = memo_history[~memo_history.index.isin(existing_hashes)]
-    
-            # Prepare messages for Discord
-            messages_to_send = list(new_transactions_df['formatted_message'])
+                    # Mark transactions as notified
+                    if hashes_to_mark:
+                        insert_query = sql_manager.load_query('discord', 'mark_transactions_notified')
+                        cur.execute(insert_query, (hashes_to_mark,))
+                        dbconnx.commit()
 
-            # Write new transactions to database if any exist
-            if not new_transactions_df.empty:
-
-                writer_df = new_transactions_df.reset_index()
-                columns_to_save = [
-                    'hash', 'memo_data', 'memo_type', 'memo_format',
-                    'datetime', 'url', 'directional_pft', 'account'
-                ]
-                
-                dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(
-                    username=self.generic_pft_utilities.node_name
-                )
-                try:
-                    writer_df[columns_to_save].to_sql(
-                        'foundation_discord',
-                        dbconnx,
-                        if_exists='append',
-                        index=False
-                    )
-                    logger.debug(f"PostFiatTaskManagement.sync_and_format_new_transactions: Synced {len(writer_df)} new transactions to table foundation_discord")
-                finally:
-                    dbconnx.dispose()
+                    return messages_to_send
             
-            return messages_to_send
+            finally:
+                if dbconnx:
+                    dbconnx.close()
         
         except Exception as e:
             logger.error(f"PostFiatTaskManagement.sync_and_format_new_transactions: Error syncing transactions: {str(e)}")
+            logger.error(traceback.format_exc())
             return []
 
     def generate_coaching_string_for_account(self, account_to_work = 'r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n'):

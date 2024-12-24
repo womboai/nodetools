@@ -1,7 +1,7 @@
 from typing import Protocol, TYPE_CHECKING, List, Dict, Any, Optional
 
 if TYPE_CHECKING:
-    from nodetools.utilities.transaction_orchestrator import ProcessingResult
+    from nodetools.utilities.transaction_orchestrator import ReviewingResult
 
 class TransactionRepository(Protocol):
     """Protocol for transaction repository"""
@@ -34,8 +34,8 @@ class TransactionRepository(Protocol):
         """
         ...
 
-    async def store_processing_result(self, tx_hash: str, result: 'ProcessingResult') -> None:
-        """Store the processing result for a transaction"""
+    async def store_reviewing_result(self, tx_hash: str, result: 'ReviewingResult') -> None:
+        """Store the reviewing result for a transaction"""
         ...
 
     async def get_processing_results(
@@ -71,15 +71,8 @@ class TransactionRepository(Protocol):
         """
         ...
     
-    async def store_transaction(self, tx_message: Dict[str, Any]) -> bool:
-        """Store a single transaction in the postfiat_tx_cache table.
-        
-        Args:
-            tx_message: Raw transaction message from XRPL websocket
-            
-        Returns:
-            bool: True if transaction was stored successfully
-        """
+    async def insert_transaction(self, tx_message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Insert a single transaction and return the processed record"""
         ...
 
     async def get_decoded_transaction(self, tx_hash: str) -> Optional[Dict[str, Any]]:

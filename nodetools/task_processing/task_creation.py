@@ -1,16 +1,15 @@
 from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
-from nodetools.protocols.task_management import PostFiatTaskGenerationSystem
 from nodetools.protocols.openrouter import OpenRouterTool
 from nodetools.prompts.task_generation import (
     task_generation_one_shot_user_prompt,
     task_generation_one_shot_system_prompt
 )
 from nodetools.task_processing.user_context_parsing import UserTaskParser
-import pandas as pd
+from nodetools.task_processing.constants import TaskType
 import uuid
 import re
 from loguru import logger
-import nodetools.configuration.constants as global_constants
+from nodetools.configuration.constants import DEFAULT_OPENROUTER_MODEL
 from typing import Optional
 
 class UserContext:
@@ -163,7 +162,7 @@ class NewTaskGeneration:
         
         # Set proposal strings, reward amounts, PFT amounts
         REWARD_AMOUNT = 900  # TODO: Make this dynamic
-        output_df['pf_proposal_string'] = global_constants.TaskType.PROPOSAL.value + output_df['content'].apply(
+        output_df['pf_proposal_string'] = TaskType.PROPOSAL.value + output_df['content'].apply(
             lambda x: self.extract_final_output(x)
         ) + ' .. ' + str(REWARD_AMOUNT)
         output_df['reward'] = REWARD_AMOUNT
@@ -204,7 +203,7 @@ class NewTaskGeneration:
     def run_batch_task_generation(
             self,
             task_map: dict,
-            model: Optional[str] = global_constants.DEFAULT_OPENROUTER_MODEL,
+            model: Optional[str] = DEFAULT_OPENROUTER_MODEL,
             get_google_doc: bool = True,
             get_historical_memos: bool = True
         ):

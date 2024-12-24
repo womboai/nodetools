@@ -1,8 +1,7 @@
 import pandas as pd
 from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
-import nodetools.configuration.constants as global_constants
 import nodetools.task_processing.constants as node_constants
-from typing import Optional, Dict, List, Union
+from typing import Optional, Union
 from loguru import logger
 import traceback
 import re
@@ -11,6 +10,13 @@ from nodetools.task_processing.constants import TaskType, TASK_PATTERNS
 class UserTaskParser:
     _instance = None
     _initialized = False
+
+    STATE_COLUMN_MAP = {
+        TaskType.ACCEPTANCE: 'acceptance',
+        TaskType.REFUSAL: 'refusal',
+        TaskType.VERIFICATION_PROMPT: 'verification',
+        TaskType.REWARD: 'reward'
+    }
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -43,43 +49,37 @@ class UserTaskParser:
         return 'UNKNOWN'
 
     @staticmethod
-    def is_valid_id(memo_dict):
-        """Check if memo contains a valid task ID in format YYYY-MM-DD_HH:MM or YYYY-MM-DD_HH:MM__XXXX."""
-        full_memo_string = str(memo_dict)
+    def is_valid_id(memo_type: str) -> bool:
+        """Check if memo_type contains a valid task ID in format YYYY-MM-DD_HH:MM or YYYY-MM-DD_HH:MM__XXXX.
+        
+        Args:
+            memo_type: The memo_type string to check for task ID pattern
+            
+        Returns:
+            bool: True if the memo_type contains a valid task ID pattern
+        """
+        if not memo_type:
+            return False
         task_id_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(?:__[A-Z0-9]{4})?)')
-        return bool(re.search(task_id_pattern, full_memo_string))
+        return bool(re.search(task_id_pattern, str(memo_type)))
     
-    @staticmethod
-    def filter_tasks(account_memo_detail_df):
-        """Filter account transaction history into a simplified DataFrame of task information."""
+    def filter_tasks(self, account_memo_detail_df):
+        """Filter account transaction history to only include tasks"""
         # Return immediately if no tasks found
         if account_memo_detail_df.empty:
             return pd.DataFrame()
 
         simplified_task_frame = account_memo_detail_df[
-            account_memo_detail_df['converted_memos'].apply(lambda x: UserTaskParser.is_valid_id(x))
+            account_memo_detail_df['memo_type'].apply(self.is_valid_id)
         ].copy()
 
         # Return immediately if no tasks found
         if simplified_task_frame.empty:
             return pd.DataFrame()
 
-        def add_field_to_map(xmap, field, field_value):
-            xmap[field] = field_value
-            return xmap
-        
-        for xfield in ['hash','datetime']:
-            simplified_task_frame['converted_memos'] = simplified_task_frame.apply(
-                lambda x: add_field_to_map(x['converted_memos'],
-                xfield,x[xfield]),
-                axis=1
-            )
-        core_task_df = pd.DataFrame(list(simplified_task_frame['converted_memos'])).copy()
-        core_task_df['task_type'] = core_task_df['MemoData'].apply(
-            lambda x: UserTaskParser.classify_task_string(x)
-        )
+        simplified_task_frame['task_type'] = simplified_task_frame['memo_data'].apply(self.classify_task_string)
 
-        return core_task_df
+        return simplified_task_frame
 
     def get_task_state_pairs(self, account_memo_detail_df):
         """Convert account info into a DataFrame of proposed tasks and their latest state changes."""
@@ -92,9 +92,9 @@ class UserTaskParser:
 
         # Rename columns for clarity
         task_frame.rename(columns={
-            'MemoType': 'task_id',
-            'MemoData': 'full_output',
-            'MemoFormat': 'user_account'
+            'memo_type': 'task_id',
+            'memo_data': 'full_output',
+            'memo_format': 'user_account'
         }, inplace=True)
 
         # Get proposals
@@ -118,7 +118,7 @@ class UserTaskParser:
         # For each task id, if there's no state change, it's in PROPOSAL state
         all_task_ids = task_pairs.index
         task_pairs['state_type'] = pd.Series(
-            global_constants.TaskType.PROPOSAL.name, 
+            TaskType.PROPOSAL.name, 
             index=all_task_ids
         )
 
@@ -180,7 +180,7 @@ class UserTaskParser:
     
     def get_pending_proposals(self, account: Union[str, pd.DataFrame]):
         """Get proposals that have not yet been accepted or refused."""
-        return self.get_proposals_by_state(account, state_type=global_constants.TaskType.PROPOSAL)
+        return self.get_proposals_by_state(account, state_type=TaskType.PROPOSAL)
 
     def get_accepted_proposals(self, account: Union[str, pd.DataFrame]):
         """Get accepted proposals"""
@@ -229,9 +229,9 @@ class UserTaskParser:
             Indexed by task_id.
         """
         # Get all proposals in refuseable states
-        pending = self.get_proposals_by_state(account, state_type=global_constants.TaskType.PROPOSAL)
-        accepted = self.get_proposals_by_state(account, state_type=global_constants.TaskType.ACCEPTANCE)
-        verification = self.get_proposals_by_state(account, state_type=global_constants.TaskType.VERIFICATION_PROMPT)
+        pending = self.get_proposals_by_state(account, state_type=TaskType.PROPOSAL)
+        accepted = self.get_proposals_by_state(account, state_type=TaskType.ACCEPTANCE)
+        verification = self.get_proposals_by_state(account, state_type=TaskType.VERIFICATION_PROMPT)
         
         # Combine all proposals, keeping only the proposal text column
         all_proposals = pd.concat([
@@ -325,7 +325,7 @@ class UserTaskParser:
             if all_proposals.empty:
                 proposal_string = "No pending or accepted proposals found."
             else:
-                proposal_string = self.format_task_section(all_proposals, global_constants.TaskType.PROPOSAL)
+                proposal_string = self.format_task_section(all_proposals, TaskType.PROPOSAL)
         
         except Exception as e:
             logger.error(f"UserTaskParser.get_full_user_context_string: Failed to get pending or accepted proposals: {e}")
@@ -338,7 +338,7 @@ class UserTaskParser:
             if refused_proposals.empty:
                 refusal_string = "No refused proposals found."
             else:
-                refusal_string = self.format_task_section(refused_proposals, global_constants.TaskType.REFUSAL)
+                refusal_string = self.format_task_section(refused_proposals, TaskType.REFUSAL)
         except Exception as e:
             logger.error(f"UserTaskParser.get_full_user_context_string: Failed to get refused proposals: {e}")
             logger.error(traceback.format_exc())
@@ -350,7 +350,7 @@ class UserTaskParser:
             if verification_proposals.empty:
                 verification_string = "No tasks pending verification."
             else:
-                verification_string = self.format_task_section(verification_proposals, global_constants.TaskType.VERIFICATION_PROMPT)
+                verification_string = self.format_task_section(verification_proposals, TaskType.VERIFICATION_PROMPT)
         except Exception as e:
             logger.error(f'UserTaskParser.get_full_user_context_string: Exception while retrieving verifications for {account_address}: {e}')
             logger.error(traceback.format_exc())
@@ -362,7 +362,7 @@ class UserTaskParser:
             if rewarded_proposals.empty:
                 reward_string = "No rewarded tasks found."
             else:
-                reward_string = self.format_task_section(rewarded_proposals, global_constants.TaskType.REWARD)
+                reward_string = self.format_task_section(rewarded_proposals, TaskType.REWARD)
         except Exception as e:
             logger.error(f'UserTaskParser.get_full_user_context_string: Exception while retrieving rewards for {account_address}: {e}')
             logger.error(traceback.format_exc())

@@ -17,4 +17,4 @@ WITH base_query AS (
     FROM decoded_memos
     WHERE (account = %s OR destination = %s)
 )
-SELECT * FROM base_query
+SELECT * FROM base_query WHERE 1=1

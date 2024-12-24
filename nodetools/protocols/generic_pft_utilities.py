@@ -60,10 +60,6 @@ class GenericPFTUtilities(Protocol):
         """Get all compressed messages for a given account"""
         ...
 
-    def get_pft_holder_df(self) -> pd.DataFrame:
-        """Get a DataFrame of all post-fiat holders"""
-        ...
-
     def construct_handshake_memo(self, user: str, ecdh_public_key: str) -> str:
         """Construct a handshake memo"""
         ...

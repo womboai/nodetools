@@ -6,6 +6,7 @@ import sys
 import subprocess
 import platform
 from nodetools.sql.sql_manager import SQLManager
+import traceback
 
 def extract_node_name(postgres_key: str) -> str:
     """Extract node name from PostgreSQL credential key.
@@ -304,7 +305,7 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
                 return
 
             if drop_tables:
-                confirm = input("WARNING: This will drop existing tables. Are you sure you want to continue? (y/n): ")
+                confirm = input(f"WARNING: This will drop existing {network_type} tables. Are you sure you want to continue? (y/n): ")
                 if confirm.lower() != "y":
                     print("Database initialization cancelled.")
                     return
@@ -313,20 +314,14 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
 
             try:
                 with engine.connect() as connection:
-                    # Only drop tables if explicitly requested
-                    if drop_tables:
-                        confirm = input("WARNING: This will drop existing tables. Are you sure you want to continue? (y/n): ")
-                        if confirm.lower() != "y":
-                            print("Database initialization cancelled.")
-                            return
-                        # Drop core tables
-                        connection.execute(text("DROP TABLE IF EXISTS transaction_processing_results CASCADE;"))
-                        connection.execute(text("DROP TABLE IF EXISTS transaction_memos CASCADE;"))
-                        connection.execute(text("DROP TABLE IF EXISTS postfiat_tx_cache CASCADE;"))
-                        # Drop module tables
-                        connection.execute(text("DROP TABLE IF EXISTS foundation_discord CASCADE;"))
-                        connection.commit()
-                        print("Dropped existing tables.")
+                    # Drop core tables
+                    connection.execute(text("DROP TABLE IF EXISTS transaction_processing_results CASCADE;"))
+                    connection.execute(text("DROP TABLE IF EXISTS transaction_memos CASCADE;"))
+                    connection.execute(text("DROP TABLE IF EXISTS postfiat_tx_cache CASCADE;"))
+                    # Drop module tables
+                    connection.execute(text("DROP TABLE IF EXISTS foundation_discord CASCADE;"))
+                    connection.commit()
+                    print("Dropped existing tables.")
 
                     # Initialize core database objects
                     print("\nInitializing core database objects...")
@@ -381,13 +376,13 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
                         print("Initializing Discord module...")
                         query = sql_manager.load_query('discord', 'create_tables')
                         connection.execute(text(query))
-                        connection.execute(text("GRANT ALL PRIVILEGES ON TABLE foundation_discord TO postfiat;"))
+                        connection.execute(text("GRANT ALL PRIVILEGES ON TABLE discord_notifications TO postfiat;"))
                         connection.commit()
                         print("Discord module initialized successfully!")
 
                     # Print table info
                     print("\nVerifying table structures:")
-                    tables_to_verify = core_tables + (["foundation_discord"] if "foundation_discord" in connection.execute(
+                    tables_to_verify = core_tables + (["discord_notifications"] if "discord_notifications" in connection.execute(
                         text("SELECT tablename FROM pg_tables WHERE schemaname = 'public';")
                     ).scalars().all() else [])
 
@@ -424,6 +419,7 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
 
     except Exception as e:
         print(f"Error initializing database: {e}")
+        print(traceback.format_exc())
 
 def print_prerequisites():
     """Print prerequisites information."""

@@ -1,43 +1,46 @@
+# Standard library imports
 from decimal import Decimal
-from typing import Optional, Union, Any
+from typing import Optional, Union, Any, Dict, List, Any
 import binascii
 import datetime 
 import random
 import time
 import string
-import nest_asyncio
-import pandas as pd
-import numpy as np
-import re
-import json
-import threading
-import requests
 import base64
 import brotli
 import hashlib
 import os
+import re
+import json
+import traceback
+import asyncio
+
+# Third party imports
+import nest_asyncio
+import pandas as pd
+import numpy as np
+import requests
 import sqlalchemy
 import xrpl
 from xrpl.models.transactions import Memo
 from xrpl.wallet import Wallet
 from xrpl.clients import JsonRpcClient
 from xrpl.models.requests import AccountInfo, AccountLines, AccountTx
-from nodetools.utilities.encryption import MessageEncryption
-from nodetools.performance.monitor import PerformanceMonitor
-from nodetools.utilities.transaction_requirements import TransactionRequirementService
-from nodetools.ai.openrouter import OpenRouterTool
-from nodetools.utilities.db_manager import DBConnectionManager
-from nodetools.utilities.credentials import CredentialManager
+from loguru import logger
+
+# NodeTools imports
 import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
+from nodetools.performance.monitor import PerformanceMonitor
+from nodetools.ai.openrouter import OpenRouterTool
+from nodetools.utilities.encryption import MessageEncryption
+from nodetools.utilities.transaction_requirements import TransactionRequirementService
+from nodetools.utilities.db_manager import DBConnectionManager
+from nodetools.utilities.credentials import CredentialManager
 from nodetools.utilities.exceptions import *
-from loguru import logger
-import traceback
 from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
 from nodetools.utilities.transaction_orchestrator import TransactionOrchestrator
 from nodetools.utilities.transaction_repository import TransactionRepository
-import asyncio
-import contextlib
 
 nest_asyncio.apply()
 
@@ -87,8 +90,7 @@ class GenericPFTUtilities:
             for address in self.node_config.auto_handshake_addresses:
                 self.message_encryption.register_auto_handshake_wallet(address)
 
-            self._holder_df_lock = threading.Lock()
-            self._pft_holder_df = None
+            self._pft_holders = None
 
             # Initialize XRPL monitor
             self.xrpl_monitor = XRPLWebSocketMonitor(
@@ -1200,27 +1202,27 @@ class GenericPFTUtilities:
         except AttributeError:
             return None
         
-    @staticmethod
-    def _process_memos(memos: Union[dict, list, None]) -> Optional[str]:
-        """Process memos for PostgreSQL storage.
+    # @staticmethod
+    # def _process_memos(memos: Union[dict, list, None]) -> Optional[str]:
+    #     """Process memos for PostgreSQL storage.
         
-        Args:
-            memos: List of memo dictionaries or single memo dict
+    #     Args:
+    #         memos: List of memo dictionaries or single memo dict
             
-        Returns:
-            JSON string representation of memos or None
-        """
-        if memos is None:
-            return None
+    #     Returns:
+    #         JSON string representation of memos or None
+    #     """
+    #     if memos is None:
+    #         return None
             
-        # Ensure memos is a list
-        memos = [memos] if not isinstance(memos, list) else memos
+    #     # Ensure memos is a list
+    #     memos = [memos] if not isinstance(memos, list) else memos
         
-        # Extract only the 'Memo' part from each dictionary
-        processed_memos = [memo.get('Memo', memo) for memo in memos]
-        return json.dumps(processed_memos)
+    #     # Extract only the 'Memo' part from each dictionary
+    #     processed_memos = [memo.get('Memo', memo) for memo in memos]
+    #     return json.dumps(processed_memos)
 
-    def fetch_formatted_transaction_history(self, account_address: str) -> pd.DataFrame:
+    def fetch_formatted_transaction_history(self, account_address: str) -> List[Dict[str, Any]]:
         """Fetch and format transaction history for an account.
         
         Retrieves transactions from XRPL and transforms them into a standardized
@@ -1230,92 +1232,64 @@ class GenericPFTUtilities:
             account_address: XRPL account address to fetch transactions for
                 
         Returns:
-            DataFrame containing processed transaction data with standardized columns
+            List of dictionaries containing processed transaction data with standardized fields
         """
         # Fetch transaction history and prepare DataFrame
-        tx_hist = self.fetch_account_transactions(account_address=account_address)
-        if not tx_hist:
-            return pd.DataFrame()
+        transactions = self.fetch_account_transactions(account_address=account_address)
+        if not transactions:
+            return []
         
-        # Create DataFrame and extract fields
-        df = pd.DataFrame(tx_hist)
-
-        # Process each field
-        for field in self.TX_JSON_FIELDS:
-            df[field.lower()] = df['tx_json'].apply(lambda x: self._extract_field(x, field))
-
-        # Process special columns
-        df['memos'] = df['memos'].apply(self._process_memos)
-        df['meta'] = df['meta'].apply(json.dumps)
-        df['tx_json'] = df['tx_json'].apply(json.dumps)
+        formatted_transactions = []
+        for tx in transactions:
+            formatted_tx = {
+                # Core transaction fields
+                'hash': tx.get('hash'),
+                'ledger_index': tx.get('ledger_index'),
+                'close_time_iso': tx.get('close_time_iso'),
+                'validated': tx.get('validated'),
+                
+                # Store complete transaction data
+                'meta': tx.get('meta', {}),
+                'tx_json': tx.get('tx_json', {}),
+            }
+            
+            formatted_transactions.append(formatted_tx)
         
-        return df
+        return formatted_transactions
     
-    def _batch_insert_transactions(self, transaction_df: pd.DataFrame, batch_size: int = 100) -> int:
+    def _batch_insert_transactions(self, transactions: List[Dict[str, Any]], batch_size: int = 100) -> int:
         """Insert transaction records in batches, skipping duplicates via SQL.
         
         Uses PostgreSQL's ON CONFLICT DO NOTHING for duplicate handling and 
         xmax system column to track new insertions within the transaction.
         
         Args:
-            transaction_df: DataFrame containing transaction records
+            transactions: List of dictionaries containing transaction records
             batch_size: Number of records to process per batch
             
         Returns:
             int: Total number of new records inserted
         """
-        # total_records = len(transaction_df)
+        # total_records = len(transactions)
         # logger.debug(f"GenericPFTUtilities._batch_insert_transactions: Inserting {total_records} transactions")
         total_rows_inserted = 0
 
-        engine = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(username=self.node_name)
-
-        insert_stmt = sqlalchemy.text("""
-            INSERT INTO postfiat_tx_cache (
-                close_time_iso, hash, ledger_hash, ledger_index, meta, 
-                tx_json, validated, account, delivermax, destination, 
-                fee, flags, lastledgersequence, sequence, signingpubkey, 
-                transactiontype, txnsignature, date, memos
-            ) VALUES (
-                :close_time_iso, :hash, :ledger_hash, :ledger_index, :meta,
-                :tx_json, :validated, :account, :delivermax, :destination,
-                :fee, :flags, :lastledgersequence, :sequence, :signingpubkey,
-                :transactiontype, :txnsignature, :date, :memos
-            ) ON CONFLICT (hash) DO NOTHING
-        """)
-
         try:
-            with engine.connect() as conn:
-                with conn.begin():
-                    for batch in self._get_transaction_batches(transaction_df, batch_size):
-                        conn.execute(insert_stmt, batch.to_dict('records'))
+            for batch in self._get_transaction_batches(transactions, batch_size):
+                inserted = self.transaction_repository.batch_insert_transactions(batch)
+                total_rows_inserted += inserted
 
-                    # Use string concatenation to build the array literal
-                    hash_array = "ARRAY[" + ",".join(f"'{h}'" for h in transaction_df['hash']) + "]"
-                    
-                    # Use the array literal directly in the query
-                    inserted = conn.execute(sqlalchemy.text(f"""
-                        SELECT COUNT(*) FROM postfiat_tx_cache 
-                        WHERE hash = ANY({hash_array})
-                        AND xmin::text = txid_current()::text
-                    """)).scalar()
+            return total_rows_inserted
 
-                    total_rows_inserted += inserted
-
-        except sqlalchemy.exc.InternalError as e:
-            self._handle_transaction_error(e, conn)
+        except Exception as e:
+            logger.error(f"Error in batch insert: {e}")
+            logger.error(traceback.format_exc())
             raise
-        finally:
-            engine.dispose()
-
-        # logger.debug(f"GenericPFTUtilities._batch_insert_transactions: Inserted {total_rows_inserted} transactions ({total_inserts_attempted} attempted)")
-        
-        return total_rows_inserted
     
-    def _get_transaction_batches(self, df: pd.DataFrame, batch_size: int):
-        """Generate batches of transactions from DataFrame."""
-        for start in range(0, len(df), batch_size):
-            yield df.iloc[start:start + batch_size]
+    def _get_transaction_batches(self, transactions: List[Dict[str, Any]], batch_size: int):
+        """Generate batches of transactions from list."""
+        for start in range(0, len(transactions), batch_size):
+            yield transactions[start:start + batch_size]
 
     def _handle_transaction_error(self, error: Exception, conn) -> None:
         """Handle database transaction errors.
@@ -1332,21 +1306,20 @@ class GenericPFTUtilities:
         else:
             logger.error("Database error occurred: %s", error)
 
-    def fetch_pft_trustline_data(self) -> pd.DataFrame:
-        """Get a DataFrame containing all PFT token holder account information.
+    def fetch_pft_trustline_data(self) -> List[Dict[str, Any]]:
+        """Get PFT token holder account information.
         
         Queries the XRPL for all accounts that have trustlines with the PFT issuer account.
         The balances are from the issuer's perspective, so they are negated to show actual
         holder balances (e.g., if issuer shows -100, holder has +100).
 
         Returns:
-            pd.DataFrame: DataFrame with columns:
+            List of dictionaries containing:
                 - account (str): XRPL account address of the token holder
                 - balance (str): Raw balance string from XRPL
                 - currency (str): Currency code (should be 'PFT')
                 - limit_peer (str): Trustline limit
                 - pft_holdings (float): Actual token balance (negated from issuer view)
-                - lines (dict): Raw trustline data from XRPL
         """
         # Create XRPL client and get account lines
         client = xrpl.clients.JsonRpcClient(self.https_url)
@@ -1357,22 +1330,15 @@ class GenericPFTUtilities:
             )
         )
 
-        # Extract only needed fields from lines into list of dicts and create DataFrame
-        holder_data = [
-            {
-                'account': line['account'],
-                'balance': line['balance'],
+        return {
+            line['account']: {
+                'balance': Decimal(line['balance']),
                 'currency': line['currency'],
-                'limit_peer': line['limit_peer']
+                'limit_peer': line['limit_peer'],
+                'pft_holdings': Decimal(line['balance']) * -1
             }
             for line in response.result['lines']
-        ]
-        df = pd.DataFrame(holder_data)
-
-        # Add calculated pft_holdings column
-        df['pft_holdings'] = pd.to_numeric(df['balance']) * -1
-
-        return df
+        }
     
     def sync_pft_transaction_history_for_account(self, account_address: str):
         """Sync transaction history for an account to the postfiat_tx_cache table.
@@ -1384,7 +1350,7 @@ class GenericPFTUtilities:
             int: Number of new transactions synced
         """
         tx_hist = self.fetch_formatted_transaction_history(account_address=account_address)
-        if tx_hist is None or tx_hist.empty:
+        if not tx_hist:
             return 0
 
         return self._batch_insert_transactions(tx_hist)
@@ -1393,13 +1359,12 @@ class GenericPFTUtilities:
     def sync_pft_transaction_history(self):
         """Sync transaction history for all PFT token holders.
         
-        Updates the internal holder DataFrame and syncs transaction history 
-        for each holder account. Uses thread-safe access to holder DataFrame.
+        Updates the holders reference and syncs transaction history for each holder account.
         
         Note: This operation can be time-consuming for many holder accounts.
         """
-        self.set_pft_holder_df(self.fetch_pft_trustline_data())
-        all_accounts = self.get_pft_holder_df()['account'].unique().tolist()
+        self.set_pft_holders(self.fetch_pft_trustline_data())
+        all_accounts = list(self.get_pft_holders().keys())
         total_accounts = len(all_accounts)
         rows_inserted = 0
         logger.info(f"Starting transaction history sync for {total_accounts} accounts")
@@ -1413,89 +1378,21 @@ class GenericPFTUtilities:
                 # Log progress every 5 accounts
                 if accounts_processed % 5 == 0:
                     progress = (accounts_processed / total_accounts) * 100
-                    logger.debug(f"Progress: {progress:.1f}% - Processed {accounts_processed}/{total_accounts} accounts, {rows_inserted} rows inserted")
+                    logger.debug(f"Progress: {progress:.1f}% - Synced {accounts_processed}/{total_accounts} accounts, {rows_inserted} rows inserted")
                     
             except Exception as e:
                 logger.error(f"Error processing account {account}: {e}")
                 continue
                 
-        logger.info(f"Completed transaction history sync. Processed {accounts_processed}/{total_accounts} accounts")
+        logger.info(f"Completed transaction history sync. Synced {accounts_processed}/{total_accounts} accounts")
 
-    def get_pft_holder_df(self):
-        """Thread-safe getter for pft_holder_df"""
-        with self._holder_df_lock:
-            return self._pft_holder_df.copy()
+    def get_pft_holders(self) -> Dict[str, Dict[str, Any]]:
+        """Getter for pft_holders"""
+        return self._pft_holders.copy()
         
-    def set_pft_holder_df(self, df: pd.DataFrame):
-        """Thread-safe setter for pft_holder_df"""
-        with self._holder_df_lock:
-            self._pft_holder_df = df
-
-    # TODO: How is this different from get_account_memo_history? 
-    def get_all_transactions_for_active_wallets(self):
-        """ This gets all the transactions for active post fiat wallets""" 
-        full_balance_df = self.get_pft_holder_df()
-        all_active_foundation_users = full_balance_df[full_balance_df['balance'].astype(float)<=-2000].copy()
-        
-        # Get unique wallet addresses from the dataframe
-        all_wallets = list(all_active_foundation_users['account'].unique())
-        
-        # Create database connection
-        dbconnx = self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(
-            username=self.node_name
-        )
-        
-        # Format the wallet addresses for the IN clause
-        wallet_list = "'" + "','".join(all_wallets) + "'"
-        
-        # Create query
-        query = f"""
-            SELECT * 
-            FROM postfiat_tx_cache
-            WHERE account IN ({wallet_list})
-            OR destination IN ({wallet_list})
-        """
-        
-        # Execute query using pandas read_sql
-        full_transaction_history = pd.read_sql(query, dbconnx)
-        full_transaction_history['meta']= full_transaction_history['meta'].apply(lambda x: json.loads(x))
-        full_transaction_history['tx_json']= full_transaction_history['tx_json'].apply(lambda x: json.loads(x))
-        return full_transaction_history
-
-    def get_all_account_pft_memo_data(self):
-        """ This gets all pft memo data for computation of leaderboard  """ 
-        all_transactions = self.get_all_transactions_for_active_wallets()
-        validated_tx=all_transactions
-        pft_only=True
-        validated_tx['has_memos'] = validated_tx['tx_json'].apply(lambda x: 'Memos' in x.keys())
-        live_memo_tx = validated_tx[validated_tx['has_memos'] == True].copy()
-        live_memo_tx['main_memo_data']=live_memo_tx['tx_json'].apply(lambda x: x['Memos'][0]['Memo'])
-        live_memo_tx['converted_memos']=live_memo_tx['main_memo_data'].apply(lambda x: 
-                                                                            self.decode_xrpl_memo(x))
-        #live_memo_tx['message_type']=np.where(live_memo_tx['destination']==account_address, 'INCOMING','OUTGOING')
-        live_memo_tx['datetime'] = pd.to_datetime(live_memo_tx['close_time_iso']).dt.tz_localize(None)
-        if pft_only:
-            live_memo_tx= live_memo_tx[live_memo_tx['tx_json'].apply(lambda x: self.pft_issuer in str(x))].copy()
-        
-        #live_memo_tx['unique_key']=live_memo_tx['reference_account']+'__'+live_memo_tx['hash']
-        def try_get_pft_absolute_amount(x):
-            try:
-                return x['DeliverMax']['value']
-            except:
-                return 0
-        def try_get_memo_info(x,info):
-            try:
-                return x[info]
-            except:
-                return ''
-        live_memo_tx['pft_absolute_amount']=live_memo_tx['tx_json'].apply(lambda x: try_get_pft_absolute_amount(x)).astype(float)
-        live_memo_tx['memo_format']=live_memo_tx['converted_memos'].apply(lambda x: try_get_memo_info(x,"MemoFormat"))
-        live_memo_tx['memo_type']= live_memo_tx['converted_memos'].apply(lambda x: try_get_memo_info(x,"MemoType"))
-        live_memo_tx['memo_data']=live_memo_tx['converted_memos'].apply(lambda x: try_get_memo_info(x,"MemoData"))
-        #live_memo_tx['pft_sign']= np.where(live_memo_tx['message_type'] =='INCOMING',1,-1)
-        #live_memo_tx['directional_pft'] = live_memo_tx['pft_sign']*live_memo_tx['pft_absolute_amount']
-        live_memo_tx['simple_date']=pd.to_datetime(live_memo_tx['datetime'].apply(lambda x: x.strftime('%Y-%m-%d')))
-        return live_memo_tx
+    def set_pft_holders(self, data: Dict[str, Dict[str, Any]]):
+        """Setter for pft_holders"""
+        self._pft_holders = data
 
     def get_latest_outgoing_context_doc_link(
             self, 
@@ -1999,8 +1896,8 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
             bool: True if trustline exists
         """
         try:
-            pft_holders = self.get_pft_holder_df()
-            return wallet.classic_address in list(pft_holders['account'])
+            pft_holders = self.get_pft_holders()
+            return wallet.classic_address in pft_holders
         except Exception as e:
             logger.error(f"GenericPFTUtilities.has_trust_line: Error checking if user {wallet.classic_address} has a trust line: {e}")
             return False
@@ -2171,387 +2068,3 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
             str: Memo data with chunk prefix removed if present, otherwise unchanged
         """
         return re.sub(r'^chunk_\d+__', '', memo_data)
-
-    # TODO: Refactor, add documentation and move to a different module
-    def output_postfiat_foundation_node_leaderboard_df(self):
-        """ This generates the full Post Fiat Foundation Leaderboard """ 
-        all_accounts = self.get_all_account_pft_memo_data()
-        # Get the mode (most frequent) memo_format for each account
-        account_modes = all_accounts.groupby('account')['memo_format'].agg(lambda x: x.mode()[0]).reset_index()
-        # If you want to see the counts as well to verify
-        account_counts = all_accounts.groupby(['account', 'memo_format']).size().reset_index(name='count')
-        
-        # Sort by account for readability
-        account_modes = account_modes.sort_values('account')
-        account_name_map = account_modes.groupby('account').first()['memo_format']
-        past_month_transactions = all_accounts[all_accounts['datetime']>datetime.datetime.now()-datetime.timedelta(30)]
-        node_transactions = past_month_transactions[past_month_transactions['account']==self.node_address].copy()
-        rewards_only=node_transactions[node_transactions['memo_data'].apply(lambda x: global_constants.TaskType.REWARD.value in str(x))].copy()
-        rewards_only['count']=1
-        rewards_only['PFT']=rewards_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float)
-        account_to_yellow_flag__count = rewards_only[rewards_only['memo_data'].apply(lambda x: 'YELLOW FLAG' in x)][['count','destination']].groupby('destination').sum()['count']
-        account_to_red_flag__count = rewards_only[rewards_only['memo_data'].apply(lambda x: 'RED FLAG' in x)][['count','destination']].groupby('destination').sum()['count']
-        
-        total_reward_number= rewards_only[['count','destination']].groupby('destination').sum()['count']
-        account_score_constructor = pd.DataFrame(account_name_map)
-        account_score_constructor=account_score_constructor[account_score_constructor.index!=self.node_address].copy()
-        account_score_constructor['reward_count']=total_reward_number
-        account_score_constructor['yellow_flags']=account_to_yellow_flag__count
-        account_score_constructor=account_score_constructor[['reward_count','yellow_flags']].fillna(0).copy()
-        account_score_constructor= account_score_constructor[account_score_constructor['reward_count']>=1].copy()
-        account_score_constructor['yellow_flag_pct']=account_score_constructor['yellow_flags']/account_score_constructor['reward_count']
-        total_pft_rewards= rewards_only[['destination','PFT']].groupby('destination').sum()['PFT']
-        account_score_constructor['red_flag']= account_to_red_flag__count
-        account_score_constructor['red_flag']=account_score_constructor['red_flag'].fillna(0)
-        account_score_constructor['total_rewards']= total_pft_rewards
-        account_score_constructor['reward_score__z']=(account_score_constructor['total_rewards']-account_score_constructor['total_rewards'].mean())/account_score_constructor['total_rewards'].std()
-        
-        account_score_constructor['yellow_flag__z']=(account_score_constructor['yellow_flag_pct']-account_score_constructor['yellow_flag_pct'].mean())/account_score_constructor['yellow_flag_pct'].std()
-        account_score_constructor['quant_score']=(account_score_constructor['reward_score__z']*.65)-(account_score_constructor['reward_score__z']*-.35)
-        top_score_frame = account_score_constructor[['total_rewards','yellow_flag_pct','quant_score']].sort_values('quant_score',ascending=False)
-        top_score_frame['account_name']=account_name_map
-        user_account_map = {}
-        for x in list(top_score_frame.index):
-            memo_history = self.get_account_memo_history(account_address=x)
-            user_account_string = self.get_full_user_context_string(account_address=x, memo_history=memo_history)
-            logger.debug(x)
-            user_account_map[x]= user_account_string
-        agency_system_prompt = """ You are the Post Fiat Agency Score calculator.
-        
-        An Agent is a human or an AI that has outlined an objective.
-        
-        An agency score has four parts:
-        1] Focus - the extent to which an Agent is focused.
-        2] Motivation - the extent to which an Agent is driving forward predictably and aggressively towards goals.
-        3] Efficacy - the extent to which an Agent is likely completing high value tasks that will drive an outcome related to the inferred goal of the tasks.
-        4] Honesty - the extent to which a Subject is likely gaming the Post Fiat Agency system.
-        
-        It is very important that you deliver assessments of Agency Scores accurately and objectively in a way that is likely reproducible. Future Post Fiat Agency Score calculators will re-run this score, and if they get vastly different scores than you, you will be called into the supervisor for an explanation. You do not want this so you do your utmost to output clean, logical, repeatable values.
-        """ 
-        
-        agency_user_prompt="""USER PROMPT
-        
-        Please consider the activity slice for a single day provided below:
-        pft_transaction is how many transactions there were
-        pft_directional value is the PFT value of rewards
-        pft_absolute value is the bidirectional volume of PFT
-        
-        <activity slice>
-        __FULL_ACCOUNT_CONTEXT__
-        <activity slice ends>
-        
-        Provide one to two sentences directly addressing how the slice reflects the following Four scores (a score of 1 is a very low score and a score of 100 is a very high score):
-        1] Focus - the extent to which an Agent is focused.
-        A focused agent has laser vision on a couple key objectives and moves the ball towards it.
-        An unfocused agent is all over the place.
-        A paragon of focus is Steve Jobs, who is famous for focusing on the few things that really matter.
-        2] Motivation - the extent to which an Agent is driving forward predictably and aggressively towards goals.
-        A motivated agent is taking massive action towards objectives. Not necessarily focused but ambitious.
-        An unmotivated agent is doing minimal work.
-        A paragon of focus is Elon Musk, who is famous for his extreme work ethic and drive.
-        3] Efficacy - the extent to which an Agent is likely completing high value tasks that will drive an outcome related to the inferred goal of the tasks.
-        An effective agent is delivering maximum possible impact towards implied goals via actions.
-        An ineffective agent might be focused and motivated but not actually accomplishing anything.
-        A paragon of focus is Lionel Messi, who is famous for taking the minimal action to generate maximum results.
-        4] Honesty - the extent to which a Subject is likely gaming the Post Fiat Agency system.
-        
-        Then provide an integer score.
-        
-        Your output should be in the following format:
-        | FOCUS COMMENTARY | <1 to two sentences> |
-        | MOTIVATION COMMENTARY | <1 to two sentences> |
-        | EFFICACY COMMENTARY | <1 to two sentences> |
-        | HONESTY COMMENTARY | <one to two sentences> |
-        | FOCUS SCORE | <integer score from 1-100> |
-        | MOTIVATION SCORE | <integer score from 1-100> |
-        | EFFICACY SCORE | <integer score from 1-100> |
-        | HONESTY SCORE | <integer score from 1-100> |
-        """
-        top_score_frame['user_account_details']=user_account_map
-        top_score_frame['system_prompt']=agency_system_prompt
-        top_score_frame['user_prompt']= agency_user_prompt
-        top_score_frame['user_prompt']=top_score_frame.apply(lambda x: x['user_prompt'].replace('__FULL_ACCOUNT_CONTEXT__',x['user_account_details']),axis=1)
-        def construct_scoring_api_arg(user_prompt, system_prompt):
-            gx ={
-                "model": global_constants.DEFAULT_OPEN_AI_MODEL,
-                "temperature":0,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ]
-            }
-            return gx
-        top_score_frame['api_args']=top_score_frame.apply(lambda x: construct_scoring_api_arg(user_prompt=x['user_prompt'],system_prompt=x['system_prompt']),axis=1)
-        
-        async_run_map = top_score_frame['api_args'].head(25).to_dict()
-        async_run_map__2 = top_score_frame['api_args'].head(25).to_dict()
-        async_output_df1= self.openrouter.create_writable_df_for_async_chat_completion(arg_async_map=async_run_map)
-        time.sleep(15)
-        async_output_df2= self.openrouter.create_writable_df_for_async_chat_completion(arg_async_map=async_run_map__2)
-        
-        
-        def extract_scores(text_data):
-            # Split the text into individual reports
-            reports = text_data.split("',\n '")
-            
-            # Clean up the string formatting
-            reports = [report.strip("['").strip("']") for report in reports]
-            
-            # Initialize list to store all scores
-            all_scores = []
-            
-            for report in reports:
-                # Extract only scores using regex
-                scores = {
-                    'focus_score': int(re.search(r'\| FOCUS SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| FOCUS SCORE \| (\d+) \|', report) else None,
-                    'motivation_score': int(re.search(r'\| MOTIVATION SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| MOTIVATION SCORE \| (\d+) \|', report) else None,
-                    'efficacy_score': int(re.search(r'\| EFFICACY SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| EFFICACY SCORE \| (\d+) \|', report) else None,
-                    'honesty_score': int(re.search(r'\| HONESTY SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| HONESTY SCORE \| (\d+) \|', report) else None
-                }
-                all_scores.append(scores)
-            
-            return all_scores
-        
-        async_output_df1['score_breakdown']=async_output_df1['choices__message__content'].apply(lambda x: extract_scores(x)[0])
-        async_output_df2['score_breakdown']=async_output_df2['choices__message__content'].apply(lambda x: extract_scores(x)[0])
-        for xscore in ['focus_score','motivation_score','efficacy_score','honesty_score']:
-            async_output_df1[xscore]=async_output_df1['score_breakdown'].apply(lambda x: x[xscore])
-            async_output_df2[xscore]=async_output_df2['score_breakdown'].apply(lambda x: x[xscore])
-        score_components = pd.concat([async_output_df1[['focus_score','motivation_score','efficacy_score','honesty_score','internal_name']],
-                async_output_df2[['focus_score','motivation_score','efficacy_score','honesty_score','internal_name']]]).groupby('internal_name').mean()
-        score_components.columns=['focus','motivation','efficacy','honesty']
-        score_components['total_qualitative_score']= score_components[['focus','motivation','efficacy','honesty']].mean(1)
-        final_score_frame = pd.concat([top_score_frame,score_components],axis=1)
-        final_score_frame['total_qualitative_score']=final_score_frame['total_qualitative_score'].fillna(50)
-        final_score_frame['reward_percentile']=((final_score_frame['quant_score']*33)+100)/2
-        final_score_frame['overall_score']= (final_score_frame['reward_percentile']*.7)+(final_score_frame['total_qualitative_score']*.3)
-        final_leaderboard = final_score_frame[['account_name','total_rewards','yellow_flag_pct','reward_percentile','focus','motivation','efficacy','honesty','total_qualitative_score','overall_score']].copy()
-        final_leaderboard['total_rewards']=final_leaderboard['total_rewards'].apply(lambda x: int(x))
-        final_leaderboard.index.name = 'Foundation Node Leaderboard as of '+datetime.datetime.now().strftime('%Y-%m-%d')
-        return final_leaderboard
-
-    # TODO: Refactor, add documentation and move to a different module
-    def format_and_write_leaderboard(self):
-        """ This loads the current leaderboard df and writes it""" 
-        def format_leaderboard_df(df):
-            """
-            Format the leaderboard DataFrame with cleaned up number formatting
-            
-            Args:
-                df: pandas DataFrame with the leaderboard data
-            Returns:
-                formatted DataFrame with cleaned up number display
-            """
-            # Create a copy to avoid modifying the original
-            formatted_df = df.copy()
-            
-            # Format total_rewards as whole numbers with commas
-            def format_number(x):
-                try:
-                    # Try to convert directly to int
-                    return f"{int(x):,}"
-                except ValueError:
-                    # If already formatted with commas, remove them and convert
-                    try:
-                        return f"{int(str(x).replace(',', '')):,}"
-                    except ValueError:
-                        return str(x)
-            
-            formatted_df['total_rewards'] = formatted_df['total_rewards'].apply(format_number)
-            
-            # Format yellow_flag_pct as percentage with 1 decimal place
-            def format_percentage(x):
-                try:
-                    if pd.notnull(x):
-                        # Remove % if present and convert to float
-                        x_str = str(x).replace('%', '')
-                        value = float(x_str)
-                        if value > 1:  # Already in percentage form
-                            return f"{value:.1f}%"
-                        else:  # Convert to percentage
-                            return f"{value*100:.1f}%"
-                    return "0%"
-                except ValueError:
-                    return str(x)
-            
-            formatted_df['yellow_flag_pct'] = formatted_df['yellow_flag_pct'].apply(format_percentage)
-            
-            # Format reward_percentile with 1 decimal place
-            def format_float(x):
-                try:
-                    return f"{float(str(x).replace(',', '')):,.1f}"
-                except ValueError:
-                    return str(x)
-            
-            formatted_df['reward_percentile'] = formatted_df['reward_percentile'].apply(format_float)
-            
-            # Format score columns with 1 decimal place
-            score_columns = ['focus', 'motivation', 'efficacy', 'honesty', 'total_qualitative_score']
-            for col in score_columns:
-                formatted_df[col] = formatted_df[col].apply(lambda x: f"{float(x):.1f}" if pd.notnull(x) and x != 'N/A' else "N/A")
-            
-            # Format overall_score with 1 decimal place
-            formatted_df['overall_score'] = formatted_df['overall_score'].apply(format_float)
-            
-            return formatted_df
-        
-        # def test_leaderboard_creation(leaderboard_df, output_path="test_leaderboard.png"):
-        #     """
-        #     Test function to create leaderboard image from a DataFrame
-        #     """
-        #     import plotly.graph_objects as go
-        #     from datetime import datetime
-            
-        #     # Format the DataFrame first
-        #     formatted_df = format_leaderboard_df(leaderboard_df)
-            
-        #     # Format current date
-        #     current_date = datetime.now().strftime("%Y-%m-%d")
-            
-        #     # Add rank and get the index
-        #     wallet_addresses = formatted_df.index.tolist()  # Get addresses from index
-            
-        #     # Define column headers with line breaks and widths
-        #     headers = [
-        #         'Rank',
-        #         'Wallet Address',
-        #         'Account<br>Name', 
-        #         'Total<br>Rewards', 
-        #         'Yellow<br>Flag %', 
-        #         'Reward<br>Percentile',
-        #         'Focus',
-        #         'Motivation',
-        #         'Efficacy',
-        #         'Honesty',
-        #         'Total<br>Qualitative',
-        #         'Overall<br>Score'
-        #     ]
-            
-        #     # Custom column widths
-        #     column_widths = [30, 140, 80, 60, 60, 60, 50, 50, 50, 50, 60, 60]
-            
-        #     # Prepare values with rank column and wallet addresses
-        #     values = [
-        #         [str(i+1) for i in range(len(formatted_df))],  # Rank
-        #         wallet_addresses,  # Full wallet address from index
-        #         formatted_df['account_name'],
-        #         formatted_df['total_rewards'],
-        #         formatted_df['yellow_flag_pct'],
-        #         formatted_df['reward_percentile'],
-        #         formatted_df['focus'],
-        #         formatted_df['motivation'],
-        #         formatted_df['efficacy'],
-        #         formatted_df['honesty'],
-        #         formatted_df['total_qualitative_score'],
-        #         formatted_df['overall_score']
-        #     ]
-            
-        #     # Create figure
-        #     fig = go.Figure(data=[go.Table(
-        #         columnwidth=column_widths,
-        #         header=dict(
-        #             values=headers,
-        #             fill_color='#000000',  # Changed to black
-        #             font=dict(color='white', size=15),
-        #             align=['center'] * len(headers),
-        #             height=60,
-        #             line=dict(width=1, color='#40444b')
-        #         ),
-        #         cells=dict(
-        #             values=values,
-        #             fill_color='#000000',  # Changed to black
-        #             font=dict(color='white', size=14),
-        #             align=['left', 'left'] + ['center'] * (len(headers)-2),
-        #             height=35,
-        #             line=dict(width=1, color='#40444b')
-        #         )
-        #     )])
-            
-        #     # Update layout
-        #     fig.update_layout(
-        #         width=1800,
-        #         height=len(formatted_df) * 35 + 100,
-        #         margin=dict(l=20, r=20, t=40, b=20),
-        #         paper_bgcolor='#000000',  # Changed to black
-        #         plot_bgcolor='#000000',  # Changed to black
-        #         title=dict(
-        #             text=f"Foundation Node Leaderboard as of {current_date} (30D Rolling)",
-        #             font=dict(color='white', size=20),
-        #             x=0.5
-        #         )
-        #     )
-            
-        #     # Save as image with higher resolution
-        #     fig.write_image(output_path, scale=2)
-            
-        #     logger.debug(f"Leaderboard image saved to: {output_path}")
-            
-        #     try:
-        #         from IPython.display import Image
-        #         return Image(filename=output_path)
-        #     except:
-        #         return None
-        # leaderboard_df = self.output_postfiat_foundation_node_leaderboard_df()
-        # test_leaderboard_creation(leaderboard_df=format_leaderboard_df(leaderboard_df))
-
-    # # TODO: Consider deprecating, not used anywhere
-    # def get_full_google_text_and_verification_stub_for_account(self,address_to_work = 'rwmzXrN3Meykp8pBd3Boj1h34k8QGweUaZ'):
-
-    #     memo_history = self.get_account_memo_history(account_address=address_to_work)
-    #     google_acount = self.get_most_recent_google_doc_for_user(account_memo_detail_df
-    #                                                                             =memo_history, 
-    #                                                                             address=address_to_work)
-    #     user_full_google_acccount = self.generic_pft_utilities.get_google_doc_text(share_link=google_acount)
-    #     #verification #= user_full_google_acccount.split('VERIFICATION SECTION START')[-1:][0].split('VERIFICATION SECTION END')[0]
-        
-    #     import re
-        
-    #     def extract_verification_text(content):
-    #         """
-    #         Extracts text between task verification markers.
-            
-    #         Args:
-    #             content (str): Input text containing verification sections
-                
-    #         Returns:
-    #             str: Extracted text between markers, or empty string if no match
-    #         """
-    #         pattern = r'TASK VERIFICATION SECTION START(.*?)TASK VERIFICATION SECTION END'
-            
-    #         try:
-    #             # Use re.DOTALL to make . match newlines as well
-    #             match = re.search(pattern, content, re.DOTALL)
-    #             return match.group(1).strip() if match else ""
-    #         except Exception as e:
-    #             logger.error(f"GenericPFTUtilities.extract_verification_text: Error extracting text: {e}")
-    #             return ""
-    #     xstr =extract_verification_text(user_full_google_acccount)
-    #     return {'verification_text': xstr, 'full_google_doc': user_full_google_acccount}
-
-    def get_account_pft_balance(self, account_address: str) -> float:
-        """
-        Get the PFT balance for a given account address.
-        Returns the balance as a float, or 0.0 if no PFT trustline exists or on error.
-        
-        Args:
-            account_address (str): The XRPL account address to check
-            
-        Returns:
-            float: The PFT balance for the account
-        """
-        client = JsonRpcClient(self.https_url)
-        try:
-            account_lines = AccountLines(
-                account=account_address,
-                ledger_index="validated"
-            )
-            account_line_response = client.request(account_lines)
-            pft_lines = [i for i in account_line_response.result['lines'] 
-                        if i['account'] == self.pft_issuer]
-            
-            if pft_lines:
-                return float(pft_lines[0]['balance'])
-            return 0.0
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities.get_account_pft_balance: Error getting PFT balance for {account_address}: {str(e)}")
-            return 0.0

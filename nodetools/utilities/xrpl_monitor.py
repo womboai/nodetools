@@ -156,10 +156,10 @@ class XRPLWebSocketMonitor:
         """Process transaction updates from websocket"""
         try:
 
-            logger.debug(f"Processing transaction update: {tx_message}")
+            logger.debug(f"XRPLWebSocketMonitor: Received transaction, storing in database: {tx_message}")
 
-            # First store the transaction in the cache
-            if self.transaction_repository.store_transaction(tx_message):
+            # First insert the transaction into the cache
+            if await self.transaction_repository.insert_transaction(tx_message):
                 # Retrieve the complete transaction record from the database
                 # to ensure consistent format, which includes decoded memo fields
                 tx = await self.transaction_repository.get_unverified_transactions(limit=1)

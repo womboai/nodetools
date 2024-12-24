@@ -1,30 +1,23 @@
 CREATE TABLE IF NOT EXISTS postfiat_tx_cache (
-    close_time_iso VARCHAR(255),
     hash VARCHAR(255) PRIMARY KEY,
-    ledger_hash VARCHAR(255),
     ledger_index BIGINT,
+    close_time_iso VARCHAR(255),
     meta TEXT,
     tx_json TEXT,
-    validated BOOLEAN,
-    account VARCHAR(255),
-    delivermax TEXT,
-    destination VARCHAR(255),
-    fee VARCHAR(20),
-    flags FLOAT,
-    lastledgersequence BIGINT,
-    sequence BIGINT,
-    signingpubkey TEXT,
-    transactiontype VARCHAR(50),
-    txnsignature TEXT,
-    date BIGINT,
-    memos TEXT
+    validated BOOLEAN
 );
 
 CREATE TABLE IF NOT EXISTS transaction_memos (
     hash VARCHAR(255) PRIMARY KEY,
+    account VARCHAR(255),
+    destination VARCHAR(255),
+    pft_amount NUMERIC,
+    xrp_fee NUMERIC,
     memo_format TEXT DEFAULT '',
     memo_type TEXT DEFAULT '',
     memo_data TEXT DEFAULT '',
+    transaction_time TIMESTAMP,
+    transaction_result VARCHAR(50),
     FOREIGN KEY (hash) REFERENCES postfiat_tx_cache(hash)
         ON DELETE CASCADE
 );
@@ -35,6 +28,6 @@ CREATE TABLE IF NOT EXISTS transaction_processing_results (
     rule_name VARCHAR(255),
     response_tx_hash VARCHAR(255),
     notes TEXT,
-    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    reviewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (hash) REFERENCES postfiat_tx_cache(hash)
 );

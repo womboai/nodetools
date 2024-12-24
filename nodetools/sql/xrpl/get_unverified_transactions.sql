@@ -4,7 +4,7 @@ SELECT
     p.rule_name,
     p.response_tx_hash,
     p.notes,
-    p.processed_at
+    p.reviewed_at
 FROM decoded_memos m
 LEFT JOIN transaction_processing_results p ON m.hash = p.hash
 WHERE 

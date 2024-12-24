@@ -1,11 +1,5 @@
-CREATE TABLE IF NOT EXISTS foundation_discord (
+CREATE TABLE IF NOT EXISTS discord_notifications (
     hash VARCHAR(255) PRIMARY KEY,
-    memo_data TEXT,
-    memo_type VARCHAR(255),
-    memo_format VARCHAR(255),
-    datetime TIMESTAMP,
-    url TEXT,
-    directional_pft FLOAT,
-    account VARCHAR(255),
-    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    notified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (hash) REFERENCES postfiat_tx_cache(hash)
 );

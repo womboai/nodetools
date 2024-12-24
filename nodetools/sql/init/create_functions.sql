@@ -66,20 +66,38 @@ BEGIN
     IF (NEW.tx_json::jsonb->'Memos') IS NOT NULL THEN
         INSERT INTO transaction_memos (
             hash,
+            account,
+            destination,
+            pft_amount,
+            xrp_fee,
             memo_format,
             memo_type,
-            memo_data
+            memo_data,
+            transaction_time,
+            transaction_result
         ) VALUES (
             NEW.hash,
+            (NEW.tx_json::jsonb->>'Account'),
+            (NEW.tx_json::jsonb->>'Destination'),
+            NULLIF((NEW.meta::jsonb->'delivered_amount'->>'value')::NUMERIC, 0),
+            NULLIF((NEW.tx_json::jsonb->>'Fee')::NUMERIC, 0) / 1000000,
             decode_hex_memo((NEW.tx_json::jsonb->'Memos'->0->'Memo'->>'MemoFormat')),
             decode_hex_memo((NEW.tx_json::jsonb->'Memos'->0->'Memo'->>'MemoType')),
-            decode_hex_memo((NEW.tx_json::jsonb->'Memos'->0->'Memo'->>'MemoData'))
+            decode_hex_memo((NEW.tx_json::jsonb->'Memos'->0->'Memo'->>'MemoData')),
+            (NEW.close_time_iso::timestamp),
+            (NEW.meta::jsonb->>'TransactionResult')
         )
         ON CONFLICT (hash) 
         DO UPDATE SET
+            account = EXCLUDED.account,
+            destination = EXCLUDED.destination,
+            pft_amount = EXCLUDED.pft_amount,
+            xrp_fee = EXCLUDED.xrp_fee,
             memo_format = EXCLUDED.memo_format,
             memo_type = EXCLUDED.memo_type,
-            memo_data = EXCLUDED.memo_data;
+            memo_data = EXCLUDED.memo_data,
+            transaction_time = EXCLUDED.transaction_time,
+            transaction_result = EXCLUDED.transaction_result;
     END IF;
 
     RETURN NEW;

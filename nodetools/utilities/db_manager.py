@@ -2,11 +2,13 @@ import sqlalchemy
 import psycopg2
 from nodetools.utilities.credentials import CredentialManager
 from loguru import logger
+import asyncpg
 
 class DBConnectionManager:
     ''' supports 1 database for the collective and one for the user'''
     _instance = None
     _initialized = False
+    _pool = None
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -37,3 +39,16 @@ class DBConnectionManager:
         db_name = db_connstring.split('/')[-1:][0]
         psycop_conn = psycopg2.connect(user=db_user, password=db_password, host=db_host, database=db_name)
         return psycop_conn
+    
+    async def get_pool(self, username):
+        """Get or create connection pool for the specified user"""
+        if self._pool is None:
+            db_connstring = self.credential_manager.get_credential(f'{username}_postgresconnstring')
+            self._pool = await asyncpg.create_pool(db_connstring)
+        return self._pool
+
+    async def close(self):
+        """Close the connection pool"""
+        if self._pool:
+            await self._pool.close()
+            self._pool = None

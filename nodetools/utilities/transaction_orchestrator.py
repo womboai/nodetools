@@ -22,6 +22,7 @@ from nodetools.configuration.configuration import NodeConfig
 from nodetools.task_processing.task_management_rules import create_business_logic, BusinessLogicProvider
 import traceback
 import time
+from datetime import datetime
 
 def format_duration(seconds: float) -> str:
     """Format a duration in H:m:s format"""
@@ -30,8 +31,8 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 @dataclass
-class ProcessingResult:
-    """Represents the outcome of processing a single transaction"""
+class ReviewingResult:
+    """Represents the outcome of reviewing a single transaction"""
     processed: bool
     rule_name: str
     response_tx_hash: Optional[str] = None
@@ -48,19 +49,30 @@ class TransactionReviewer:
         self.pattern_rule_map = business_logic.pattern_rule_map
         self.repository = repository
 
-    async def review_transaction(self, tx: Dict[str, Any]) -> ProcessingResult:
+    async def review_transaction(self, tx: Dict[str, Any]) -> ReviewingResult:
         """Review a single transaction against all rules"""
 
-        logger.debug(f"Reviewing transaction {tx.get('hash')}: {tx}")
-        logger.debug(f"Transaction memo_type: {tx.get('memo_type')}")
+        # logger.debug(f"Reviewing transaction {tx}")
+
+        # tx_summary = {
+        #     'hash': tx.get('hash'),
+        #     'pft_amount': tx.get('pft_absolute_amount'),
+        #     'xrp_fee': int(tx.get('fee', '0'))/1000000,  # Convert drops to XRP
+        #     'account': tx.get('account'),
+        #     'destination': tx.get('destination'),
+        #     'memo_format': tx.get('memo_format'),
+        #     'memo_type': tx.get('memo_type'),
+        #     'memo_data': tx.get('memo_data')
+        # }
+        # logger.debug(f"Reviewing transaction: {tx_summary}")
 
         # First find matching pattern
         pattern_id = self.graph.find_matching_pattern(tx)
 
-        logger.debug(f"Found matching pattern_id: {pattern_id}")
+        # logger.debug(f"Found matching pattern_id: {pattern_id}")
 
         if not pattern_id:
-            return ProcessingResult(
+            return ReviewingResult(
                 processed=True,  # We've reviewed it and found no matching pattern
                 rule_name="NoRule",
                 notes="No matching pattern found"
@@ -68,13 +80,13 @@ class TransactionReviewer:
         
         pattern = self.graph.patterns[pattern_id]
 
-        logger.debug(f"Found pattern: {pattern}")
+        # logger.debug(f"Found pattern: {pattern}")
 
         # Get the corresponding rule for this pattern
         rule = self.pattern_rule_map[pattern_id]
         if not rule:
             logger.error(f"No rule found for pattern_id: {pattern_id}")
-            return ProcessingResult(
+            return ReviewingResult(
                 processed=True,
                 rule_name="NoRule",
                 notes=f"No rule found for pattern {pattern_id}"
@@ -84,15 +96,15 @@ class TransactionReviewer:
 
             if await rule.validate(tx):  # Pure business rule validation
                 
-                logger.debug(f"Rule {rule.__class__.__name__} validated transaction")
+                # logger.debug(f"Rule {rule.__class__.__name__} validated transaction")
 
                 # Process based on the pattern's transaction type
                 match pattern.transaction_type:
                     # Response or standalone transactions don't need responses
                     case TransactionType.RESPONSE | TransactionType.STANDALONE:
-                        logger.debug(f"Processed {pattern.transaction_type.value} transaction")
+                        # logger.debug(f"Processed '{pattern.transaction_type.value}' transaction. No action required.")
 
-                        return ProcessingResult(
+                        return ReviewingResult(
                             processed=True, 
                             rule_name=rule.__class__.__name__,
                             notes=f"Processed {pattern.transaction_type.value} transaction"
@@ -108,25 +120,25 @@ class TransactionReviewer:
                         )
                         response_tx = result[0] if result else None
 
-                        logger.debug(f"Response query for rule {rule.__class__.__name__}: {response_query.query}")
-                        logger.debug(f"Response params for rule {rule.__class__.__name__}: {response_query.params}")
+                        # logger.debug(f"Response query for rule {rule.__class__.__name__}: {response_query.query}")
+                        # logger.debug(f"Response params for rule {rule.__class__.__name__}: {response_query.params}")
 
                         if not response_tx:
 
                             # DEBUGGING
-                            logger.debug(f"No response found for tx {tx['hash']} using rule {rule.__class__.__name__}")
+                            # logger.debug(f"No response found for tx {tx['hash']} using rule {rule.__class__.__name__}. Marking as unprocessed.")
 
-                            return ProcessingResult(
+                            return ReviewingResult(
                                 processed=False,  # We've reviewed it and found no response
                                 rule_name=rule.__class__.__name__,
                                 notes="Required response not found",
                                 needs_rereview=True
                             )
 
-                        logger.debug(f"Response found for tx {tx['hash']} using rule {rule.__class__.__name__}")
+                        # logger.debug(f"Response found for tx {tx['hash']} using rule {rule.__class__.__name__}. No action required.")
 
                         # 5. Response found
-                        return ProcessingResult(
+                        return ReviewingResult(
                             processed=True,  # We've reviewed it and found the required response
                             rule_name=rule.__class__.__name__,
                             response_tx_hash=response_tx.get("hash"),
@@ -135,9 +147,9 @@ class TransactionReviewer:
                     
             else:
                 # Rule validation failed
-                logger.debug(f"Rule {rule.__class__.__name__} failed validation for transaction {tx['hash']}")
+                # logger.debug(f"Rule {rule.__class__.__name__} failed validation for transaction {tx['hash']}. No action required.")
 
-                return ProcessingResult(
+                return ReviewingResult(
                     processed=True,  # We've reviewed it and determined it failed validation
                     rule_name=rule.__class__.__name__,
                     notes=f"Failed validation for rule {rule.__class__.__name__}"
@@ -450,7 +462,7 @@ class ResponseProcessor:
             )
 
         except Exception as e:
-            logger.error(f"BaseConsumer._process_transaction: Error processing transaction: {e}")
+            logger.error(f"ResponseProcessor._process_transaction: Error processing transaction: {e}")
             logger.error(traceback.format_exc())
             return False
 
@@ -626,6 +638,7 @@ class TransactionOrchestrator:
         last_activity_time = time.time()
         LOG_INTERVAL = 60  # Log progress every minute
         IDLE_LOG_INTERVAL = 300  # Log idle status every 5 minutes
+        COUNT_LOG_INTERVAL = 100  # Log count every 100 transactions
 
         try:
             while not self._shutdown_event.is_set():
@@ -634,25 +647,34 @@ class TransactionOrchestrator:
                     tx = await asyncio.wait_for(self.review_queue.get(), timeout=IDLE_LOG_INTERVAL)
                     
                     result = await self.reviewer.review_transaction(tx)
-                    await self.transaction_repository.store_processing_result(tx['hash'], result)
+                    await self.transaction_repository.store_reviewing_result(tx['hash'], result)
                     reviewed_count += 1
                     last_activity_time = time.time()
 
                     # If transaction needs a response, add to processing queue
                     if not result.processed:
+                        logger.debug(f"TransactionOrchestrator: Transaction {tx['hash']} needs a response. Adding to routing queue.")
                         await self.routing_queue.put(tx)
+
+                    # Check if queue just became empty
+                    queue_size = self.review_queue.qsize()
+                    if queue_size == 0:
+                        logger.info(f"Finished reviewing. Total transactions reviewed: {reviewed_count}")
+
+                    if reviewed_count % COUNT_LOG_INTERVAL == 0:
+                        logger.debug(f"Progress: {reviewed_count} transactions reviewed. Current queue size: {queue_size}")
 
                     # Log progress if interval elapsed
                     current_time = time.time()
                     if current_time - last_log_time > LOG_INTERVAL:
                         queue_size = self.review_queue.qsize()
-                        logger.info(f"TransactionOrchestrator: Progress: {reviewed_count} transactions reviewed. Current queue size: {queue_size}")
+                        logger.debug(f"TransactionOrchestrator: Progress: {reviewed_count} transactions reviewed. Current queue size: {queue_size}")
                         last_log_time = current_time
 
                 except asyncio.TimeoutError:
                     current_time = time.time()
                     idle_duration = current_time - last_activity_time
-                    logger.info(f"TransactionOrchestrator: Review loop idle for {format_duration(idle_duration)}. Total reviewed: {reviewed_count}")
+                    logger.debug(f"TransactionOrchestrator: Review loop idle for {format_duration(idle_duration)}. Total reviewed: {reviewed_count}")
                     continue
                     
                 except Exception as e:
@@ -668,6 +690,7 @@ class TransactionOrchestrator:
         last_activity_time = time.time()
         LOG_INTERVAL = 60  # Log progress every minute
         IDLE_LOG_INTERVAL = 300  # Log idle status every 5 minutes
+        ROUTE_LOG_INTERVAL = 100  # Log count every 100 transactions
 
         try:
             while not self._shutdown_event.is_set():
@@ -681,13 +704,22 @@ class TransactionOrchestrator:
                         routed_count += 1
                         last_activity_time = time.time()
 
+                    # Log progress by count
+                    queue_size = self.routing_queue.qsize()
+                    if queue_size == 0:
+                        logger.debug(f"Finished routing. Total routed: {routed_count}")
+
+                    if routed_count % ROUTE_LOG_INTERVAL == 0:
+                        queue_size = self.routing_queue.qsize()
+                        logger.debug(f"TransactionOrchestrator: Progress: {routed_count} transactions routed. Current queue size: {queue_size}")
+
                     # Log progress if interval elapsed
                     current_time = time.time()
                     if current_time - last_log_time > LOG_INTERVAL:
                         queue_size = self.routing_queue.qsize()
                         pending_count = len(self.response_manager.pending_responses)
                         response_queue_sizes = self.response_manager.get_queue_sizes()
-                        logger.info(
+                        logger.debug(
                             f"TransactionOrchestrator: Progress update:\n"
                             f"  - Total routed: {routed_count}\n"
                             f"  - Routing queue size: {queue_size}\n"
@@ -700,7 +732,7 @@ class TransactionOrchestrator:
                     current_time = time.time()
                     idle_duration = current_time - last_activity_time
                     pending_count = len(self.response_manager.pending_responses)
-                    logger.info(
+                    logger.debug(
                         f"TransactionOrchestrator: Process loop idle for {format_duration(idle_duration)}.\n"
                         f"  - Total routed: {routed_count}\n"
                         f"  - Pending responses: {pending_count}"
@@ -727,6 +759,6 @@ class TransactionOrchestrator:
 
     def stop(self):
         """Stop all transaction processing tasks"""
-        logger.info("TransactionOrchestrator: Stopping all transaction processing tasks")
+        logger.debug("TransactionOrchestrator: Stopping all transaction processing tasks")
         self._shutdown_event.set()
 

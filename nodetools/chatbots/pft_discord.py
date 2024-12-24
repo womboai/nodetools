@@ -6,6 +6,7 @@ from nodetools.ai.openai import OpenAIRequestTool
 from nodetools.utilities.credentials import CredentialManager
 from nodetools.utilities.generic_pft_utilities import *
 from nodetools.task_processing.task_management import PostFiatTaskGenerationSystem
+from nodetools.task_processing.constants import TaskType
 from nodetools.utilities.generic_pft_utilities import GenericPFTUtilities
 from nodetools.chatbots.personas.odv import odv_system_prompt
 from nodetools.performance.monitor import PerformanceMonitor
@@ -1100,8 +1101,8 @@ class MyClient(discord.Client):
             
             try:
                 # Generate and format the leaderboard
-                leaderboard_df = generic_pft_utilities.output_postfiat_foundation_node_leaderboard_df()
-                generic_pft_utilities.format_and_write_leaderboard()
+                leaderboard_df = self.output_postfiat_foundation_node_leaderboard_df()
+                self.format_and_write_leaderboard()
                 
                 embed = discord.Embed(
                     title="Post Fiat Foundation Node Leaderboard 🏆",
@@ -1542,7 +1543,7 @@ class MyClient(discord.Client):
             accepted_tasks = pf_df[
                 (pf_df['acceptance'] != '') & 
                 ~pf_df.index.isin(memo_history[
-                    memo_history['memo_data'].str.contains(global_constants.TaskType.VERIFICATION_PROMPT.value, na=False)
+                    memo_history['memo_data'].str.contains(TaskType.VERIFICATION_PROMPT.value, na=False)
                 ]['memo_type'].unique())
             ].copy()
             
@@ -2263,7 +2264,7 @@ Note: XRP wallets need 15 XRP to transact.
         await self.wait_until_ready()
         while not self.is_closed():
             await self.check_and_notify_new_transactions()
-            await asyncio.sleep(15)  # Check every 60 seconds
+            await asyncio.sleep(15)  # Check every 15 seconds
 
     async def death_march_reminder(self):
         await self.wait_until_ready()
@@ -2392,7 +2393,7 @@ Note: XRP wallets need 15 XRP to transact.
                     wallet_address = user_wallet.classic_address
 
                     # Check PFT balance
-                    pft_balance = self.generic_pft_utilities.get_account_pft_balance(wallet_address)
+                    pft_balance = self.fetch_pft_balance(wallet_address)
                     logger.debug(f"MyClient.coach: PFT balance for {message.author.name} is {pft_balance}")
                     if not (config.RuntimeConfig.USE_TESTNET and config.RuntimeConfig.DISABLE_PFT_REQUIREMENTS):
                         if pft_balance < 25000:
@@ -2917,10 +2918,10 @@ My specific question/request is: {user_query}"""
 
         # Get original requests and proposals
         task_requests = all_account_info[
-            all_account_info['memo_data'].apply(lambda x: global_constants.TaskType.REQUEST_POST_FIAT.value in x)
+            all_account_info['memo_data'].apply(lambda x: TaskType.REQUEST_POST_FIAT.value in x)
         ].groupby('memo_type').first()['memo_data']
 
-        proposal_patterns = global_constants.TASK_PATTERNS[global_constants.TaskType.PROPOSAL]
+        proposal_patterns = TASK_PATTERNS[TaskType.PROPOSAL]
         task_proposals = all_account_info[
             all_account_info['memo_data'].apply(lambda x: any(pattern in str(x) for pattern in proposal_patterns))
         ].groupby('memo_type').first()['memo_data']
@@ -2975,12 +2976,297 @@ My specific question/request is: {user_query}"""
             reward_str += f"Request: {row['request']}\n"
             reward_str += f"Proposal: {row['proposal']}\n"
             reward_str += f"Reward: {row['directional_pft']} PFT\n"
-            reward_str += f"Response: {row['memo_data'].replace(global_constants.TaskType.REWARD.value, '')}\n"
+            reward_str += f"Response: {row['memo_data'].replace(TaskType.REWARD.value, '')}\n"
             reward_str += "-" * 50  # Separator
             formatted_rewards.append(reward_str)
         
         output_string = "REWARD SUMMARY\n\n" + "\n".join(formatted_rewards)
         return output_string
+
+    def fetch_pft_balance(self, account_address: str) -> float:
+        """
+        Get the PFT balance for a given account address.
+        Returns the balance as a float, or 0.0 if no PFT trustline exists or on error.
+        
+        Args:
+            account_address (str): The XRPL account address to check
+            
+        Returns:
+            float: The PFT balance for the account
+        """
+        client = JsonRpcClient(self.generic_pft_utilities.https_url)
+        try:
+            account_lines = AccountLines(
+                account=account_address,
+                ledger_index="validated"
+            )
+            account_line_response = client.request(account_lines)
+            pft_lines = [i for i in account_line_response.result['lines'] 
+                        if i['account'] == self.generic_pft_utilities.pft_issuer]
+            
+            if pft_lines:
+                return float(pft_lines[0]['balance'])
+            return 0.0
+        except Exception as e:
+            logger.error(f"GenericPFTUtilities.get_account_pft_balance: Error getting PFT balance for {account_address}: {str(e)}")
+            return 0.0
+        
+    def get_all_transactions_for_active_wallets(self):
+        """Get all transactions for active post fiat wallets (balance <= -2000)"""
+        active_wallets = [
+            account for account, data in self.generic_pft_utilities.get_pft_holders().items()
+            if float(data['balance']) <= -2000
+        ]
+        
+        transactions = self.generic_pft_utilities.transaction_repository.get_active_wallet_transactions(active_wallets)
+        
+        return pd.DataFrame(transactions)
+
+    def get_all_account_pft_memo_data(self):
+        """Get all PFT memo data for computation of leaderboard."""
+        all_transactions = self.get_all_transactions_for_active_wallets()
+        
+        if all_transactions.empty:
+            return pd.DataFrame()
+
+        # Filter for transactions with memos and non-zero PFT amounts
+        memo_transactions = all_transactions[
+            (all_transactions['memo_type'].notna()) & 
+            (all_transactions['pft_amount'] != 0)
+        ].copy()
+
+
+        # Convert and clean up datetime
+        memo_transactions['datetime'] = pd.to_datetime(
+            memo_transactions['close_time_iso']
+        ).dt.tz_localize(None)
+        
+        memo_transactions['simple_date'] = memo_transactions['datetime'].dt.strftime('%Y-%m-%d')
+        memo_transactions['simple_date'] = pd.to_datetime(memo_transactions['simple_date'])
+
+        return memo_transactions
+
+    def format_and_write_leaderboard(self):
+        """ This loads the current leaderboard df and writes it"""
+
+        def format_leaderboard_df(df):
+            """
+            Format the leaderboard DataFrame with cleaned up number formatting
+            
+            Args:
+                df: pandas DataFrame with the leaderboard data
+            Returns:
+                formatted DataFrame with cleaned up number display
+            """
+            # Create a copy to avoid modifying the original
+            formatted_df = df.copy()
+            
+            # Format total_rewards as whole numbers with commas
+            def format_number(x):
+                try:
+                    # Try to convert directly to int
+                    return f"{int(x):,}"
+                except ValueError:
+                    # If already formatted with commas, remove them and convert
+                    try:
+                        return f"{int(str(x).replace(',', '')):,}"
+                    except ValueError:
+                        return str(x)
+            
+            formatted_df['total_rewards'] = formatted_df['total_rewards'].apply(format_number)
+            
+            # Format yellow_flag_pct as percentage with 1 decimal place
+            def format_percentage(x):
+                try:
+                    if pd.notnull(x):
+                        # Remove % if present and convert to float
+                        x_str = str(x).replace('%', '')
+                        value = float(x_str)
+                        if value > 1:  # Already in percentage form
+                            return f"{value:.1f}%"
+                        else:  # Convert to percentage
+                            return f"{value*100:.1f}%"
+                    return "0%"
+                except ValueError:
+                    return str(x)
+            
+            formatted_df['yellow_flag_pct'] = formatted_df['yellow_flag_pct'].apply(format_percentage)
+            
+            # Format reward_percentile with 1 decimal place
+            def format_float(x):
+                try:
+                    return f"{float(str(x).replace(',', '')):,.1f}"
+                except ValueError:
+                    return str(x)
+            
+            formatted_df['reward_percentile'] = formatted_df['reward_percentile'].apply(format_float)
+            
+            # Format score columns with 1 decimal place
+            score_columns = ['focus', 'motivation', 'efficacy', 'honesty', 'total_qualitative_score']
+            for col in score_columns:
+                formatted_df[col] = formatted_df[col].apply(lambda x: f"{float(x):.1f}" if pd.notnull(x) and x != 'N/A' else "N/A")
+            
+            # Format overall_score with 1 decimal place
+            formatted_df['overall_score'] = formatted_df['overall_score'].apply(format_float)
+            
+            return formatted_df
+        
+    def output_postfiat_foundation_node_leaderboard_df(self):
+        """ This generates the full Post Fiat Foundation Leaderboard """ 
+        all_accounts = self.get_all_account_pft_memo_data()
+        # Get the mode (most frequent) memo_format for each account
+        account_modes = all_accounts.groupby('account')['memo_format'].agg(lambda x: x.mode()[0]).reset_index()
+        # If you want to see the counts as well to verify
+        account_counts = all_accounts.groupby(['account', 'memo_format']).size().reset_index(name='count')
+        
+        # Sort by account for readability
+        account_modes = account_modes.sort_values('account')
+        account_name_map = account_modes.groupby('account').first()['memo_format']
+        past_month_transactions = all_accounts[all_accounts['datetime']>datetime.datetime.now()-datetime.timedelta(30)]
+        node_transactions = past_month_transactions[past_month_transactions['account']==self.generic_pft_utilities.node_address].copy()
+        rewards_only=node_transactions[node_transactions['memo_data'].apply(lambda x: TaskType.REWARD.value in str(x))].copy()
+        rewards_only['count']=1
+        rewards_only['PFT']=rewards_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float)
+        account_to_yellow_flag__count = rewards_only[rewards_only['memo_data'].apply(lambda x: 'YELLOW FLAG' in x)][['count','destination']].groupby('destination').sum()['count']
+        account_to_red_flag__count = rewards_only[rewards_only['memo_data'].apply(lambda x: 'RED FLAG' in x)][['count','destination']].groupby('destination').sum()['count']
+        
+        total_reward_number= rewards_only[['count','destination']].groupby('destination').sum()['count']
+        account_score_constructor = pd.DataFrame(account_name_map)
+        account_score_constructor=account_score_constructor[account_score_constructor.index!=self.generic_pft_utilities.node_address].copy()
+        account_score_constructor['reward_count']=total_reward_number
+        account_score_constructor['yellow_flags']=account_to_yellow_flag__count
+        account_score_constructor=account_score_constructor[['reward_count','yellow_flags']].fillna(0).copy()
+        account_score_constructor= account_score_constructor[account_score_constructor['reward_count']>=1].copy()
+        account_score_constructor['yellow_flag_pct']=account_score_constructor['yellow_flags']/account_score_constructor['reward_count']
+        total_pft_rewards= rewards_only[['destination','PFT']].groupby('destination').sum()['PFT']
+        account_score_constructor['red_flag']= account_to_red_flag__count
+        account_score_constructor['red_flag']=account_score_constructor['red_flag'].fillna(0)
+        account_score_constructor['total_rewards']= total_pft_rewards
+        account_score_constructor['reward_score__z']=(account_score_constructor['total_rewards']-account_score_constructor['total_rewards'].mean())/account_score_constructor['total_rewards'].std()
+        
+        account_score_constructor['yellow_flag__z']=(account_score_constructor['yellow_flag_pct']-account_score_constructor['yellow_flag_pct'].mean())/account_score_constructor['yellow_flag_pct'].std()
+        account_score_constructor['quant_score']=(account_score_constructor['reward_score__z']*.65)-(account_score_constructor['reward_score__z']*-.35)
+        top_score_frame = account_score_constructor[['total_rewards','yellow_flag_pct','quant_score']].sort_values('quant_score',ascending=False)
+        top_score_frame['account_name']=account_name_map
+        user_account_map = {}
+        for x in list(top_score_frame.index):
+            memo_history = self.generic_pft_utilities.get_account_memo_history(account_address=x)
+            user_account_string = self.user_task_parser.get_full_user_context_string(account_address=x, memo_history=memo_history)
+            logger.debug(x)
+            user_account_map[x]= user_account_string
+        agency_system_prompt = """ You are the Post Fiat Agency Score calculator.
+        
+        An Agent is a human or an AI that has outlined an objective.
+        
+        An agency score has four parts:
+        1] Focus - the extent to which an Agent is focused.
+        2] Motivation - the extent to which an Agent is driving forward predictably and aggressively towards goals.
+        3] Efficacy - the extent to which an Agent is likely completing high value tasks that will drive an outcome related to the inferred goal of the tasks.
+        4] Honesty - the extent to which a Subject is likely gaming the Post Fiat Agency system.
+        
+        It is very important that you deliver assessments of Agency Scores accurately and objectively in a way that is likely reproducible. Future Post Fiat Agency Score calculators will re-run this score, and if they get vastly different scores than you, you will be called into the supervisor for an explanation. You do not want this so you do your utmost to output clean, logical, repeatable values.
+        """ 
+        
+        agency_user_prompt="""USER PROMPT
+        
+        Please consider the activity slice for a single day provided below:
+        pft_transaction is how many transactions there were
+        pft_directional value is the PFT value of rewards
+        pft_absolute value is the bidirectional volume of PFT
+        
+        <activity slice>
+        __FULL_ACCOUNT_CONTEXT__
+        <activity slice ends>
+        
+        Provide one to two sentences directly addressing how the slice reflects the following Four scores (a score of 1 is a very low score and a score of 100 is a very high score):
+        1] Focus - the extent to which an Agent is focused.
+        A focused agent has laser vision on a couple key objectives and moves the ball towards it.
+        An unfocused agent is all over the place.
+        A paragon of focus is Steve Jobs, who is famous for focusing on the few things that really matter.
+        2] Motivation - the extent to which an Agent is driving forward predictably and aggressively towards goals.
+        A motivated agent is taking massive action towards objectives. Not necessarily focused but ambitious.
+        An unmotivated agent is doing minimal work.
+        A paragon of focus is Elon Musk, who is famous for his extreme work ethic and drive.
+        3] Efficacy - the extent to which an Agent is likely completing high value tasks that will drive an outcome related to the inferred goal of the tasks.
+        An effective agent is delivering maximum possible impact towards implied goals via actions.
+        An ineffective agent might be focused and motivated but not actually accomplishing anything.
+        A paragon of focus is Lionel Messi, who is famous for taking the minimal action to generate maximum results.
+        4] Honesty - the extent to which a Subject is likely gaming the Post Fiat Agency system.
+        
+        Then provide an integer score.
+        
+        Your output should be in the following format:
+        | FOCUS COMMENTARY | <1 to two sentences> |
+        | MOTIVATION COMMENTARY | <1 to two sentences> |
+        | EFFICACY COMMENTARY | <1 to two sentences> |
+        | HONESTY COMMENTARY | <one to two sentences> |
+        | FOCUS SCORE | <integer score from 1-100> |
+        | MOTIVATION SCORE | <integer score from 1-100> |
+        | EFFICACY SCORE | <integer score from 1-100> |
+        | HONESTY SCORE | <integer score from 1-100> |
+        """
+        top_score_frame['user_account_details']=user_account_map
+        top_score_frame['system_prompt']=agency_system_prompt
+        top_score_frame['user_prompt']= agency_user_prompt
+        top_score_frame['user_prompt']=top_score_frame.apply(lambda x: x['user_prompt'].replace('__FULL_ACCOUNT_CONTEXT__',x['user_account_details']),axis=1)
+        def construct_scoring_api_arg(user_prompt, system_prompt):
+            gx ={
+                "model": global_constants.DEFAULT_OPEN_AI_MODEL,
+                "temperature":0,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            }
+            return gx
+        top_score_frame['api_args']=top_score_frame.apply(lambda x: construct_scoring_api_arg(user_prompt=x['user_prompt'],system_prompt=x['system_prompt']),axis=1)
+        
+        async_run_map = top_score_frame['api_args'].head(25).to_dict()
+        async_run_map__2 = top_score_frame['api_args'].head(25).to_dict()
+        async_output_df1= self.openrouter.create_writable_df_for_async_chat_completion(arg_async_map=async_run_map)
+        time.sleep(15)
+        async_output_df2= self.openrouter.create_writable_df_for_async_chat_completion(arg_async_map=async_run_map__2)
+        
+        
+        def extract_scores(text_data):
+            # Split the text into individual reports
+            reports = text_data.split("',\n '")
+            
+            # Clean up the string formatting
+            reports = [report.strip("['").strip("']") for report in reports]
+            
+            # Initialize list to store all scores
+            all_scores = []
+            
+            for report in reports:
+                # Extract only scores using regex
+                scores = {
+                    'focus_score': int(re.search(r'\| FOCUS SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| FOCUS SCORE \| (\d+) \|', report) else None,
+                    'motivation_score': int(re.search(r'\| MOTIVATION SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| MOTIVATION SCORE \| (\d+) \|', report) else None,
+                    'efficacy_score': int(re.search(r'\| EFFICACY SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| EFFICACY SCORE \| (\d+) \|', report) else None,
+                    'honesty_score': int(re.search(r'\| HONESTY SCORE \| (\d+) \|', report).group(1)) if re.search(r'\| HONESTY SCORE \| (\d+) \|', report) else None
+                }
+                all_scores.append(scores)
+            
+            return all_scores
+        
+        async_output_df1['score_breakdown']=async_output_df1['choices__message__content'].apply(lambda x: extract_scores(x)[0])
+        async_output_df2['score_breakdown']=async_output_df2['choices__message__content'].apply(lambda x: extract_scores(x)[0])
+        for xscore in ['focus_score','motivation_score','efficacy_score','honesty_score']:
+            async_output_df1[xscore]=async_output_df1['score_breakdown'].apply(lambda x: x[xscore])
+            async_output_df2[xscore]=async_output_df2['score_breakdown'].apply(lambda x: x[xscore])
+        score_components = pd.concat([async_output_df1[['focus_score','motivation_score','efficacy_score','honesty_score','internal_name']],
+                async_output_df2[['focus_score','motivation_score','efficacy_score','honesty_score','internal_name']]]).groupby('internal_name').mean()
+        score_components.columns=['focus','motivation','efficacy','honesty']
+        score_components['total_qualitative_score']= score_components[['focus','motivation','efficacy','honesty']].mean(1)
+        final_score_frame = pd.concat([top_score_frame,score_components],axis=1)
+        final_score_frame['total_qualitative_score']=final_score_frame['total_qualitative_score'].fillna(50)
+        final_score_frame['reward_percentile']=((final_score_frame['quant_score']*33)+100)/2
+        final_score_frame['overall_score']= (final_score_frame['reward_percentile']*.7)+(final_score_frame['total_qualitative_score']*.3)
+        final_leaderboard = final_score_frame[['account_name','total_rewards','yellow_flag_pct','reward_percentile','focus','motivation','efficacy','honesty','total_qualitative_score','overall_score']].copy()
+        final_leaderboard['total_rewards']=final_leaderboard['total_rewards'].apply(lambda x: int(x))
+        final_leaderboard.index.name = 'Foundation Node Leaderboard as of '+datetime.datetime.now().strftime('%Y-%m-%d')
+        return final_leaderboard
 
 @dataclass
 class AccountInfo:
