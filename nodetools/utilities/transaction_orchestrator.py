@@ -8,8 +8,8 @@ import asyncio
 from loguru import logger
 from nodetools.models.models import (
     ResponseRule, 
-    TransactionType, 
-    TransactionPattern, 
+    InteractionType, 
+    MessagePattern, 
     ResponseGenerator, 
     ResponseParameters,
     Dependencies
@@ -101,7 +101,7 @@ class TransactionReviewer:
                 # Process based on the pattern's transaction type
                 match pattern.transaction_type:
                     # Response or standalone transactions don't need responses
-                    case TransactionType.RESPONSE | TransactionType.STANDALONE:
+                    case InteractionType.RESPONSE | InteractionType.STANDALONE:
                         # logger.debug(f"Processed '{pattern.transaction_type.value}' transaction. No action required.")
 
                         return ReviewingResult(
@@ -111,7 +111,7 @@ class TransactionReviewer:
                         )
                     
                     # Request transactions need responses
-                    case TransactionType.REQUEST:
+                    case InteractionType.REQUEST:
                         # 4. Get response query and execute it
                         response_query = await rule.find_response(tx)
                         result = await self.repository.execute_query(
@@ -170,7 +170,7 @@ class ResponseRoutingResult:
 class QueueConfig:
     """Configuration for a response queue and its generator"""
     queue: asyncio.Queue
-    pattern: TransactionPattern
+    pattern: MessagePattern
     rule: ResponseRule
 
 class ResponseQueueRouter:
@@ -214,7 +214,7 @@ class ResponseQueueRouter:
 
         # Create a queue for each RESPONSE type pattern in the graph
         for pattern_id, pattern in self.graph.patterns.items():
-            if pattern.transaction_type == TransactionType.RESPONSE:
+            if pattern.transaction_type == InteractionType.RESPONSE:
                 rule = self.pattern_rule_map[pattern_id]
                 if isinstance(rule, ResponseRule):
                     configs[pattern_id] = QueueConfig(
@@ -280,7 +280,7 @@ class ResponseQueueRouter:
         request_pattern = self.graph.patterns[request_pattern_id]
         
         # Verify it's a request type pattern
-        if request_pattern.transaction_type != TransactionType.REQUEST:
+        if request_pattern.transaction_type != InteractionType.REQUEST:
             return ResponseRoutingResult(
                 success=False,
                 pattern_id="unknown",

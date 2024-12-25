@@ -34,7 +34,7 @@ from decimal import Decimal
 from loguru import logger
 
 # NodeTools imports
-from nodetools.task_processing.constants import TaskType
+from nodetools.task_processing.constants import TaskType, MessageType
 from nodetools.utilities.credentials import SecretType
 from nodetools.protocols.transaction_repository import TransactionRepository
 from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
@@ -43,14 +43,14 @@ from nodetools.protocols.credentials import CredentialManager
 from nodetools.configuration.configuration import NodeConfig, RuntimeConfig
 from nodetools.configuration.constants import DEFAULT_OPENROUTER_MODEL, SystemMemoType
 from nodetools.models.models import (
-    TransactionGraph,
+    MessageGraph,
     MemoPattern,
     ResponseQuery,
     BusinessLogicProvider,
     RequestRule,
     ResponseRule,
     StandaloneRule,
-    TransactionType,
+    InteractionType,
     ResponseGenerator,
     ResponseParameters,
     Dependencies
@@ -114,6 +114,11 @@ REWARD_PATTERN = MemoPattern(
     memo_data=re.compile(f'.*{re.escape(TaskType.REWARD.value)}.*')
 )
 
+# Message patterns
+ODV_REQUEST_PATTERN = MemoPattern(
+
+)
+
 ##########################################################################
 ####################### BUSINESS LOGIC PROVIDER ##########################
 ##########################################################################
@@ -121,7 +126,7 @@ REWARD_PATTERN = MemoPattern(
 def create_business_logic() -> BusinessLogicProvider:
     """Factory function to create all business logic components"""
     # Setup transaction graph
-    graph = TransactionGraph()
+    graph = MessageGraph()
 
     # Create rules so we can map them to patterns
     rules = {
@@ -144,78 +149,78 @@ def create_business_logic() -> BusinessLogicProvider:
     graph.add_pattern(
         pattern_id="initiation_rite",
         memo_pattern=INITIATION_RITE_PATTERN,
-        transaction_type=TransactionType.REQUEST,
+        transaction_type=InteractionType.REQUEST,
         valid_responses={INITIATION_REWARD_PATTERN}
     )
     graph.add_pattern(
         pattern_id="initiation_reward",
         memo_pattern=INITIATION_REWARD_PATTERN,
-        transaction_type=TransactionType.RESPONSE,
+        transaction_type=InteractionType.RESPONSE,
     )
 
     # Add google doc link patterns to graph
     graph.add_pattern(
         pattern_id="google_doc_link",
         memo_pattern=GOOGLE_DOC_LINK_PATTERN,
-        transaction_type=TransactionType.STANDALONE,
+        transaction_type=InteractionType.STANDALONE,
     )
 
     # Add handshake patterns to graph
     graph.add_pattern(
         pattern_id="handshake_request",
         memo_pattern=HANDSHAKE_PATTERN,
-        transaction_type=TransactionType.REQUEST,
+        transaction_type=InteractionType.REQUEST,
         valid_responses={HANDSHAKE_PATTERN}
     )
     graph.add_pattern(
         pattern_id="handshake_response",
         memo_pattern=HANDSHAKE_PATTERN,
-        transaction_type=TransactionType.RESPONSE,
+        transaction_type=InteractionType.RESPONSE,
     )
 
     # Add patterns to graph
     graph.add_pattern(
         pattern_id="request_post_fiat",
         memo_pattern=REQUEST_POST_FIAT_PATTERN,
-        transaction_type=TransactionType.REQUEST,
+        transaction_type=InteractionType.REQUEST,
         valid_responses={PROPOSAL_PATTERN}
     )
     graph.add_pattern(
         pattern_id="proposal",
         memo_pattern=PROPOSAL_PATTERN,
-        transaction_type=TransactionType.RESPONSE,
+        transaction_type=InteractionType.RESPONSE,
     )
     graph.add_pattern(
         pattern_id="acceptance",
         memo_pattern=ACCEPTANCE_PATTERN,
-        transaction_type=TransactionType.STANDALONE,
+        transaction_type=InteractionType.STANDALONE,
     )
     graph.add_pattern(
         pattern_id="refusal",
         memo_pattern=REFUSAL_PATTERN,
-        transaction_type=TransactionType.STANDALONE,
+        transaction_type=InteractionType.STANDALONE,
     )
     graph.add_pattern(
         pattern_id="task_output",
         memo_pattern=TASK_OUTPUT_PATTERN,
-        transaction_type=TransactionType.REQUEST,
+        transaction_type=InteractionType.REQUEST,
         valid_responses={VERIFICATION_PROMPT_PATTERN}
     )
     graph.add_pattern(
         pattern_id="verification_prompt",
         memo_pattern=VERIFICATION_PROMPT_PATTERN,
-        transaction_type=TransactionType.RESPONSE
+        transaction_type=InteractionType.RESPONSE
     )
     graph.add_pattern(
         pattern_id="verification_response",
         memo_pattern=VERIFICATION_RESPONSE_PATTERN,
-        transaction_type=TransactionType.REQUEST,
+        transaction_type=InteractionType.REQUEST,
         valid_responses={REWARD_PATTERN}
     )
     graph.add_pattern(
         pattern_id="reward",
         memo_pattern=REWARD_PATTERN,
-        transaction_type=TransactionType.RESPONSE
+        transaction_type=InteractionType.RESPONSE
     )
 
     return BusinessLogicProvider(
