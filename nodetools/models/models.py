@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
     from nodetools.protocols.openrouter import OpenRouterTool
     from nodetools.protocols.transaction_repository import TransactionRepository
+    from nodetools.protocols.encryption import MessageEncryption
     from nodetools.configuration.configuration import NodeConfig
 
 class InteractionType(Enum):
@@ -26,25 +27,105 @@ class MemoDataStructureType(Enum):
     NONE = "-"      # No processing
 
 @dataclass
-class MessageStructure:
-    """Describes how a message is structured across transactions"""
+class Dependencies:
+    """Container for all possible dependencies needed by business logic"""
+    node_config: 'NodeConfig'
+    credential_manager: 'CredentialManager'
+    generic_pft_utilities: 'GenericPFTUtilities'
+    openrouter: 'OpenRouterTool'
+    transaction_repository: 'TransactionRepository'
+    message_encryption: 'MessageEncryption'
+
+@dataclass
+class MemoStructure:
+    """Describes how a memo is structured across transactions"""
     is_chunked: bool
     chunk_index: Optional[int] = None
     total_chunks: Optional[int] = None
     group_id: Optional[str] = None
     compression_type: Optional[MemoDataStructureType] = None  # Might be unknown until processing
     encryption_type: Optional[MemoDataStructureType] = None   # Might be unknown until processing
+    is_standardized_format: bool = False  
 
     @property
     def is_complete(self) -> bool:
-        """Whether this represents a complete message"""
-        return not self.is_chunked  # A non-chunked message is always complete
+        """Whether this represents a complete memo"""
+        return not self.is_chunked  # A non-chunked memo is always complete
     
     @classmethod
-    def from_transaction(cls, tx: Dict[str, Any]) -> 'MessageStructure':
+    def is_standardized_memo_format(cls, memo_format: Optional[str]) -> bool:
         """
-        Extract message structure from transaction memo fields.
-        Tries new standardized memo_format first, falls back to legacy memo_data prefixes.
+        Check if memo_format follows the standardized format.
+        Examples:
+            "e.b.c1/4"  # encrypted, compressed, chunk 1 of 4
+            "-.b.c2/4"  # not encrypted, compressed, chunk 2 of 4
+            "-.-.-"     # no special processing
+        """
+        if not memo_format:
+            return False
+        
+        parts = memo_format.split(".")
+        if len(parts) != 3:
+            return False
+        
+        encryption, compression, chunking = parts
+
+        # Validate encryption part
+        if encryption not in {MemoDataStructureType.ECDH.value, MemoDataStructureType.NONE.value}:
+            return False
+            
+        # Validate compression part
+        if compression not in {MemoDataStructureType.BROTLI.value, MemoDataStructureType.NONE.value}:
+            return False
+            
+        # Validate chunking part
+        if chunking != MemoDataStructureType.NONE.value:
+            chunk_match = re.match(f'{MemoDataStructureType.CHUNK.value}\d+/\d+', chunking)
+            if not chunk_match:
+                return False
+                
+        return True
+    
+    @classmethod
+    def parse_standardized_format(cls, memo_format: str) -> 'MemoStructure':
+        """Parse a validated standardized memo_format string."""
+        encryption, compression, chunking = memo_format.split(".")
+
+        # Parse encryption
+        encryption_type = (
+            MemoDataStructureType.ECDH if encryption == MemoDataStructureType.ECDH.value 
+            else None
+        )
+        
+        # Parse compression
+        compression_type = (
+            MemoDataStructureType.BROTLI if compression == MemoDataStructureType.BROTLI.value 
+            else None
+        )
+        
+        # Parse chunking
+        chunk_index = None
+        total_chunks = None
+        if chunking != MemoDataStructureType.NONE.value:
+            chunk_match = re.match(f'{MemoDataStructureType.CHUNK.value}(\d+)/(\d+)', chunking)
+            if chunk_match:  # We know this matches from validation
+                chunk_index = int(chunk_match.group(1))
+                total_chunks = int(chunk_match.group(2))
+        
+        return cls(
+            is_chunked=chunk_index is not None,
+            chunk_index=chunk_index,
+            total_chunks=total_chunks,
+            group_id=None,  # Will be set from tx
+            compression_type=compression_type,
+            encryption_type=encryption_type,
+            is_standardized_format=True
+        )
+    
+    @classmethod
+    def from_transaction(cls, tx: Dict[str, Any]) -> 'MemoStructure':
+        """
+        Extract memo structure from transaction memo fields.
         
         New format examples:
             "e.b.c1/4"                    # encrypted, compressed, chunk 1 of 4
@@ -65,53 +146,16 @@ class MessageStructure:
             Other chunks: "chunk_2__<compressed_data>"
             After joining and decompressing: "WHISPER__<encrypted_data>"
         """
-        memo_data = tx.get("memo_data")
+        memo_data = tx.get("memo_data", "")
         memo_format = tx.get("memo_format")
 
-        # Try parsing standardized memo_format first
-        if memo_format:
-            try:
-                parts = memo_format.split(".")
-                if len(parts) != 3:
-                    raise ValueError(f"Invalid memo_format structure: {memo_format}")
-                
-                encryption, compression, chunking = parts
+        # Check if using standardized format
+        if cls.is_standardized_memo_format(memo_format):
+            structure = cls.parse_standardized_format(memo_format)
+            structure.group_id = tx.get("memo_type")  # Set group_id from transaction
+            return structure
 
-                # Parse encryption
-                encryption_type = (
-                    MemoDataStructureType.ECDH if encryption == MemoDataStructureType.ECDH.value 
-                    else None
-                )
-
-                # Parse compression
-                compression_type = (
-                    MemoDataStructureType.BROTLI if compression == MemoDataStructureType.BROTLI.value
-                    else None
-                )
-
-                # Parse chunking
-                chunk_index, total_chunks = None, None
-                if chunking.startswith(MemoDataStructureType.CHUNK.value):
-                    chunk_match = re.match(
-                        f'{MemoDataStructureType.CHUNK.value}(\d+)/(\d+)', 
-                        chunking
-                    )
-                    if not chunk_match:
-                        raise ValueError(f"Invalid chunking format: {chunking}")
-                    chunk_index = int(chunk_match.group(1))
-                    total_chunks = int(chunk_match.group(2))
-                
-                return cls(
-                    is_chunked=chunk_index is not None and total_chunks is not None,
-                    chunk_index=chunk_index,
-                    total_chunks=total_chunks,
-                    group_id=tx.get("memo_type"),
-                    compression_type=compression_type,
-                    encryption_type=encryption_type,
-                )
-            except (ValueError, AttributeError) as e:
-                logger.warning(f"Invalid standardized memo_format '{memo_format}', falling back to legacy format parsing: {e}")
-
+        ## Backwards compatibility for legacy format
         # Fall back to legacy prefix detection
         chunk_match = re.match(r'^chunk_(\d+)__', memo_data)
         
@@ -121,103 +165,102 @@ class MessageStructure:
             if chunk_match and chunk_match.group(1) == "1" 
             else None  # Unknown for other chunks
         )
-        
-        # Can't determine encryption status from raw memo_data
-        is_encrypted = None  # Will be determined after processing
-        
+
         return cls(
             is_chunked=chunk_match is not None,
             chunk_index=int(chunk_match.group(1)) if chunk_match else None,
             total_chunks=None,  # Legacy format doesn't specify total chunks
             group_id=tx.get("memo_type"),
             compression_type=MemoDataStructureType.BROTLI if is_compressed else None,
-            encryption_type=is_encrypted
+            encryption_type=None,  # Will be determined after processing
+            is_standardized_format=False
         )
     
-    def update_structure_after_processing(self, processed_data: str) -> None:
-        """
-        Update structure information after processing steps.
-        Should be called after decompression to check for encryption.
-        """
-        if "WHISPER__" in processed_data:
-            self.encryption_type = MemoDataStructureType.ECDH
-    
 @dataclass
-class MessageGroup:
+class MemoGroup:
     """
-    Manages a group of related messages.
-    Messages are related if they share the same memo_type (group_id).
+    Manages a group of related memos from individual transactions.
+    Memos are related if they share the same memo_type (group_id) and have a consistent memo_format (MemoStructure).
+    These memos can be reconstituted into a single memo by unchunking.
+    Additional processing can be applied to the unchunked memo_data.
     """
     group_id: str
     messages: List[Dict[str, Any]]
-    structure: Optional[MessageStructure] = None
+    structure: Optional[MemoStructure] = None
 
     @classmethod
-    def create_from_transaction(cls, tx: Dict[str, Any]) -> 'MessageGroup':
+    def create_from_transaction(cls, tx: Dict[str, Any]) -> 'MemoGroup':
         """Create a new message group from an initial transaction"""
-        structure = MessageStructure.from_transaction(tx)
+        structure = MemoStructure.from_transaction(tx)
         return cls(
             group_id=tx.get("memo_type"),
             messages=[tx],
             structure=structure,
         )
     
-    def add_message(self, tx: Dict[str, Any]) -> bool:
+    def _is_structure_consistent(self, new_structure: MemoStructure) -> bool:
         """
-        Add a message to the group if it belongs.
-        Returns True if message was added, False if it doesn't belong.
+        Check if a new message's structure is consistent with the group.
+        Only applies to new format messages, whose structure can be interpreted from memo_format.
+        """            
+        return (
+            new_structure.encryption_type == self.structure.encryption_type and
+            new_structure.compression_type == self.structure.compression_type and
+            new_structure.total_chunks == self.structure.total_chunks
+        )
+    
+    def add_memo(self, tx: Dict[str, Any]) -> bool:
         """
+        Add a memo to the group if it belongs.
+        Returns True if memo was added, False if it doesn't belong.
+        """
+        if tx.get('transaction_result') != 'tesSUCCESS':
+            return False
+
         if tx.get("memo_type") != self.group_id:
             return False
         
-        new_structure = MessageStructure.from_transaction(tx)
-        if not new_structure.is_chunked:
-            return False
+        new_structure = MemoStructure.from_transaction(tx)
+
+        # For new format messages, validate consistency
+        if new_structure.is_standardized_format:
+            if not self._is_structure_consistent(new_structure):
+                logger.warning(f"Inconsistent message structure in group {self.group_id}")
+                return False
         
         self.messages.append(tx)
         return True
-    
+        
     @property
     def chunk_indices(self) -> Set[int]:
         """Get set of available chunk indices"""
         return {
-            MessageStructure.from_transaction(tx).chunk_index
+            MemoStructure.from_transaction(tx).chunk_index
             for tx in self.messages
-            if MessageStructure.from_transaction(tx).chunk_index is not None
+            if MemoStructure.from_transaction(tx).chunk_index is not None
         }
     
-    @property
-    def is_sequential(self) -> bool:
-        """
-        Check if we have a sequential set of chunks with no duplicates.
-        For example: {0,1,2} is sequential, {0,1,1,2} or {0,1,3} are not.
-        """
-        indices = self.chunk_indices
-        if not indices:
-            return False
-        
-        # Count occurrences of each index in messages
-        index_counts = {}
-        for tx in self.messages:
-            idx = MessageStructure.from_transaction(tx).chunk_index
-            if idx is not None:
-                index_counts[idx] = index_counts.get(idx, 0) + 1
-                if index_counts[idx] > 1:
-                    return False  # Duplicate chunk found
-        
-        # Check for sequence completeness
-        min_idx = min(indices)
-        max_idx = max(indices)
-        expected_indices = set(range(min_idx, max_idx + 1))
-        return indices == expected_indices
-    
-    @abstractmethod
-    async def try_decompress(self) -> Optional[str]:
-        """
-        Attempt to decompress all chunks in the group.
-        Returns decompressed message if successful, None if incomplete/failed.
-        """
-        pass
+class StructuralPattern(Enum):
+    """
+    Defines patterns for matching XRPL memo structure before content processing.
+    Used to determine if memos need grouping and how they should be processed.
+    """
+    DIRECT_MATCH = "direct_match"          # Can be pattern matched directly
+    NEEDS_GROUPING = "needs_grouping"      # New format, needs grouping
+    NEEDS_LEGACY_GROUPING = "needs_legacy_grouping"  # Legacy format, needs grouping
+
+    @staticmethod
+    def match(tx: Dict[str, Any]) -> str:
+        """Determine how a transaction's memos should be handled"""
+        structure = MemoStructure.from_transaction(tx)
+        if structure.is_standardized_format:
+            # New format: Use metadata to determine grouping needs
+            return StructuralPattern.NEEDS_GROUPING if structure.is_chunked else StructuralPattern.DIRECT_MATCH
+        else:
+            # Legacy format: Check for chunk prefix
+            if "chunk_" in tx.get('memo_data', ''):
+                return StructuralPattern.NEEDS_LEGACY_GROUPING
+            return StructuralPattern.DIRECT_MATCH
 
 @dataclass(frozen=True)  # Making it immutable for hashability
 class MemoPattern:
@@ -229,9 +272,9 @@ class MemoPattern:
     memo_format: Optional[str | Pattern] = None
     memo_data: Optional[str | Pattern] = None
 
-    def get_message_structure(self, tx: Dict[str, Any]) -> MessageStructure:
+    def get_message_structure(self, tx: Dict[str, Any]) -> MemoStructure:
         """Extract structural information from the memo fields"""
-        return MessageStructure.from_transaction(tx)
+        return MemoStructure.from_transaction(tx)
 
     def matches(self, tx: Dict[str, Any]) -> bool:
         """Check if a transaction's memo matches this pattern"""
@@ -280,9 +323,8 @@ class MemoPattern:
                 compare_attrs(self.memo_data, other.memo_data))
 
 @dataclass
-class MessagePattern:
+class InteractionPattern:
     memo_pattern: MemoPattern
-    content_pattern: Optional[ContentPattern] = None
     transaction_type: InteractionType
     valid_responses: Set[MemoPattern]
 
@@ -294,9 +336,9 @@ class MessagePattern:
         if self.transaction_type == InteractionType.REQUEST and not self.valid_responses:
             raise ValueError("REQUEST types must have valid_responses")
 
-class MessageGraph:
+class InteractionGraph:
     def __init__(self):
-        self.patterns: Dict[str, MessagePattern] = {}
+        self.patterns: Dict[str, InteractionPattern] = {}
         self.memo_pattern_to_id: Dict[MemoPattern, str] = {}
 
     def add_pattern(
@@ -311,7 +353,7 @@ class MessageGraph:
         For RESPONSE and STANDALONE types, valid_responses should be None or empty.
         For REQUEST types, valid_responses must be provided.
         """
-        self.patterns[pattern_id] = MessagePattern(
+        self.patterns[pattern_id] = InteractionPattern(
             memo_pattern=memo_pattern, 
             transaction_type=transaction_type, 
             valid_responses=valid_responses, 
@@ -359,20 +401,20 @@ class MessageGraph:
         """Get the pattern ID for a given memo pattern"""
         return self.memo_pattern_to_id.get(memo_pattern)
 
-class MessageRule(ABC):
-    """Base class for message processing rules"""
+class InteractionRule(ABC):
+    """Base class for interaction processing rules"""
     @abstractmethod
     async def validate(self, tx: Dict[str, Any]) -> bool:
         """
-        Validate any additional business rules for a message
-        This is separate from the message pattern matching
+        Validate any additional business rules for an interaction
+        This is separate from the interaction pattern matching
         """
         pass
 
     @property
     @abstractmethod
-    def message_type(self) -> InteractionType:
-        """Return the type of message this rule handles"""
+    def interaction_type(self) -> InteractionType:
+        """Return the type of interaction this rule handles"""
         pass
 
 @dataclass
@@ -381,9 +423,18 @@ class ResponseQuery:
     query: str
     params: Dict[str, Any]
 
-class RequestRule(MessageRule):
+class RequestRule(InteractionRule):
     """Base class for rules that handle request transactions"""
     transaction_type = InteractionType.REQUEST
+
+    @abstractmethod
+    async def validate(
+        self,
+        tx: Dict[str, Any],
+        dependencies: Dependencies
+    ) -> bool:
+        """Validate transaction against business rules"""
+        pass
 
     @abstractmethod
     async def find_response(self, request_tx: Dict[str, Any]) -> Optional[ResponseQuery]:
@@ -414,7 +465,7 @@ class ResponseGenerator(ABC):
         """Construct the response memo and parameters"""
         pass
 
-class ResponseRule(MessageRule):
+class ResponseRule(InteractionRule):
     """Base class for rules that handle response transactions"""
     transaction_type = InteractionType.RESPONSE
 
@@ -427,21 +478,12 @@ class ResponseRule(MessageRule):
         """
         pass
 
-class StandaloneRule(MessageRule):
+class StandaloneRule(InteractionRule):
     """Base class for rules that handle standalone transactions"""
     transaction_type = InteractionType.STANDALONE
     
 @dataclass
 class BusinessLogicProvider:
     """Centralizes all business logic configuration"""
-    transaction_graph: MessageGraph
-    pattern_rule_map: Dict[str, MessageRule]  # Maps pattern_id to rule instance
-
-@dataclass
-class Dependencies:
-    """Container for all possible dependencies needed by ResponseGenerators"""
-    node_config: 'NodeConfig'
-    credential_manager: 'CredentialManager'
-    generic_pft_utilities: 'GenericPFTUtilities'
-    openrouter: 'OpenRouterTool'
-    transaction_repository: 'TransactionRepository'
+    transaction_graph: InteractionGraph
+    pattern_rule_map: Dict[str, InteractionRule]  # Maps pattern_id to rule instance

@@ -29,6 +29,7 @@ When adding new rules, remember:
 from typing import Dict, Any, Optional
 import re
 from decimal import Decimal
+import traceback
 
 # Third-party imports
 from loguru import logger
@@ -41,9 +42,12 @@ from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
 from nodetools.ai.openrouter import OpenRouterTool
 from nodetools.protocols.credentials import CredentialManager
 from nodetools.configuration.configuration import NodeConfig, RuntimeConfig
-from nodetools.configuration.constants import DEFAULT_OPENROUTER_MODEL, SystemMemoType
+from nodetools.configuration.constants import (
+    DEFAULT_OPENROUTER_MODEL,
+    SystemMemoType
+)
 from nodetools.models.models import (
-    MessageGraph,
+    InteractionGraph,
     MemoPattern,
     ResponseQuery,
     BusinessLogicProvider,
@@ -115,8 +119,14 @@ REWARD_PATTERN = MemoPattern(
 )
 
 # Message patterns
-ODV_REQUEST_PATTERN = MemoPattern(
+TASK_RESPONSE_ID_PATTERN = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(?:__[A-Z0-9]{4})?_response)')
 
+ODV_REQUEST_PATTERN = MemoPattern(
+    memo_type=TASK_ID_PATTERN,
+    memo_data=re.compile(f'.*{re.escape(MessageType.ODV_REQUEST.value)}.*')
+)
+ODV_RESPONSE_PATTERN = MemoPattern(
+    memo_type=TASK_RESPONSE_ID_PATTERN  # this is the only way to pattern match ODV responses at this time
 )
 
 ##########################################################################
@@ -126,7 +136,7 @@ ODV_REQUEST_PATTERN = MemoPattern(
 def create_business_logic() -> BusinessLogicProvider:
     """Factory function to create all business logic components"""
     # Setup transaction graph
-    graph = MessageGraph()
+    graph = InteractionGraph()
 
     # Create rules so we can map them to patterns
     rules = {
@@ -223,6 +233,19 @@ def create_business_logic() -> BusinessLogicProvider:
         transaction_type=InteractionType.RESPONSE
     )
 
+    # Add ODV patterns to graph
+    graph.add_pattern(
+        pattern_id="odv_request",
+        memo_pattern=ODV_REQUEST_PATTERN,
+        transaction_type=InteractionType.REQUEST,
+        valid_responses={ODV_RESPONSE_PATTERN}
+    )
+    graph.add_pattern(
+        pattern_id="odv_response",
+        memo_pattern=ODV_RESPONSE_PATTERN,
+        transaction_type=InteractionType.RESPONSE,
+    )
+
     return BusinessLogicProvider(
         transaction_graph=graph,
         pattern_rule_map=rules
@@ -272,15 +295,19 @@ class InitiationRiteRule(RequestRule):
         
         return True
     
-    async def validate(self, tx: Dict[str, Any]) -> bool:
+    async def validate(
+            self, 
+            tx: Dict[str, Any],
+            dependencies: Dependencies
+        ) -> bool:
         """
         Validate business rules for an initiation rite.
         Pattern matching is handled by TransactionGraph.
         Must:
-        1. Be a successful transaction
-        2. Have valid rite text
+        1. Have valid rite text
+        2. Be sent to the node address
         """
-        if tx.get('transaction_result') != 'tesSUCCESS':
+        if tx.get('destination') != dependencies.node_config.node_address:
             return False
 
         return self.is_valid_initiation_rite(tx.get('memo_data', ''))
@@ -324,15 +351,6 @@ class InitiationRiteRule(RequestRule):
     
 class InitiationRewardRule(ResponseRule):
     """Pure business logic for handling initiation rewards"""
-
-    async def validate(self, tx: Dict[str, Any]) -> bool:
-        """
-        Validate business rules for an initiation reward.
-        Pattern matching is handled by TransactionGraph.
-        Must:
-        1. Be a successful transaction
-        """
-        return tx.get('transaction_result') == 'tesSUCCESS'
     
     def get_response_generator(self, dependencies: Dependencies) -> ResponseGenerator:
         """Get response generator for initiation rewards with all dependencies"""
@@ -413,16 +431,10 @@ class InitiationRewardGenerator(ResponseGenerator):
 ##########################################################################
 
 class GoogleDocLinkRule(StandaloneRule):
-    """Pure business logic for handling google doc links"""
-
-    async def validate(self, tx: Dict[str, Any]) -> bool:
-        """
-        Validate business rules for a google doc link.
-        Pattern matching is handled by TransactionGraph.
-        Must:
-        1. Be a successful transaction
-        """
-        return tx.get('transaction_result') == 'tesSUCCESS'
+    """
+    Pure business logic for handling google doc links
+    Currently, this rule is a placeholder and does not perform any validation.
+    """
     
 ##########################################################################
 ########################## HANDSHAKE RULES ###############################
@@ -431,14 +443,35 @@ class GoogleDocLinkRule(StandaloneRule):
 class HandshakeRequestRule(RequestRule):
     """Pure business logic for handling handshake requests"""
 
-    async def validate(self, tx: Dict[str, Any]) -> bool:
+    async def validate(
+            self, 
+            tx: Dict[str, Any],
+            dependencies: Dependencies
+        ) -> bool:
         """
         Validate business rules for a handshake request.
         Pattern matching is handled by TransactionGraph.
         Must:
-        1. Be a successful transaction
+        1. Be sent to the node address or remembrancer address
+        2. Be a valid ECDH public key
         """
-        return tx.get('transaction_result') == 'tesSUCCESS'
+        if tx.get('destination') not in [dependencies.node_config.node_address, dependencies.node_config.remembrancer_address]:
+            return False
+        
+        try:
+            # Determine which secret type to use based on receiving address
+            secret_type = SecretType.NODE if tx['destination'] == dependencies.node_config.node_address else SecretType.REMEMBRANCER
+            
+            # Try to derive shared secret - this will fail if the public key is invalid
+            received_key = tx.get('memo_data', '')
+            dependencies.credential_manager.get_shared_secret(
+                received_key=received_key,
+                secret_type=secret_type
+            )
+            return True
+
+        except Exception as e:
+            return False
 
     async def find_response(
             self,
@@ -474,15 +507,6 @@ class HandshakeRequestRule(RequestRule):
 
 class HandshakeResponseRule(ResponseRule):
     """Pure business logic for handling handshake responses"""
-
-    async def validate(self, tx: Dict[str, Any]) -> bool:
-        """
-        Validate business rules for a handshake response.
-        Pattern matching is handled by TransactionGraph.
-        Must:
-        1. Be a successful transaction
-        """
-        return tx.get('transaction_result') == 'tesSUCCESS'
     
     def get_response_generator(self, dependencies: Dependencies) -> ResponseGenerator:
         """Get response generator for handshake response with all dependencies"""
@@ -572,14 +596,18 @@ class HandshakeResponseGenerator(ResponseGenerator):
 class RequestPostFiatRule(RequestRule):
     """Pure business logic for handling post-fiat requests"""
 
-    async def validate(self, tx: Dict[str, Any]) -> bool:
+    async def validate(
+            self, 
+            tx: Dict[str, Any],
+            dependencies: Dependencies
+        ) -> bool:
         """
         Validate business rules for a post-fiat request.
         Pattern matching is handled by TransactionGraph.
         Must:
-        1. Be a successful transaction
+        1. Be addressed to the node address
         """
-        return tx.get('transaction_result') == 'tesSUCCESS'
+        return tx.get('destination') == dependencies.node_config.node_address
     
     async def find_response(
             self,
@@ -609,15 +637,6 @@ class RequestPostFiatRule(RequestRule):
     
 class ProposalRule(ResponseRule):
     """Pure business logic for handling proposals"""
-
-    async def validate(self, tx: Dict[str, Any]) -> bool:
-        """
-        Validate business rules for a proposal.
-        Pattern matching is handled by TransactionGraph.
-        Must:
-        1. Be a successful transaction
-        """
-        return tx.get('transaction_result') == 'tesSUCCESS'
     
     def get_response_generator(self, dependencies: Dependencies) -> ResponseGenerator:
         """Get response generator for proposals with all dependencies"""
@@ -694,28 +713,16 @@ class ProposalResponseGenerator(ResponseGenerator):
             raise Exception(f"Failed to construct proposal response: {e}")  
     
 class AcceptanceRule(StandaloneRule):
-    """Pure business logic for handling acceptances"""
-
-    async def validate(self, tx: Dict[str, Any]) -> bool:
-        """
-        Validate business rules for an acceptance.
-        Pattern matching is handled by TransactionGraph.
-        Must:
-        1. Be a successful transaction
-        """
-        return tx.get('transaction_result') == 'tesSUCCESS'
+    """
+    Pure business logic for handling acceptances
+    Currently, this rule is a placeholder and does not perform any validation.
+    """
     
 class RefusalRule(StandaloneRule):
-    """Pure business logic for handling refusals"""
-
-    async def validate(self, tx: Dict[str, Any]) -> bool:
-        """
-        Validate business rules for a refusal.
-        Pattern matching is handled by TransactionGraph.
-        Must:
-        1. Be a successful transaction
-        """
-        return tx.get('transaction_result') == 'tesSUCCESS'
+    """
+    Pure business logic for handling refusals
+    Currently, this rule is a placeholder and does not perform any validation.
+    """
     
 ##############################################################################
 ########################## INITIAL VERIFICATION ##############################
@@ -724,14 +731,18 @@ class RefusalRule(StandaloneRule):
 class TaskOutputRule(RequestRule):
     """Pure business logic for handling task outputs"""
 
-    async def validate(self, tx: Dict[str, Any]) -> bool:
+    async def validate(
+            self, 
+            tx: Dict[str, Any],
+            dependencies: Dependencies
+        ) -> bool:
         """
         Validate business rules for a task output.
         Pattern matching is handled by TransactionGraph.
         Must:
-        1. Be a successful transaction
+        1. Be addressed to the node address
         """
-        return tx.get('transaction_result') == 'tesSUCCESS'
+        return tx.get('destination') == dependencies.node_config.node_address
     
     async def find_response(
             self,
@@ -761,15 +772,6 @@ class TaskOutputRule(RequestRule):
     
 class VerificationPromptRule(ResponseRule):
     """Pure business logic for handling verification prompts"""
-
-    async def validate(self, tx: Dict[str, Any]) -> bool:
-        """
-        Validate business rules for a verification prompt.
-        Pattern matching is handled by TransactionGraph.
-        Must:
-        1. Be a successful transaction
-        """
-        return tx.get('transaction_result') == 'tesSUCCESS'
     
     def get_response_generator(self, dependencies: Dependencies) -> ResponseGenerator:
         """Get response generator for verification prompts with all dependencies"""
@@ -904,16 +906,24 @@ class VerificationPromptGenerator(ResponseGenerator):
 ############################################################################
 
 class VerificationResponseRule(RequestRule):
-    """Pure business logic for handling verification responses"""
+    """
+    Pure business logic for handling verification responses.
+    This is not to be confused with ResponseRules, which are system responses.
+    These are user responses to verification prompts.
+    """
 
-    async def validate(self, tx: Dict[str, Any]) -> bool:
+    async def validate(
+            self,
+            tx: Dict[str, Any],
+            dependencies: Dependencies
+        ) -> bool:
         """
         Validate business rules for a verification response.
         Pattern matching is handled by TransactionGraph.
         Must:
-        1. Be a successful transaction
+        1. Be addressed to the node address
         """
-        return tx.get('transaction_result') == 'tesSUCCESS'
+        return tx.get('destination') == dependencies.node_config.node_address
     
     async def find_response(
             self,
@@ -943,15 +953,6 @@ class VerificationResponseRule(RequestRule):
     
 class RewardRule(ResponseRule):
     """Pure business logic for handling rewards"""
-
-    async def validate(self, tx: Dict[str, Any]) -> bool:
-        """
-        Validate business rules for a reward.
-        Pattern matching is handled by TransactionGraph.
-        Must:
-        1. Be a successful transaction
-        """
-        return tx.get('transaction_result') == 'tesSUCCESS'
 
     def get_response_generator(self, dependencies: Dependencies) -> ResponseGenerator:
         """Get response generator for rewards with all dependencies"""
@@ -1189,3 +1190,61 @@ class RewardResponseGenerator(ResponseGenerator):
 
         except Exception as e:
             raise Exception(f"Failed to construct reward response: {e}")
+
+
+############################################################################
+################################# ODV ######################################
+############################################################################
+
+class ODVRequestRule(RequestRule):
+    """Rule for validating ODV requests to the remembrancer"""
+
+    async def validate(
+            self,
+            tx: Dict[str, Any],
+            dependencies: Dependencies
+        ) -> bool:
+        """
+        Validates that:
+        1. Request is sent to remembrancer address
+        2. User has minimum required PFT balance (2000)
+        """
+        try:
+            # Check destination is remembrancer
+            if tx['destination'] != dependencies.node_config.remembrancer_address:
+                return False
+            
+            # Check user's PFT balance
+            balance = dependencies.generic_pft_utilities.get_pft_balance(tx['account'])
+            if balance < 2000:
+                return False
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error validating ODV request: {e}")
+            logger.error(traceback.format_exc())
+            return False
+        
+    async def find_response(
+        self,
+        request_tx: Dict[str, Any],
+    ) -> ResponseQuery:
+        """Get query information for finding an ODV response."""
+        query = """
+            SELECT * FROM find_transaction_response(
+                request_account := %(account)s,
+                request_destination := %(destination)s,
+                request_time := %(request_time)s,
+                response_memo_type := %(response_memo_type)s,
+                require_after_request := TRUE
+            );
+        """
+        
+        params = {
+            'account': request_tx.get('account', request_tx.get('tx_json_parsed', {}).get('Account')),
+            'destination': request_tx.get('destination', request_tx.get('tx_json_parsed', {}).get('Destination')),
+            'request_time': request_tx.get('close_time_iso'),
+            'response_memo_type': f"{request_tx.get('memo_type')}_response"
+        }
+            
+        return ResponseQuery(query=query, params=params)

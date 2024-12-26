@@ -34,5 +34,4 @@ for task_type in TaskType:
 TASK_INDICATORS = [task_type.value for task_type in TaskType]
 
 class MessageType(Enum):
-    """Message-related memo types"""
-    MEMO = 'chunk_'
+    ODV_REQUEST = 'ODV'

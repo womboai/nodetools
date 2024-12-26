@@ -2607,7 +2607,7 @@ My specific question/request is: {user_query}"""
             logger.debug(f"MyClient.pf_initiate: Spawning wallet to initiate for {message.author.name}")
             wallet = generic_pft_utilities.spawn_wallet_from_seed(seed)
             wallet_address = wallet.classic_address
-            xrp_balance = generic_pft_utilities.get_xrp_balance(address=wallet_address)
+            xrp_balance = generic_pft_utilities.fetch_xrp_balance(address=wallet_address)
             if xrp_balance < global_constants.MIN_XRP_BALANCE:
                 await message.reply(f"You must fund your wallet with at least {global_constants.MIN_XRP_BALANCE} XRP before initiating.", mention_author=True)
                 return
@@ -2659,8 +2659,8 @@ My specific question/request is: {user_query}"""
 
             # Get balances
             try:
-                account_info.xrp_balance = self.generic_pft_utilities.get_xrp_balance(address)
-                account_info.pft_balance = self.generic_pft_utilities.get_pft_balance(address)
+                account_info.xrp_balance = self.generic_pft_utilities.fetch_xrp_balance(address)
+                account_info.pft_balance = self.generic_pft_utilities.fetch_pft_balance(address)
             except Exception as e:
                 # Account probably not activated yet
                 account_info.xrp_balance = 0

@@ -105,10 +105,23 @@ class XRPLWebSocketMonitor:
         self.last_ledger_time = time.time()
 
         async with AsyncWebsocketClient(self.url) as self.client:
+
+            # Determine which node accounts to subscribe to
+            accounts = [
+                # Primary node address
+                self.node_config.node_address,  
+                # Issuer address, should result in all PFT transactions being subscribed to (TODO: confirm this understanding)    
+                self.network_config.issuer_address  
+            ]
+
+            # Add remembrancer address if configured
+            if self.node_config.remembrancer_address:
+                accounts.append(self.node_config.remembrancer_address)
+
             # Subscribe to streams
             response = await self.client.request(xrpl.models.requests.Subscribe(
                 streams=["ledger"],
-                accounts=[self.node_config.node_address, self.network_config.issuer_address]
+                accounts=accounts
             ))
 
             if not response.is_successful():

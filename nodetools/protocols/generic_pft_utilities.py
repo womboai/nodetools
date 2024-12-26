@@ -103,3 +103,11 @@ class GenericPFTUtilities(Protocol):
         ) -> bool:
         """Send and track a node-initiated transaction for queue processing"""
         ...
+
+    def fetch_pft_balance(self, address: str) -> Decimal:
+        """Get PFT balance for an account"""
+        ...
+
+    def fetch_xrp_balance(self, address: str) -> Decimal:
+        """Get XRP balance for an account"""
+        ...

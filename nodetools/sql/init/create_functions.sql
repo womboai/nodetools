@@ -108,3 +108,73 @@ CREATE TRIGGER process_tx_memos_trigger
     AFTER INSERT OR UPDATE ON postfiat_tx_cache
     FOR EACH ROW
     EXECUTE FUNCTION process_tx_memos();
+
+-- Function to update PFT holders and balances when transactions are processed
+CREATE OR REPLACE FUNCTION update_pft_holders()
+RETURNS TRIGGER AS $$
+DECLARE
+    affected_node JSONB;
+    final_fields JSONB;
+    previous_fields JSONB;
+    account_address TEXT;
+    new_balance NUMERIC;
+    pft_issuer TEXT;
+BEGIN
+    -- Set issuer based on database name
+    pft_issuer := CASE 
+        WHEN current_database() LIKE '%_testnet' THEN 'rLX2tgumpiUE6kjr757Ao8HWiJzC8uuBSN'
+        ELSE 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
+    END;
+
+    -- Only process successful PFT transactions
+    IF NEW.meta_parsed->>'TransactionResult' != 'tesSUCCESS' THEN
+        RETURN NEW;
+    END IF;
+
+    -- Iterate through affected nodes
+    -- In XRPL transactions, the AffectedNodes array in the metadata shows all ledger entries that were modified by the transaction.
+    FOR affected_node IN 
+        SELECT jsonb_array_elements(NEW.meta_parsed->'AffectedNodes')
+    LOOP
+        -- Only process RippleState entries for PFT
+        IF affected_node->'ModifiedNode'->>'LedgerEntryType' = 'RippleState' 
+           AND affected_node->'ModifiedNode'->'FinalFields'->'Balance'->>'currency' = 'PFT' THEN
+            
+            final_fields := affected_node->'ModifiedNode'->'FinalFields';
+            previous_fields := affected_node->'ModifiedNode'->'PreviousFields';
+
+            -- Get the non-issuer account
+            IF final_fields->'LowLimit'->>'issuer' != pft_issuer THEN
+                account_address := final_fields->'LowLimit'->>'issuer';
+                new_balance := (final_fields->'Balance'->>'value')::NUMERIC;
+            ELSIF final_fields->'HighLimit'->>'issuer' != pft_issuer THEN
+                account_address := final_fields->'HighLimit'->>'issuer';
+                -- Negate the balance for high limit accounts
+                new_balance := -(final_fields->'Balance'->>'value')::NUMERIC;
+            END IF;
+
+            -- Update or insert the balance
+            INSERT INTO pft_holders (account, balance, last_updated, last_tx_hash)
+            VALUES (
+                account_address,
+                new_balance,
+                NEW.close_time_iso,
+                NEW.hash
+            )
+            ON CONFLICT (account) DO UPDATE
+            SET 
+                balance = EXCLUDED.balance,
+                last_updated = EXCLUDED.last_updated,
+                last_tx_hash = EXCLUDED.last_tx_hash;
+        END IF;
+    END LOOP;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create trigger
+CREATE TRIGGER update_pft_holders_trigger
+    AFTER INSERT ON postfiat_tx_cache
+    FOR EACH ROW
+    EXECUTE FUNCTION update_pft_holders();

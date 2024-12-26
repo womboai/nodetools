@@ -31,3 +31,10 @@ CREATE TABLE IF NOT EXISTS transaction_processing_results (
     reviewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (hash) REFERENCES postfiat_tx_cache(hash)
 );
+
+CREATE TABLE IF NOT EXISTS pft_holders (
+    account VARCHAR(255) PRIMARY KEY,
+    balance NUMERIC NOT NULL DEFAULT 0,
+    last_updated TIMESTAMP NOT NULL,
+    last_tx_hash VARCHAR(255)
+);

@@ -5,3 +5,4 @@ CREATE INDEX IF NOT EXISTS idx_close_time_iso
     ON postfiat_tx_cache(close_time_iso DESC);
 CREATE INDEX IF NOT EXISTS idx_memo_fields 
     ON transaction_memos(memo_type, memo_format, memo_data);
+CREATE INDEX IF NOT EXISTS idx_pft_holders_balance on pft_holders(balance);

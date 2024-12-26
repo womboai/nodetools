@@ -9,20 +9,24 @@ from loguru import logger
 from nodetools.models.models import (
     ResponseRule, 
     InteractionType, 
-    MessagePattern, 
+    InteractionPattern, 
     ResponseGenerator, 
     ResponseParameters,
-    Dependencies
+    Dependencies,
+    StructuralPattern,
+    MemoGroup
 )
+from nodetools.models.memo_processor import MemoProcessor
 from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
 from nodetools.protocols.transaction_repository import TransactionRepository
 from nodetools.protocols.credentials import CredentialManager
 from nodetools.protocols.openrouter import OpenRouterTool
+from nodetools.protocols.encryption import MessageEncryption
 from nodetools.configuration.configuration import NodeConfig
 from nodetools.task_processing.task_management_rules import create_business_logic, BusinessLogicProvider
 import traceback
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 def format_duration(seconds: float) -> str:
     """Format a duration in H:m:s format"""
@@ -42,12 +46,90 @@ class ReviewingResult:
 class TransactionReviewer:
     """
     Handles the core logic of reviewing individual transactions against business rules.
-    This is the lowest level component that actually applies business logic to transactions.
+    
+    Key responsibilities:
+    1. Transaction Pattern Matching:
+       - Identifies if transactions match known patterns
+       - Routes to appropriate review method based on structural pattern
+    
+    2. Group Management:
+       - Maintains state of pending transaction groups
+       - Handles chunked message reassembly
+       - Manages group lifecycle and cleanup
+    
+    3. Memo Processing:
+       - Coordinates memo processing through MemoProcessor
+       - Provides encryption context (credentials, keys) for memo decryption
+       - Creates synthetic transactions with processed memo content
+    
+    4. Business Rule Application:
+       - Validates transactions against business rules
+       - Determines if responses are needed
+       - Finds and validates response transactions
+    
+    Dependencies:
+    - business_logic: Provides transaction patterns and rules
+    - repository: For querying transaction history
+    - credential_manager: For decryption operations
+    - message_encryption: For ECDH handshake operations
+    - node_config: For system address configuration
+    
+    State Management:
+    - Tracks pending transaction groups
+    - Manages sync mode state
+    - Handles cleanup of stale groups
     """
-    def __init__(self, business_logic: BusinessLogicProvider, repository: TransactionRepository):
+    def __init__(
+            self, 
+            business_logic: BusinessLogicProvider, 
+            repository: TransactionRepository,
+            credential_manager: CredentialManager,
+            message_encryption: MessageEncryption,
+            node_config: NodeConfig
+        ):
+        # dependencies
         self.graph = business_logic.transaction_graph
         self.pattern_rule_map = business_logic.pattern_rule_map
         self.repository = repository
+        self.message_encryption = message_encryption
+        self.credential_manager = credential_manager
+        self.node_config = node_config
+
+        # state
+        self.pending_groups: Dict[str, MemoGroup] = {}  # group_id -> MemoGroup
+        self.STALE_GROUP_TIMEOUT = timedelta(minutes=10)
+        self.latest_processed_time: Optional[datetime] = None
+        self.is_syncing: bool = True  # Flag to indicate if we're in sync mode
+
+    def end_sync_mode(self):
+        self.is_syncing = False
+        self._cleanup_stale_groups()
+    
+    def _cleanup_stale_groups(self):
+        """Remove groups that haven't received new chunks within threshold"""
+        # Skip cleanup during sync mode
+        if self.is_syncing:
+            return
+
+        # Update latest processed time
+        current_time = datetime.now(timezone.utc)
+        if not self.latest_processed_time or current_time > self.latest_processed_time:
+            self.latest_processed_time = current_time
+
+        for group_id, group in list(self.pending_groups.items()):
+            # Get timestamp of last transaction in group
+            last_tx_time = max(
+                datetime.fromisoformat(tx.get('datetime', ''))
+                for tx in group.messages
+            )
+            
+            if last_tx_time + self.STALE_GROUP_TIMEOUT < current_time:
+                logger.warning(
+                    f"Dropping stale group {group_id}. "
+                    f"Last transaction was {self.latest_processed_time - last_tx_time} before latest processed transaction. "
+                    f"Had {len(group.chunk_indices)} chunks"
+                )
+                self.pending_groups.pop(group_id)
 
     async def review_transaction(self, tx: Dict[str, Any]) -> ReviewingResult:
         """Review a single transaction against all rules"""
@@ -66,6 +148,92 @@ class TransactionReviewer:
         # }
         # logger.debug(f"Reviewing transaction: {tx_summary}")
 
+        # First determine if transaction needs grouping
+        structural_result = StructuralPattern.match(tx)
+
+        match structural_result:
+            case StructuralPattern.DIRECT_MATCH:
+                return await self._review_direct_match(tx)
+            
+            case StructuralPattern.NEEDS_GROUPING:
+                return await self._review_group(tx, is_standardized=True)
+            
+            case StructuralPattern.NEEDS_LEGACY_GROUPING:
+                return await self._review_group(tx, is_standardized=False)
+            
+    async def _review_group(self, tx: Dict[str, Any], is_standardized: bool) -> ReviewingResult:
+        """Handle review of grouped transactions"""
+        group_id = tx.get('memo_type')
+
+        # Clean up stale groups
+        self._cleanup_stale_groups()
+
+        # Get or create group
+        if group_id not in self.pending_groups:
+            self.pending_groups[group_id] = MemoGroup.create_from_transaction(tx)
+        else:
+            if not self.pending_groups[group_id].add_memo(tx):
+                logger.warning(f"Failed to add message to group {group_id}")
+                return ReviewingResult(
+                    processed=True,
+                    rule_name="NoRule",
+                    notes=f"Message doesn't belong to group {group_id}"
+                )
+            
+        group = self.pending_groups[group_id]
+        structure = group.structure
+
+        # For standardized format, only attempting processing when we have all chunks
+        if is_standardized and len(group.chunk_indices) < structure.total_chunks:
+            return ReviewingResult(
+                processed=False,
+                rule_name="NoRule",
+                notes=f"Waiting for more chunks ({len(group.chunk_indices)}/{structure.total_chunks})"
+            )
+        
+        # Try processing the group
+        try:
+            processed_content = MemoProcessor.process_group(
+                group,
+                credential_manager=self.credential_manager,
+                message_encryption=self.message_encryption,
+                node_config=self.node_config
+            )
+            if not processed_content:
+                raise ValueError("Failed to process group content")
+            
+            # Create synthetic transaction with processed content
+            complete_tx = tx.copy()
+            complete_tx['memo_data'] = processed_content
+            return await self._review_direct_match(complete_tx)
+        
+        except Exception as e:
+            logger.error(f"Error processing group {group_id}: {e}")
+            logger.error(traceback.format_exc())
+
+            # For legacy groups, we lack the metadata to explicitly know if we've received all chunks
+            # So we'll keep the group in pending and try again later if we receive more chunks
+            if not is_standardized:
+                return ReviewingResult(
+                    processed=True,
+                    rule_name="NoRule",
+                    notes=f"Failed to process group: {str(e)}. Maybe more chunks are coming."
+                )
+            
+            # Otherwise, remove the failed group
+            self.pending_groups.pop(group_id)
+            return ReviewingResult(
+                processed=True,
+                rule_name="ProcessingError",
+                notes=f"Failed to process group: {str(e)}"
+            )
+        finally:
+            # Remove successful groups 
+            if group_id in self.pending_groups and processed_content:
+                self.pending_groups.pop(group_id) 
+
+    async def _review_direct_match(self, tx: Dict[str, Any]) -> ReviewingResult:
+        """Handle review of transactions that can be matched directly"""
         # First find matching pattern
         pattern_id = self.graph.find_matching_pattern(tx)
 
@@ -170,7 +338,7 @@ class ResponseRoutingResult:
 class QueueConfig:
     """Configuration for a response queue and its generator"""
     queue: asyncio.Queue
-    pattern: MessagePattern
+    pattern: InteractionPattern
     rule: ResponseRule
 
 class ResponseQueueRouter:
@@ -549,12 +717,14 @@ class TransactionOrchestrator:
             generic_pft_utilities: GenericPFTUtilities, 
             transaction_repository: TransactionRepository,
             credential_manager: CredentialManager,
+            message_encryption: MessageEncryption,
             node_config: NodeConfig,
             openrouter: OpenRouterTool
     ):
         self.generic_pft_utilities = generic_pft_utilities
         self.transaction_repository = transaction_repository
         self.credential_manager = credential_manager
+        self.message_encryption = message_encryption
         self.node_config = node_config
         self.openrouter = openrouter
         self.review_queue = asyncio.Queue()     # Queue for transactions needing review
@@ -570,7 +740,10 @@ class TransactionOrchestrator:
             if not self.reviewer:
                 self.reviewer = TransactionReviewer(
                     business_logic=create_business_logic(),
-                    repository=self.transaction_repository
+                    repository=self.transaction_repository,
+                    credential_manager=self.credential_manager,
+                    message_encryption=self.message_encryption,
+                    node_config=self.node_config
                 )
             if not self.response_manager:
                 self.response_manager = ResponseQueueRouter(
@@ -659,6 +832,7 @@ class TransactionOrchestrator:
                     # Check if queue just became empty
                     queue_size = self.review_queue.qsize()
                     if queue_size == 0:
+                        self.reviewer.end_sync_mode()
                         logger.info(f"Finished reviewing. Total transactions reviewed: {reviewed_count}")
 
                     if reviewed_count % COUNT_LOG_INTERVAL == 0:

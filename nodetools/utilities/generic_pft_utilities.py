@@ -103,6 +103,7 @@ class GenericPFTUtilities:
                 generic_pft_utilities=self, 
                 transaction_repository=self.transaction_repository,
                 credential_manager=self.credential_manager,
+                message_encryption=self.message_encryption,
                 node_config=self.node_config,
                 openrouter=self.openrouter,
             )
@@ -1363,8 +1364,7 @@ class GenericPFTUtilities:
         
         Note: This operation can be time-consuming for many holder accounts.
         """
-        self.set_pft_holders(self.fetch_pft_trustline_data())
-        all_accounts = list(self.get_pft_holders().keys())
+        all_accounts = list(self.fetch_pft_trustline_data().keys())  # TODO: consider simplifying fetch_pft_trustline_data()
         total_accounts = len(all_accounts)
         rows_inserted = 0
         logger.info(f"Starting transaction history sync for {total_accounts} accounts")
@@ -1391,8 +1391,12 @@ class GenericPFTUtilities:
         return self._pft_holders.copy()
         
     def set_pft_holders(self, data: Dict[str, Dict[str, Any]]):
-        """Setter for pft_holders"""
-        self._pft_holders = data
+        """
+        This method is maintained for backwards compatibility but now logs a warning
+        since balances are managed by database triggers.
+        """
+        logger.warning("set_pft_holders called but balances are now managed by database triggers")
+        pass
 
     def get_latest_outgoing_context_doc_link(
             self, 
@@ -1714,14 +1718,14 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
 """
         return output_string
     
-    def get_pft_balance(self, address: str) -> float:
-        """Get PFT balance for an account.
+    def fetch_pft_balance(self, address: str) -> Decimal:
+        """Get PFT balance for an account from the XRPL.
     
         Args:
             address (str): XRPL account address
             
         Returns:
-            float: PFT balance, 0 if no trustline exists
+            Decimal: PFT balance, 0 if no trustline exists
             
         Raises:
             Exception: If there is an error getting the PFT balance
@@ -1735,20 +1739,20 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
             response = client.request(account_lines)
             if response.is_successful():
                 pft_lines = [line for line in response.result['lines'] if line['account']==self.pft_issuer]
-                return float(pft_lines[0]['balance']) if pft_lines else 0
+                return Decimal(pft_lines[0]['balance']) if pft_lines else Decimal(0)
         
         except Exception as e:
-            logger.error(f"GenericPFTUtilities.get_pft_balance: Error getting PFT balance for {address}: {e}")
+            logger.error(f"GenericPFTUtilities.fetch_pft_balance: Error getting PFT balance for {address}: {e}")
             return 0
     
-    def get_xrp_balance(self, address: str) -> float:
-        """Get XRP balance for an account.
+    def fetch_xrp_balance(self, address: str) -> Decimal:
+        """Get XRP balance for an account from the XRPL.
         
         Args:
             account_address (str): XRPL account address
             
         Returns:
-            float: XRP balance
+            Decimal: XRP balance
 
         Raises:
             XRPAccountNotFoundException: If the account is not found
@@ -1762,10 +1766,10 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         try:
             response = client.request(acct_info)
             if response.is_successful():
-                return float(response.result['account_data']['Balance']) / 1_000_000
+                return Decimal(response.result['account_data']['Balance']) / 1_000_000
 
         except Exception as e:
-            logger.error(f"GenericPFTUtilities.get_xrp_balance: Error getting XRP balance: {e}")
+            logger.error(f"GenericPFTUtilities.fetch_xrp_balance: Error getting XRP balance: {e}")
             raise Exception(f"Error getting XRP balance: {e}")
 
     def verify_xrp_balance(self, address: str, minimum_xrp_balance: int) -> bool:
@@ -1779,7 +1783,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         Returns:
             tuple: (bool, float) - Whether balance check passed and current balance
         """
-        balance = self.get_xrp_balance(address)
+        balance = self.fetch_xrp_balance(address)
         return (balance >= minimum_xrp_balance, balance)
 
     def extract_transaction_info_from_response_object(self, response):
