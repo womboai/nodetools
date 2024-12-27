@@ -105,9 +105,13 @@ class GenericPFTUtilities(Protocol):
         ...
 
     def fetch_pft_balance(self, address: str) -> Decimal:
-        """Get PFT balance for an account"""
+        """Get PFT balance for an account from the XRPL"""
         ...
 
     def fetch_xrp_balance(self, address: str) -> Decimal:
-        """Get XRP balance for an account"""
+        """Get XRP balance for an account from the XRPL"""
+        ...
+
+    def get_pft_balance(self, account_address: str) -> Decimal:
+        """Get PFT balance for an account from the database"""
         ...

@@ -90,8 +90,6 @@ class GenericPFTUtilities:
             for address in self.node_config.auto_handshake_addresses:
                 self.message_encryption.register_auto_handshake_wallet(address)
 
-            self._pft_holders = None
-
             # Initialize XRPL monitor
             self.xrpl_monitor = XRPLWebSocketMonitor(
                 generic_pft_utilities=self,
@@ -1258,7 +1256,7 @@ class GenericPFTUtilities:
         
         return formatted_transactions
     
-    def _batch_insert_transactions(self, transactions: List[Dict[str, Any]], batch_size: int = 100) -> int:
+    async def _batch_insert_transactions(self, transactions: List[Dict[str, Any]], batch_size: int = 100) -> int:
         """Insert transaction records in batches, skipping duplicates via SQL.
         
         Uses PostgreSQL's ON CONFLICT DO NOTHING for duplicate handling and 
@@ -1277,7 +1275,7 @@ class GenericPFTUtilities:
 
         try:
             for batch in self._get_transaction_batches(transactions, batch_size):
-                inserted = self.transaction_repository.batch_insert_transactions(batch)
+                inserted = await self.transaction_repository.batch_insert_transactions(batch)
                 total_rows_inserted += inserted
 
             return total_rows_inserted
@@ -1307,7 +1305,7 @@ class GenericPFTUtilities:
         else:
             logger.error("Database error occurred: %s", error)
 
-    def fetch_pft_trustline_data(self) -> List[Dict[str, Any]]:
+    def fetch_pft_trustline_data(self) -> Dict[str, Dict[str, Any]]:
         """Get PFT token holder account information.
         
         Queries the XRPL for all accounts that have trustlines with the PFT issuer account.
@@ -1315,8 +1313,9 @@ class GenericPFTUtilities:
         holder balances (e.g., if issuer shows -100, holder has +100).
 
         Returns:
-            List of dictionaries containing:
+            Dict of dictionaries with keys:
                 - account (str): XRPL account address of the token holder
+            and values:
                 - balance (str): Raw balance string from XRPL
                 - currency (str): Currency code (should be 'PFT')
                 - limit_peer (str): Trustline limit
@@ -1354,7 +1353,7 @@ class GenericPFTUtilities:
         if not tx_hist:
             return 0
 
-        return self._batch_insert_transactions(tx_hist)
+        return asyncio.run(self._batch_insert_transactions(tx_hist))
     
     @PerformanceMonitor.measure('sync_pft_transaction_history')
     def sync_pft_transaction_history(self):
@@ -1387,16 +1386,17 @@ class GenericPFTUtilities:
         logger.info(f"Completed transaction history sync. Synced {accounts_processed}/{total_accounts} accounts")
 
     def get_pft_holders(self) -> Dict[str, Dict[str, Any]]:
-        """Getter for pft_holders"""
-        return self._pft_holders.copy()
-        
-    def set_pft_holders(self, data: Dict[str, Dict[str, Any]]):
-        """
-        This method is maintained for backwards compatibility but now logs a warning
-        since balances are managed by database triggers.
-        """
-        logger.warning("set_pft_holders called but balances are now managed by database triggers")
-        pass
+        """Get current PFT holder data from database"""
+        try:
+            return asyncio.run(self.transaction_repository.get_pft_holders())
+        except Exception as e:
+            logger.error(f"Error getting PFT holders: {e}")
+            return {}
+    
+    def get_pft_balance(self, account_address: str) -> Decimal:
+        """Get PFT balance for an account from the database"""
+        pft_holders = self.get_pft_holders()
+        return pft_holders.get(account_address, {}).get('balance', Decimal(0))
 
     def get_latest_outgoing_context_doc_link(
             self, 

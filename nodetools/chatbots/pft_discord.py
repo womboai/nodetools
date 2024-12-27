@@ -3018,7 +3018,7 @@ My specific question/request is: {user_query}"""
             if float(data['balance']) <= -2000
         ]
         
-        transactions = self.generic_pft_utilities.transaction_repository.get_active_wallet_transactions(active_wallets)
+        transactions = asyncio.run(self.generic_pft_utilities.transaction_repository.get_active_wallet_transactions(active_wallets))
         
         return pd.DataFrame(transactions)
 

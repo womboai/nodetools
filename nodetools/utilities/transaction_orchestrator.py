@@ -22,6 +22,7 @@ from nodetools.protocols.transaction_repository import TransactionRepository
 from nodetools.protocols.credentials import CredentialManager
 from nodetools.protocols.openrouter import OpenRouterTool
 from nodetools.protocols.encryption import MessageEncryption
+from nodetools.utilities.compression import CompressionError
 from nodetools.configuration.configuration import NodeConfig
 from nodetools.task_processing.task_management_rules import create_business_logic, BusinessLogicProvider
 import traceback
@@ -80,20 +81,16 @@ class TransactionReviewer:
     - Handles cleanup of stale groups
     """
     def __init__(
-            self, 
-            business_logic: BusinessLogicProvider, 
-            repository: TransactionRepository,
-            credential_manager: CredentialManager,
-            message_encryption: MessageEncryption,
-            node_config: NodeConfig
+            self,
+            business_logic: BusinessLogicProvider,
+            dependencies: Dependencies
         ):
-        # dependencies
+        # business logic dependencies
         self.graph = business_logic.transaction_graph
         self.pattern_rule_map = business_logic.pattern_rule_map
-        self.repository = repository
-        self.message_encryption = message_encryption
-        self.credential_manager = credential_manager
-        self.node_config = node_config
+
+        # framework dependencies
+        self.dependencies = dependencies
 
         # state
         self.pending_groups: Dict[str, MemoGroup] = {}  # group_id -> MemoGroup
@@ -119,16 +116,16 @@ class TransactionReviewer:
         for group_id, group in list(self.pending_groups.items()):
             # Get timestamp of last transaction in group
             last_tx_time = max(
-                datetime.fromisoformat(tx.get('datetime', ''))
-                for tx in group.messages
+                tx['datetime'].replace(tzinfo=timezone.utc) if tx['datetime'].tzinfo is None else tx['datetime']
+                for tx in group.memos
             )
             
             if last_tx_time + self.STALE_GROUP_TIMEOUT < current_time:
-                logger.warning(
-                    f"Dropping stale group {group_id}. "
-                    f"Last transaction was {self.latest_processed_time - last_tx_time} before latest processed transaction. "
-                    f"Had {len(group.chunk_indices)} chunks"
-                )
+                # logger.warning(
+                #     f"Dropping stale group {group_id}. "
+                #     f"Last transaction was {self.latest_processed_time - last_tx_time} before latest processed transaction. "
+                #     f"Had {len(group.chunk_indices)} chunks"
+                # )
                 self.pending_groups.pop(group_id)
 
     async def review_transaction(self, tx: Dict[str, Any]) -> ReviewingResult:
@@ -152,6 +149,12 @@ class TransactionReviewer:
         structural_result = StructuralPattern.match(tx)
 
         match structural_result:
+            case StructuralPattern.NO_MEMO:
+                return ReviewingResult(
+                    processed=True,
+                    rule_name="NoRule",
+                    notes="No memo present"
+                )
             case StructuralPattern.DIRECT_MATCH:
                 return await self._review_direct_match(tx)
             
@@ -195,42 +198,43 @@ class TransactionReviewer:
         try:
             processed_content = MemoProcessor.process_group(
                 group,
-                credential_manager=self.credential_manager,
-                message_encryption=self.message_encryption,
-                node_config=self.node_config
+                credential_manager=self.dependencies.credential_manager,
+                message_encryption=self.dependencies.message_encryption,
+                node_config=self.dependencies.node_config
             )
-            if not processed_content:
-                raise ValueError("Failed to process group content")
             
             # Create synthetic transaction with processed content
             complete_tx = tx.copy()
             complete_tx['memo_data'] = processed_content
+            self.pending_groups.pop(group_id) 
             return await self._review_direct_match(complete_tx)
+        
+        except CompressionError as e:
+            # For legacy groups, we lack the metadata to explicitly know if we've received all chunks
+            # So we'll keep the group in pending and try again later if we receive more chunks
+            if not is_standardized:
+                # chunk_indices = group.chunk_indices
+                # logger.warning(f"Failed to process group {group_id} (legacy). May be due to missing chunks. Received indices: {chunk_indices}")
+                return ReviewingResult(
+                    processed=True,
+                    rule_name="NoRule",
+                    notes=f"Failed to process group (legacy). May be due to missing chunks."
+                )
+            
+            # For standardized format, re-raise to be caught by general exception handler
+            raise
         
         except Exception as e:
             logger.error(f"Error processing group {group_id}: {e}")
             logger.error(traceback.format_exc())
 
-            # For legacy groups, we lack the metadata to explicitly know if we've received all chunks
-            # So we'll keep the group in pending and try again later if we receive more chunks
-            if not is_standardized:
-                return ReviewingResult(
-                    processed=True,
-                    rule_name="NoRule",
-                    notes=f"Failed to process group: {str(e)}. Maybe more chunks are coming."
-                )
-            
-            # Otherwise, remove the failed group
+            # Remove the failed group
             self.pending_groups.pop(group_id)
             return ReviewingResult(
                 processed=True,
                 rule_name="ProcessingError",
                 notes=f"Failed to process group: {str(e)}"
             )
-        finally:
-            # Remove successful groups 
-            if group_id in self.pending_groups and processed_content:
-                self.pending_groups.pop(group_id) 
 
     async def _review_direct_match(self, tx: Dict[str, Any]) -> ReviewingResult:
         """Handle review of transactions that can be matched directly"""
@@ -262,7 +266,7 @@ class TransactionReviewer:
 
         try:
 
-            if await rule.validate(tx):  # Pure business rule validation
+            if await rule.validate(tx, dependencies=self.dependencies):  # Pure business rule validation
                 
                 # logger.debug(f"Rule {rule.__class__.__name__} validated transaction")
 
@@ -282,7 +286,7 @@ class TransactionReviewer:
                     case InteractionType.REQUEST:
                         # 4. Get response query and execute it
                         response_query = await rule.find_response(tx)
-                        result = await self.repository.execute_query(
+                        result = await self.dependencies.transaction_repository.execute_query(
                             response_query.query,
                             response_query.params
                         )
@@ -326,6 +330,7 @@ class TransactionReviewer:
         except Exception as e:
             logger.error(f"Error processing rule {rule.__class__.__name__}: {e}")
             logger.error(traceback.format_exc())
+            logger.error(f"Transaction: {tx}")
     
 @dataclass
 class ResponseRoutingResult:
@@ -544,16 +549,14 @@ class ResponseProcessor:
             queue: asyncio.Queue,
             response_manager: ResponseQueueRouter,
             generator: ResponseGenerator,
-            credential_manager: CredentialManager,
-            generic_pft_utilities: GenericPFTUtilities,
+            dependencies: Dependencies,
             shutdown_event: asyncio.Event,
             pattern_id: str
         ):
         self.queue = queue
         self.response_manager = response_manager
         self.generator = generator
-        self.credential_manager = credential_manager
-        self.generic_pft_utilities = generic_pft_utilities
+        self.dependencies = dependencies
         self._shutdown_event = shutdown_event
         self.pattern_id = pattern_id
         self.processed_count = 0
@@ -617,17 +620,18 @@ class ResponseProcessor:
             response_params: ResponseParameters = await self.generator.construct_response(tx, evaluation)
 
             # Get appropriate wallet based on source
-            node_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(
-                self.credential_manager.get_credential(f'{response_params.source}__v1xrpsecret')
+            node_wallet = self.dependencies.generic_pft_utilities.spawn_wallet_from_seed(
+                self.dependencies.credential_manager.get_credential(f'{response_params.source}__v1xrpsecret')
             )
 
-            # Send response transaction
-            return await self.generic_pft_utilities.process_queue_transaction(
-                wallet=node_wallet,
-                memo=response_params.memo,
-                destination=response_params.destination,
-                pft_amount=response_params.pft_amount
-            )
+            # TODO: uncomment this when ready to send responses
+            # # Send response transaction
+            # return await self.dependenciesgeneric_pft_utilities.process_queue_transaction(
+            #     wallet=node_wallet,
+            #     memo=response_params.memo,
+            #     destination=response_params.destination,
+            #     pft_amount=response_params.pft_amount
+            # )
 
         except Exception as e:
             logger.error(f"ResponseProcessor._process_transaction: Error processing transaction: {e}")
@@ -643,20 +647,10 @@ class ResponseProcessorManager:
     def __init__(
             self, 
             response_manager: ResponseQueueRouter,
-            node_config: NodeConfig,
-            credential_manager: CredentialManager,
-            generic_pft_utilities: GenericPFTUtilities,
-            openrouter: OpenRouterTool,
-            transaction_repository: TransactionRepository
+            dependencies: Dependencies
         ):
         self.response_manager = response_manager
-        self.dependencies = Dependencies(
-            node_config=node_config,
-            credential_manager=credential_manager,
-            generic_pft_utilities=generic_pft_utilities,
-            openrouter=openrouter,
-            transaction_repository=transaction_repository
-        )
+        self.dependencies = dependencies
         self.consumers: Dict[str, ResponseProcessor] = {}
         self._tasks: List[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
@@ -676,8 +670,7 @@ class ResponseProcessorManager:
                     queue=config.queue,
                     response_manager=self.response_manager,
                     generator=generator,
-                    credential_manager=self.dependencies.credential_manager,
-                    generic_pft_utilities=self.dependencies.generic_pft_utilities,
+                    dependencies=self.dependencies,
                     shutdown_event=self._shutdown_event,
                     pattern_id=pattern_id
                 )
@@ -721,12 +714,14 @@ class TransactionOrchestrator:
             node_config: NodeConfig,
             openrouter: OpenRouterTool
     ):
-        self.generic_pft_utilities = generic_pft_utilities
-        self.transaction_repository = transaction_repository
-        self.credential_manager = credential_manager
-        self.message_encryption = message_encryption
-        self.node_config = node_config
-        self.openrouter = openrouter
+        self.dependencies = Dependencies(
+            generic_pft_utilities=generic_pft_utilities,
+            transaction_repository=transaction_repository,
+            credential_manager=credential_manager,
+            message_encryption=message_encryption,
+            node_config=node_config,
+            openrouter=openrouter
+        )
         self.review_queue = asyncio.Queue()     # Queue for transactions needing review
         self.routing_queue = asyncio.Queue()    # Queue for transactions needing responses
         self.reviewer: TransactionReviewer = None  # will be initialized in start()
@@ -737,42 +732,37 @@ class TransactionOrchestrator:
     async def start(self):
         """Coordinate transaction processing"""
         try:
+            business_logic = create_business_logic()
+
             if not self.reviewer:
                 self.reviewer = TransactionReviewer(
-                    business_logic=create_business_logic(),
-                    repository=self.transaction_repository,
-                    credential_manager=self.credential_manager,
-                    message_encryption=self.message_encryption,
-                    node_config=self.node_config
+                    business_logic=business_logic,
+                    dependencies=self.dependencies
                 )
             if not self.response_manager:
                 self.response_manager = ResponseQueueRouter(
-                    business_logic=create_business_logic(),
+                    business_logic=business_logic,
                     review_queue=self.review_queue,
-                    transaction_repository=self.transaction_repository,
+                    transaction_repository=self.dependencies.transaction_repository,
                     shutdown_event=self._shutdown_event
                 )
             if not self.consumer_manager:
                 self.consumer_manager = ResponseProcessorManager(
                     response_manager=self.response_manager,
-                    node_config=self.node_config,
-                    credential_manager=self.credential_manager,
-                    generic_pft_utilities=self.generic_pft_utilities,
-                    openrouter=self.openrouter,
-                    transaction_repository=self.transaction_repository
+                    dependencies=self.dependencies
                 )
 
             # Start websocket with review queue
-            self.generic_pft_utilities.xrpl_monitor.start(queue=self.review_queue)
+            self.dependencies.generic_pft_utilities.xrpl_monitor.start(queue=self.review_queue)
 
             # Sync and process historical data
-            self.generic_pft_utilities.sync_pft_transaction_history()
+            self.dependencies.generic_pft_utilities.sync_pft_transaction_history()
             
             # Get unverified transactions and add them to review queue
             logger.debug("TransactionOrchestrator: Getting unverified transactions")
-            unverified_txs = await self.transaction_repository.get_unprocessed_transactions(
+            unverified_txs = await self.dependencies.transaction_repository.get_unprocessed_transactions(
                 order_by="close_time_iso ASC",
-                include_processed=False   # For debugging only
+                include_processed=True   # For debugging only
             )
             logger.debug(f"TransactionOrchestrator: Found {len(unverified_txs)} unverified transactions")
 
@@ -820,13 +810,13 @@ class TransactionOrchestrator:
                     tx = await asyncio.wait_for(self.review_queue.get(), timeout=IDLE_LOG_INTERVAL)
                     
                     result = await self.reviewer.review_transaction(tx)
-                    await self.transaction_repository.store_reviewing_result(tx['hash'], result)
+                    await self.dependencies.transaction_repository.store_reviewing_result(tx['hash'], result)
                     reviewed_count += 1
                     last_activity_time = time.time()
 
                     # If transaction needs a response, add to processing queue
                     if not result.processed:
-                        logger.debug(f"TransactionOrchestrator: Transaction {tx['hash']} needs a response. Adding to routing queue.")
+                        logger.debug(f"TransactionOrchestrator: Transaction {tx['hash']} with memo type {tx['memo_type']} needs a response.")
                         await self.routing_queue.put(tx)
 
                     # Check if queue just became empty
@@ -854,6 +844,15 @@ class TransactionOrchestrator:
                 except Exception as e:
                     logger.error(f"Error reviewing transaction: {e}")
                     logger.error(traceback.format_exc())
+                    logger.error(f"Transaction: {tx}")
+
+                    # debugging
+                    raise
+
+        # debugging
+        except Exception as e:
+            raise
+
         finally:
             logger.debug("TransactionOrchestrator: Review loop shutdown complete")
 
@@ -916,6 +915,14 @@ class TransactionOrchestrator:
                 except Exception as e:
                     logger.error(f"Error processing transaction: {e}")
                     logger.error(traceback.format_exc())
+
+                    # debugging
+                    raise
+
+        # debugging
+        except Exception as e:
+            raise
+
         finally:
             logger.debug("TransactionOrchestrator: Route loop shutdown complete")
 

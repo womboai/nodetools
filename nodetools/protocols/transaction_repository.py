@@ -22,18 +22,6 @@ class TransactionRepository(Protocol):
         """
         ...
 
-    async def reprocess_transactions(
-        self,
-        tx_hashes: List[str]
-    ) -> None:
-        """
-        Remove processing results for specified transactions so they can be reprocessed.
-        
-        Args:
-            tx_hashes: List of transaction hashes to reprocess
-        """
-        ...
-
     async def store_reviewing_result(self, tx_hash: str, result: 'ReviewingResult') -> None:
         """Store the reviewing result for a transaction"""
         ...

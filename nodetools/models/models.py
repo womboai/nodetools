@@ -28,7 +28,7 @@ class MemoDataStructureType(Enum):
 
 @dataclass
 class Dependencies:
-    """Container for all possible dependencies needed by business logic"""
+    """Container for core dependencies that can be provided by NodeTools"""
     node_config: 'NodeConfig'
     credential_manager: 'CredentialManager'
     generic_pft_utilities: 'GenericPFTUtilities'
@@ -80,7 +80,7 @@ class MemoStructure:
             
         # Validate chunking part
         if chunking != MemoDataStructureType.NONE.value:
-            chunk_match = re.match(f'{MemoDataStructureType.CHUNK.value}\d+/\d+', chunking)
+            chunk_match = re.match(fr'{MemoDataStructureType.CHUNK.value}\d+/\d+', chunking)
             if not chunk_match:
                 return False
                 
@@ -107,7 +107,7 @@ class MemoStructure:
         chunk_index = None
         total_chunks = None
         if chunking != MemoDataStructureType.NONE.value:
-            chunk_match = re.match(f'{MemoDataStructureType.CHUNK.value}(\d+)/(\d+)', chunking)
+            chunk_match = re.match(fr'{MemoDataStructureType.CHUNK.value}(\d+)/(\d+)', chunking)
             if chunk_match:  # We know this matches from validation
                 chunk_index = int(chunk_match.group(1))
                 total_chunks = int(chunk_match.group(2))
@@ -185,7 +185,7 @@ class MemoGroup:
     Additional processing can be applied to the unchunked memo_data.
     """
     group_id: str
-    messages: List[Dict[str, Any]]
+    memos: List[Dict[str, Any]]
     structure: Optional[MemoStructure] = None
 
     @classmethod
@@ -194,7 +194,7 @@ class MemoGroup:
         structure = MemoStructure.from_transaction(tx)
         return cls(
             group_id=tx.get("memo_type"),
-            messages=[tx],
+            memos=[tx],
             structure=structure,
         )
     
@@ -227,8 +227,28 @@ class MemoGroup:
             if not self._is_structure_consistent(new_structure):
                 logger.warning(f"Inconsistent message structure in group {self.group_id}")
                 return False
+            self.memos.append(tx)
+            return True
         
-        self.messages.append(tx)
+        # For legacy format messages, handle duplicate chunks
+        if new_structure.chunk_index is not None:
+            # Find any existing memo with the same chunk index
+            existing_memo = next(
+                (memo for memo in self.memos 
+                if MemoStructure.from_transaction(memo).chunk_index == new_structure.chunk_index),
+                None
+            )
+            
+            if existing_memo:
+                # If we found a duplicate chunk, only replace if new tx has earlier datetime
+                if tx.get('datetime') < existing_memo.get('datetime'):
+                    self.memos.remove(existing_memo)
+                    self.memos.append(tx)
+                    return True
+                return False  # Duplicate chunk with later datetime, ignore it
+        
+        # No duplicate found, add the new memo
+        self.memos.append(tx)
         return True
         
     @property
@@ -236,7 +256,7 @@ class MemoGroup:
         """Get set of available chunk indices"""
         return {
             MemoStructure.from_transaction(tx).chunk_index
-            for tx in self.messages
+            for tx in self.memos
             if MemoStructure.from_transaction(tx).chunk_index is not None
         }
     
@@ -245,6 +265,7 @@ class StructuralPattern(Enum):
     Defines patterns for matching XRPL memo structure before content processing.
     Used to determine if memos need grouping and how they should be processed.
     """
+    NO_MEMO = "no_memo"                    # No memo present  
     DIRECT_MATCH = "direct_match"          # Can be pattern matched directly
     NEEDS_GROUPING = "needs_grouping"      # New format, needs grouping
     NEEDS_LEGACY_GROUPING = "needs_legacy_grouping"  # Legacy format, needs grouping
@@ -252,6 +273,10 @@ class StructuralPattern(Enum):
     @staticmethod
     def match(tx: Dict[str, Any]) -> str:
         """Determine how a transaction's memos should be handled"""
+        if not bool(tx.get('has_memos')):
+            return StructuralPattern.NO_MEMO
+
+        # Check if there is no memo present
         structure = MemoStructure.from_transaction(tx)
         if structure.is_standardized_format:
             # New format: Use metadata to determine grouping needs
@@ -403,18 +428,14 @@ class InteractionGraph:
 
 class InteractionRule(ABC):
     """Base class for interaction processing rules"""
+    transaction_type: InteractionType
+
     @abstractmethod
-    async def validate(self, tx: Dict[str, Any]) -> bool:
+    async def validate(self, tx: Dict[str, Any], *args, **kwargs) -> bool:
         """
         Validate any additional business rules for an interaction
         This is separate from the interaction pattern matching
         """
-        pass
-
-    @property
-    @abstractmethod
-    def interaction_type(self) -> InteractionType:
-        """Return the type of interaction this rule handles"""
         pass
 
 @dataclass

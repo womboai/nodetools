@@ -39,40 +39,36 @@ class TransactionRepository:
             List of dictionaries containing transaction history with memo details
         """ 
         try:
-            conn = self.db_manager.spawn_psycopg2_db_connection(self.username)
+            pool = await self.db_manager.get_pool(self.username)
 
-            with conn.cursor() as cur:
+            async with pool.acquire() as conn:
                 sql_manager = SQLManager()
                 query = sql_manager.load_query('xrpl', 'get_account_memo_history')
+
+                # Convert all %s to numbered parameters
+                param_count = query.count('%s')
+                for i in range(param_count):
+                    query = query.replace('%s', f'${i+1}', 1)
                 
                 if pft_issuer:
-                    query += " AND tx_json_parsed::text LIKE %s"
-                    params = (
+                    query += f" AND tx_json_parsed::text LIKE ${param_count+1}"
+                    params = [
                         account_address, account_address, account_address,
                         account_address, account_address, f"%{pft_issuer}%"
-                    )
+                    ]
                 else:
-                    params = (
+                    params = [
                         account_address, account_address, account_address,
                         account_address, account_address
-                    )
+                    ]
                     
-                cur.execute(query, params)
-                
-                columns = [desc[0] for desc in cur.description]
-                results = []
-                
-                for row in cur.fetchall():
-                    results.append(dict(zip(columns, row)))
-                
-                return results
+                rows = await conn.fetch(query, *params)
+                return [dict(row) for row in rows]
 
         except Exception as e:
             logger.error(f"TransactionRepository.get_account_memo_history: Error getting memo history: {e}")
             logger.error(traceback.format_exc())
             raise
-        finally:
-            conn.close()
 
     async def get_unprocessed_transactions(
         self, 
@@ -89,88 +85,65 @@ class TransactionRepository:
             include_processed: If True, includes all transactions regardless of processing status
         """
         try:
-            conn = self.db_manager.spawn_psycopg2_db_connection(self.username)
+            pool = await self.db_manager.get_pool(self.username)
             
-            with conn.cursor() as cur:
+            async with pool.acquire() as conn:
                 sql_manager = SQLManager()
                 query = sql_manager.load_query('xrpl', 'get_unverified_transactions')
-                cur.execute(query, (
+
+                # Convert %s to numbered parameters
+                query = query.replace('%s', '$1', 1)  # include_processed
+                query = query.replace('%s', '$2', 1)  # first order_by
+                query = query.replace('%s', '$3', 1)  # second order_by
+                query = query.replace('%s', 'CAST($4 AS INTEGER)', 1)  # limit for CASE WHEN
+                query = query.replace('%s', 'CAST($5 AS INTEGER)', 1)  # limit for actual limit
+                
+                rows = await conn.fetch(
+                    query,
                     include_processed,
-                    order_by,  # Used twice in the ORDER BY clause
-                    order_by,
-                    limit,     # For CASE WHEN NULL check
-                    limit      # For actual limit value
-                ))
+                    order_by,      # First usage in ORDER BY
+                    order_by,      # Second usage in ORDER BY
+                    limit,         # For CASE WHEN NULL check
+                    limit          # For actual limit value
+                )
                 
-                columns = [desc[0] for desc in cur.description]
-                results = []
-                
-                for row in cur.fetchall():
-                    results.append(dict(zip(columns, row)))
-                
-                return results
+                return [dict(row) for row in rows]
                 
         except Exception as e:
             logger.error(f"TransactionRepository.get_unverified_transactions: Error getting unverified transactions: {e}")
             logger.error(traceback.format_exc())
             raise
-        finally:
-            conn.close()
-
-    async def reprocess_transactions(
-        self,
-        tx_hashes: List[str]
-    ) -> None:
-        """
-        Remove processing results for specified transactions so they can be reprocessed.
-        
-        Args:
-            tx_hashes: List of transaction hashes to reprocess
-        """
-        try:
-            conn = self.db_manager.spawn_psycopg2_db_connection(self.username)
-            
-            with conn.cursor() as cur:
-                query = """
-                    DELETE FROM transaction_processing_results 
-                    WHERE hash = ANY(%s)
-                """
-                cur.execute(query, (tx_hashes,))
-                conn.commit()
-                
-                logger.info(f"Cleared processing results for {cur.rowcount} transactions")
-                
-        except Exception as e:
-            logger.error(f"TransactionRepository.reprocess_transactions: Error clearing processing results: {e}")
-            logger.error(traceback.format_exc())
-            raise
-        finally:
-            conn.close()
 
     async def store_reviewing_result(self, tx_hash: str, result: 'ReviewingResult') -> None:
         """Store the reviewing result for a transaction"""
         try:
-            conn = self.db_manager.spawn_psycopg2_db_connection(self.username)
+            pool = await self.db_manager.get_pool(self.username)
             
-            with conn.cursor() as cur:
-                sql_manager = SQLManager()
-                query = sql_manager.load_query('xrpl', 'store_reviewing_result')
-                values = (
-                    tx_hash,
-                    result.processed,
-                    result.rule_name,
-                    result.response_tx_hash,
-                    result.notes
-                )
-                cur.execute(query, values)
-                conn.commit()
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    sql_manager = SQLManager()
+                    query = sql_manager.load_query('xrpl', 'store_reviewing_result')
+                    
+                    # Convert %s to numbered parameters
+                    query = query.replace('%s', '$1', 1)
+                    query = query.replace('%s', '$2', 1)
+                    query = query.replace('%s', '$3', 1)
+                    query = query.replace('%s', '$4', 1)
+                    query = query.replace('%s', '$5', 1)
+                    
+                    await conn.execute(
+                        query,
+                        tx_hash,
+                        result.processed,
+                        result.rule_name,
+                        result.response_tx_hash,
+                        result.notes
+                    )
                 
         except Exception as e:
             logger.error(f"TransactionRepository.store_reviewing_result: Error storing reviewing result: {e}")
             logger.error(traceback.format_exc())
             raise
-        finally:
-            conn.close()
 
     async def execute_query(
         self,
@@ -179,30 +152,32 @@ class TransactionRepository:
     ) -> List[Dict[str, Any]]:
         """Execute a custom query with parameters."""
         try:
-            conn = self.db_manager.spawn_psycopg2_db_connection(self.username)
+            pool = await self.db_manager.get_pool(self.username)
             
-            with conn.cursor() as cur:
-                cur.execute(query, params or {})
-                # logger.debug(f"Executed query: {query}, params: {params}")
-                
-                # Get column names from cursor description
-                columns = [desc[0] for desc in cur.description]
-                results = []
-                
-                # Convert rows to dictionaries
-                for row in cur.fetchall():
-                    results.append(dict(zip(columns, row)))
-                
-                return results
+            async with pool.acquire() as conn:
+                # Convert named parameters from %(name)s to $1, $2, etc.
+                if params:
+                    # Create a mapping of param names to positions
+                    param_names = list(params.keys())
+                    for i, name in enumerate(param_names, 1):
+                        query = query.replace(f"%({name})s", f"${i}")
+                    # Convert dict to list of values in the correct order
+                    param_values = [params[name] for name in param_names]
+                else:
+                    param_values = []
+
+                # Execute query and fetch results
+                rows = await conn.fetch(query, *param_values)
+                return [dict(row) for row in rows]
                 
         except Exception as e:
             logger.error(f"TransactionRepository.execute_query: Error executing query: {e}")
+            logger.error(f"Query: {query}")
+            logger.error(f"Params: {params}")
             logger.error(traceback.format_exc())
             raise
-        finally:
-            conn.close()
 
-    def batch_insert_transactions(self, tx_list: List[Dict[str, Any]]) -> int:
+    async def batch_insert_transactions(self, tx_list: List[Dict[str, Any]]) -> int:
         """Batch insert transactions into postfiat_tx_cache.
         
         Args:
@@ -212,43 +187,47 @@ class TransactionRepository:
             int: Number of transactions successfully inserted
         """
         try:
-            conn = self.db_manager.spawn_psycopg2_db_connection(self.username)
+            pool = await self.db_manager.get_pool(self.username)
 
-            with conn.cursor() as cur:
-                sql_manager = SQLManager()
-                query = sql_manager.load_query('xrpl', 'insert_transaction')
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    sql_manager = SQLManager()
+                    query = sql_manager.load_query('xrpl', 'insert_transaction')
 
-                # Prepare transaction data
-                tx_data = [{
-                    "hash": tx.get("hash"),
-                    "ledger_index": tx.get("ledger_index"),
-                    "close_time_iso": tx.get("close_time_iso"),
-                    "tx_json": json.dumps(tx.get("tx_json", {})),
-                    "meta": json.dumps(tx.get("meta", {})),
-                    "validated": tx.get("validated", False)
-                } for tx in tx_list]
+                    # Convert %(name)s style parameters to $1, $2, etc.
+                    query = query.replace("%(hash)s", "$1")
+                    query = query.replace("%(ledger_index)s", "$2")
+                    query = query.replace("%(close_time_iso)s", "$3")
+                    query = query.replace("%(tx_json)s", "$4")
+                    query = query.replace("%(meta)s", "$5")
+                    query = query.replace("%(validated)s", "$6")
                 
-                # Execute batch insert
-                cur.executemany(query, tx_data)
+                    # Execute batch insert
+                    await conn.executemany(
+                        query,
+                        [(
+                            tx.get("hash"),
+                            tx.get("ledger_index"),
+                            tx.get("close_time_iso"),
+                            json.dumps(tx.get("tx_json", {})),
+                            json.dumps(tx.get("meta", {})),
+                            tx.get("validated", False)
+                        ) for tx in tx_list]
+                    )
 
-                # Get count of new insertions
-                hash_array = "ARRAY[" + ",".join(f"'{t['hash']}'" for t in tx_data) + "]"
-                cur.execute(f"""
-                    SELECT COUNT(*) FROM postfiat_tx_cache 
-                    WHERE hash = ANY({hash_array})
-                    AND xmin::text = txid_current()::text
-                """)
-                inserted = cur.fetchone()[0]
+                    # Get count of new insertions
+                    hash_array = "ARRAY[" + ",".join(f"'{t['hash']}'" for t in tx_list) + "]"
+                    row = await conn.fetchrow(f"""
+                        SELECT COUNT(*) FROM postfiat_tx_cache 
+                        WHERE hash = ANY({hash_array})
+                        AND xmin::text = txid_current()::text
+                    """)
+                    return row[0]
 
-                conn.commit()
-                return inserted
-            
         except Exception as e:
             logger.error(f"TransactionRepository: Error batch inserting transactions: {e}")
             logger.error(traceback.format_exc())
             raise
-        finally:
-            conn.close()
 
     async def insert_transaction(self, tx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Insert a single transaction and return the processed record"""
@@ -303,9 +282,9 @@ class TransactionRepository:
             Dict containing transaction data with decoded memos if found, None otherwise
         """
         try:
-            conn = self.db_manager.spawn_psycopg2_db_connection(self.username)
-            
-            with conn.cursor() as cur:
+            pool = await self.db_manager.get_pool(self.username)
+
+            async with pool.acquire() as conn:
                 query = """
                     SELECT 
                         m.*,
@@ -316,24 +295,17 @@ class TransactionRepository:
                         p.reviewed_at
                     FROM decoded_memos m
                     LEFT JOIN transaction_processing_results p ON m.hash = p.hash
-                    WHERE m.hash = %s
+                    WHERE m.hash = $1
                 """
-                cur.execute(query, (tx_hash,))
-                
-                row = cur.fetchone()
-                if row:
-                    columns = [desc[0] for desc in cur.description]
-                    return dict(zip(columns, row))
-                return None
+                row = await conn.fetchrow(query, tx_hash)
+                return dict(row) if row else None
                 
         except Exception as e:
             logger.error(f"TransactionRepository.get_decoded_transaction: Error getting transaction {tx_hash}: {e}")
             logger.error(traceback.format_exc())
             raise
-        finally:
-            conn.close()
 
-    def get_active_wallet_transactions(self, wallet_addresses: List[str]) -> List[Dict[str, Any]]:
+    async def get_active_wallet_transactions(self, wallet_addresses: List[str]) -> List[Dict[str, Any]]:
         """Get all transactions for the specified wallet addresses.
         
         Args:
@@ -343,27 +315,26 @@ class TransactionRepository:
             List of transactions with decoded memo data
         """
         try:
-            conn = self.db_manager.spawn_psycopg2_db_connection(self.username)
+            pool = await self.db_manager.get_pool(self.username)
             
-            with conn.cursor() as cur:
+            async with pool.acquire() as conn:
                 sql_manager = SQLManager()
                 query = sql_manager.load_query('xrpl', 'get_active_wallet_transactions')
                 
-                # Convert list to tuple for SQL IN clause
-                params = {'wallet_addresses': tuple(wallet_addresses)}
+                # Convert %(wallet_addresses)s to $1
+                query = query.replace("%(wallet_addresses)s", "$1")
                 
-                cur.execute(query, params)
+                # Execute query with tuple of addresses
+                rows = await conn.fetch(query, tuple(wallet_addresses))
                 
-                columns = [desc[0] for desc in cur.description]
                 results = []
-                
-                for row in cur.fetchall():
+                for row in rows:
+                    row_dict = dict(row)
                     # Parse JSON fields
-                    row_dict = dict(zip(columns, row))
-                    if isinstance(row_dict.get('tx_json'), str):
-                        row_dict['tx_json'] = json.loads(row_dict['tx_json'])
-                    if isinstance(row_dict.get('meta'), str):
-                        row_dict['meta'] = json.loads(row_dict['meta'])
+                    if isinstance(row.get('tx_json'), str):
+                        row_dict['tx_json'] = json.loads(row['tx_json'])
+                    if isinstance(row.get('meta'), str):
+                        row_dict['meta'] = json.loads(row['meta'])
                     results.append(row_dict)
                 
                 return results
@@ -372,5 +343,30 @@ class TransactionRepository:
             logger.error(f"TransactionRepository.get_active_wallet_transactions: Error getting transactions: {e}")
             logger.error(traceback.format_exc())
             raise
-        finally:
-            conn.close()
+
+    async def get_pft_holders(self) -> Dict[str, Dict[str, Any]]:
+        """Get current PFT holder data from database"""
+        try:
+            pool = await self.db_manager.get_pool(self.username)
+            
+            async with pool.acquire() as conn:
+                sql_manager = SQLManager()
+                query = sql_manager.load_query('xrpl', 'get_pft_holders')
+                
+                rows = await conn.fetch(query)
+                
+                results = {}
+                for row in rows:
+                    row_dict = dict(row)
+                    results[row_dict['account']] = {
+                        'balance': row_dict['balance'],
+                        'last_updated': row_dict['last_updated'],
+                        'last_tx_hash': row_dict['last_tx_hash']
+                    }
+                
+                return results
+                
+        except Exception as e:
+            logger.error(f"TransactionRepository.get_pft_holders: Error getting PFT holders: {e}")
+            logger.error(traceback.format_exc())
+            raise

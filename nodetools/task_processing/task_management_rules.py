@@ -35,10 +35,13 @@ import traceback
 from loguru import logger
 
 # NodeTools imports
+from nodetools.utilities.exceptions import HandshakeRequiredException
 from nodetools.task_processing.constants import TaskType, MessageType
+from nodetools.task_processing.user_context_parsing import UserTaskParser
 from nodetools.utilities.credentials import SecretType
 from nodetools.protocols.transaction_repository import TransactionRepository
 from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
+from nodetools.utilities.encryption import MessageEncryption
 from nodetools.ai.openrouter import OpenRouterTool
 from nodetools.protocols.credentials import CredentialManager
 from nodetools.configuration.configuration import NodeConfig, RuntimeConfig
@@ -61,6 +64,7 @@ from nodetools.models.models import (
 )
 
 # Task management node imports
+from nodetools.chatbots.personas.odv import odv_system_prompt
 from nodetools.prompts.initiation_rite import phase_4__system, phase_4__user
 from nodetools.prompts.rewards_manager import (
     verification_system_prompt,
@@ -152,7 +156,9 @@ def create_business_logic() -> BusinessLogicProvider:
         "task_output": TaskOutputRule(),
         "verification_prompt": VerificationPromptRule(),
         "verification_response": VerificationResponseRule(),
-        "reward": RewardRule()
+        "reward": RewardRule(),
+        "odv_request": ODVRequestRule(),
+        "odv_response": ODVResponseRule()
     }
 
     # Add initiation rite patterns to graph
@@ -340,9 +346,9 @@ class InitiationRiteRule(RequestRule):
 
         params = {
             # Attempt to retrieve account and destination from top level of tx or tx_json_parsed
-            'account': request_tx.get('account', request_tx.get('tx_json_parsed', {}).get('Account')),
-            'destination': request_tx.get('destination', request_tx.get('tx_json_parsed', {}).get('Destination')),
-            'request_time': request_tx.get('close_time_iso'),
+            'account': request_tx['account'],
+            'destination': request_tx['destination'],
+            'request_time': request_tx['close_time_iso'],
             'response_memo_type': SystemMemoType.INITIATION_REWARD.value,
             'require_after_request': self._should_require_after_request()
         }
@@ -351,6 +357,9 @@ class InitiationRiteRule(RequestRule):
     
 class InitiationRewardRule(ResponseRule):
     """Pure business logic for handling initiation rewards"""
+
+    async def validate(self, *args, **kwargs) -> bool:
+        return True
     
     def get_response_generator(self, dependencies: Dependencies) -> ResponseGenerator:
         """Get response generator for initiation rewards with all dependencies"""
@@ -435,6 +444,8 @@ class GoogleDocLinkRule(StandaloneRule):
     Pure business logic for handling google doc links
     Currently, this rule is a placeholder and does not perform any validation.
     """
+    async def validate(self, *args, **kwargs) -> bool:
+        return True
     
 ##########################################################################
 ########################## HANDSHAKE RULES ###############################
@@ -452,10 +463,10 @@ class HandshakeRequestRule(RequestRule):
         Validate business rules for a handshake request.
         Pattern matching is handled by TransactionGraph.
         Must:
-        1. Be sent to the node address or remembrancer address
+        1. Be sent an address in the node's auto-handshake addresses
         2. Be a valid ECDH public key
         """
-        if tx.get('destination') not in [dependencies.node_config.node_address, dependencies.node_config.remembrancer_address]:
+        if tx.get('destination') not in dependencies.node_config.auto_handshake_addresses:
             return False
         
         try:
@@ -497,9 +508,9 @@ class HandshakeRequestRule(RequestRule):
 
         params = {
             # Attempt to retrieve account and destination from top level of tx or tx_json_parsed
-            'account': request_tx.get('account', request_tx.get('tx_json_parsed', {}).get('Account')),
-            'destination': request_tx.get('destination', request_tx.get('tx_json_parsed', {}).get('Destination')),
-            'request_time': request_tx.get('close_time_iso'),
+            'account': request_tx['account'],
+            'destination': request_tx['destination'],
+            'request_time': request_tx['close_time_iso'],
             'response_memo_type': SystemMemoType.HANDSHAKE.value
         }
             
@@ -507,6 +518,9 @@ class HandshakeRequestRule(RequestRule):
 
 class HandshakeResponseRule(ResponseRule):
     """Pure business logic for handling handshake responses"""
+
+    async def validate(self, *args, **kwargs) -> bool:
+        return True
     
     def get_response_generator(self, dependencies: Dependencies) -> ResponseGenerator:
         """Get response generator for handshake response with all dependencies"""
@@ -626,10 +640,10 @@ class RequestPostFiatRule(RequestRule):
         """
         
         params = {
-            'account': request_tx.get('account', request_tx.get('tx_json_parsed', {}).get('Account')),
-            'destination': request_tx.get('destination', request_tx.get('tx_json_parsed', {}).get('Destination')),
-            'request_time': request_tx.get('close_time_iso'),
-            'response_memo_type': request_tx.get('memo_type'),
+            'account': request_tx['account'],
+            'destination': request_tx['destination'],
+            'request_time': request_tx['close_time_iso'],
+            'response_memo_type': request_tx['memo_type'],
             'response_memo_data': regex_to_sql_pattern(PROPOSAL_PATTERN.memo_data)
         }
             
@@ -637,6 +651,9 @@ class RequestPostFiatRule(RequestRule):
     
 class ProposalRule(ResponseRule):
     """Pure business logic for handling proposals"""
+
+    async def validate(self, *args, **kwargs) -> bool:
+        return True
     
     def get_response_generator(self, dependencies: Dependencies) -> ResponseGenerator:
         """Get response generator for proposals with all dependencies"""
@@ -717,12 +734,16 @@ class AcceptanceRule(StandaloneRule):
     Pure business logic for handling acceptances
     Currently, this rule is a placeholder and does not perform any validation.
     """
+    async def validate(self, *args, **kwargs) -> bool:
+        return True
     
 class RefusalRule(StandaloneRule):
     """
     Pure business logic for handling refusals
     Currently, this rule is a placeholder and does not perform any validation.
     """
+    async def validate(self, *args, **kwargs) -> bool:
+        return True
     
 ##############################################################################
 ########################## INITIAL VERIFICATION ##############################
@@ -761,10 +782,10 @@ class TaskOutputRule(RequestRule):
         """
         
         params = {
-            'account': request_tx.get('account', request_tx.get('tx_json_parsed', {}).get('Account')),
-            'destination': request_tx.get('destination', request_tx.get('tx_json_parsed', {}).get('Destination')),
-            'request_time': request_tx.get('close_time_iso'),
-            'response_memo_type': request_tx.get('memo_type'),
+            'account': request_tx['account'],
+            'destination': request_tx['destination'],
+            'request_time': request_tx['close_time_iso'],
+            'response_memo_type': request_tx['memo_type'],
             'response_memo_data': regex_to_sql_pattern(VERIFICATION_PROMPT_PATTERN.memo_data)
         }
             
@@ -772,6 +793,9 @@ class TaskOutputRule(RequestRule):
     
 class VerificationPromptRule(ResponseRule):
     """Pure business logic for handling verification prompts"""
+
+    async def validate(self, *args, **kwargs) -> bool:
+        return True
     
     def get_response_generator(self, dependencies: Dependencies) -> ResponseGenerator:
         """Get response generator for verification prompts with all dependencies"""
@@ -942,10 +966,10 @@ class VerificationResponseRule(RequestRule):
         """
         
         params = {
-            'account': request_tx.get('account', request_tx.get('tx_json_parsed', {}).get('Account')),
-            'destination': request_tx.get('destination', request_tx.get('tx_json_parsed', {}).get('Destination')),
-            'request_time': request_tx.get('close_time_iso'),
-            'response_memo_type': request_tx.get('memo_type'),
+            'account': request_tx['account'],
+            'destination': request_tx['destination'],
+            'request_time': request_tx['close_time_iso'],
+            'response_memo_type': request_tx['memo_type'],
             'response_memo_data': regex_to_sql_pattern(REWARD_PATTERN.memo_data)
         }
             
@@ -953,6 +977,9 @@ class VerificationResponseRule(RequestRule):
     
 class RewardRule(ResponseRule):
     """Pure business logic for handling rewards"""
+
+    async def validate(self, *args, **kwargs) -> bool:
+        return True
 
     def get_response_generator(self, dependencies: Dependencies) -> ResponseGenerator:
         """Get response generator for rewards with all dependencies"""
@@ -1241,10 +1268,152 @@ class ODVRequestRule(RequestRule):
         """
         
         params = {
-            'account': request_tx.get('account', request_tx.get('tx_json_parsed', {}).get('Account')),
-            'destination': request_tx.get('destination', request_tx.get('tx_json_parsed', {}).get('Destination')),
-            'request_time': request_tx.get('close_time_iso'),
-            'response_memo_type': f"{request_tx.get('memo_type')}_response"
+            'account': request_tx['account'],
+            'destination': request_tx['destination'],
+            'request_time': request_tx['close_time_iso'],
+            'response_memo_type': f"{request_tx['memo_type']}_response"
         }
             
         return ResponseQuery(query=query, params=params)
+    
+class ODVResponseRule(ResponseRule):
+    """Pure business logic for handling ODV responses"""
+
+    async def validate(self, *args, **kwargs) -> bool:
+        return True
+    
+    def get_response_generator(self, dependencies: Dependencies) -> ResponseGenerator:
+        """Get response generator for ODV responses with all dependencies"""
+        return ODVResponseGenerator(
+            openrouter=dependencies.openrouter,
+            node_config=dependencies.node_config,
+            generic_pft_utilities=dependencies.generic_pft_utilities,
+            message_encryption=dependencies.message_encryption,
+            credential_manager=dependencies.credential_manager
+        )
+
+class ODVResponseGenerator(ResponseGenerator):
+    """Evaluates ODV submissions and generates response parameters.
+    
+    Handles the evaluation of user ODV responses using AI and determines 
+    appropriate feedback and response parameters.
+    """
+    def __init__(
+            self,
+            openrouter: OpenRouterTool,
+            node_config: NodeConfig,
+            generic_pft_utilities: GenericPFTUtilities,
+            message_encryption: MessageEncryption,
+            credential_manager: CredentialManager
+        ):
+        self.openrouter = openrouter
+        self.node_config = node_config
+        self.generic_pft_utilities = generic_pft_utilities
+        self.user_task_parser = UserTaskParser(
+            generic_pft_utilities=self.generic_pft_utilities
+        )
+        self.message_encryption = message_encryption
+        self.credential_manager = credential_manager
+
+    async def evaluate_request(self, request_tx: Dict[str, Any]) -> Dict[str, Any]:
+        """Evaluate ODV submission"""
+        account = request_tx['account']
+        model = "openai/o1-preview-2024-09-12"
+        odv_text = request_tx.get('memo_data')
+        # logger.debug(f"ODVResponseGenerator.evaluate_request: Evaluating ODV submission: {odv_text}")
+
+        user_context = self._get_user_context(account)
+        system_prompt = odv_system_prompt
+        user_prompt = self._construct_user_prompt(
+            user_context=user_context,
+            user_query=odv_text
+        )
+
+        # Use AI to evaluate the ODV response
+        response = await self.openrouter.create_single_chat_completion(
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt
+        )
+        content = response['choices'][0]['message']['content']
+
+        return {'odv_response': "ODV SYSTEM: " + content}
+    
+    def _get_user_context(self, account_address: str) -> str:
+        """Get context string for an account.
+    
+        Args:
+            account_address: Account address
+            
+        Returns:
+            Context string for the account
+        """
+        return self.user_task_parser.get_full_user_context_string(
+            account_address,
+            memo_history=self.generic_pft_utilities.get_account_memo_history(account_address)
+        )
+    
+    @staticmethod
+    def _construct_user_prompt(user_context: str, user_query: str) -> str:
+        """Construct the prompt for the AI model."""
+        return f"""You are to ingest the User's context below
+    
+        <<< USER FULL CONTEXT STARTS HERE>>>
+        {user_context}
+        <<< USER FULL CONTEXT ENDS HERE>>>
+        
+        And consider what the user has asked below
+        <<<USER QUERY STARTS HERE>>>
+        {user_query}
+        <<<USER QUERY ENDS HERE>>>
+        
+        Output a response that is designed for the user to ACHIEVE MASSIVE RESULTS IN LINE WITH ODVS MANDATE
+        WHILE AT THE SAME TIME SPECIFICALLY MAXIMIZING THE USERS AGENCY AND STATED OBJECTIVES 
+        Keep your response to below 4 paragraphs."""
+
+    async def construct_response(
+            self,
+            request_tx: Dict[str, Any],
+            evaluation_result: Dict[str, Any]
+        ) -> ResponseParameters:
+        """Construct ODV response parameters"""
+        try:
+            account = request_tx['account']
+            destination = request_tx['destination']
+            memo_data = request_tx['memo_data']
+            was_encrypted = '[Decrypted]' in memo_data
+            response_memo_data = evaluation_result['odv_response']
+
+            if was_encrypted:
+                channel_key, counterparty_key = self.message_encryption.get_handshake_for_address(
+                    channel_address=destination,
+                    channel_counterparty=account
+                )
+                if not (channel_key and counterparty_key):
+                    raise HandshakeRequiredException(account, destination)
+                
+                shared_secret = self.credential_manager.get_shared_secret(
+                    received_key=counterparty_key,
+                    secret_type=SecretType.REMEMBRANCER
+                )
+                response_memo_data = MessageEncryption.process_encrypted_message(
+                    message=response_memo_data,
+                    shared_secret=shared_secret
+                )
+
+            # Construct response memo
+            memo = self.generic_pft_utilities.construct_standardized_xrpl_memo(
+                memo_data=response_memo_data,
+                memo_type=f"{request_tx.get('memo_type')}_response",  # Uses request memo_type + _response
+                memo_format="odv"
+            )
+
+            return ResponseParameters(
+                source=self.node_config.remembrancer_name,
+                memo=memo,
+                destination=request_tx['account'],
+                pft_amount=None  # Assuming no PFT transfer for ODV responses
+            )
+
+        except Exception as e:
+            raise Exception(f"Failed to construct ODV response: {e}")

@@ -4,7 +4,7 @@ DROP FUNCTION IF EXISTS find_transaction_response(text, text, timestamp, text, t
 CREATE OR REPLACE FUNCTION find_transaction_response(
     request_account TEXT,      -- Account that made the request
     request_destination TEXT,  -- Destination account of the request
-    request_time TIMESTAMP,    -- Timestamp of the request
+    request_time TEXT,         -- Timestamp of the request
     response_memo_type TEXT,   -- Expected memo_type of the response
     response_memo_format TEXT DEFAULT NULL,  -- Optional: expected memo_format
     response_memo_data TEXT DEFAULT NULL,    -- Optional: expected memo_data
@@ -36,7 +36,7 @@ BEGIN
         AND d.transaction_result = 'tesSUCCESS'
         AND (
             NOT require_after_request 
-            OR d.close_time_iso::timestamp > request_time
+            OR d.close_time_iso::timestamp > request_time::timestamp
         )
         AND d.memo_type = response_memo_type
         AND (response_memo_format IS NULL OR d.memo_format = response_memo_format)
@@ -119,6 +119,7 @@ DECLARE
     account_address TEXT;
     new_balance NUMERIC;
     pft_issuer TEXT;
+    meta_parsed JSONB;
 BEGIN
     -- Set issuer based on database name
     pft_issuer := CASE 
@@ -126,15 +127,32 @@ BEGIN
         ELSE 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
     END;
 
+    -- Skip if no meta data exists
+    IF NEW.meta IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    -- Try to parse meta as JSON
+    BEGIN
+        meta_parsed := NEW.meta::jsonb;
+    EXCEPTION WHEN OTHERS THEN
+        RETURN NEW;
+    END;
+
     -- Only process successful PFT transactions
-    IF NEW.meta_parsed->>'TransactionResult' != 'tesSUCCESS' THEN
+    IF meta_parsed->>'TransactionResult' != 'tesSUCCESS' THEN
+        RETURN NEW;
+    END IF;
+
+    -- Only process if AffectedNodes exists and is an array
+    IF meta_parsed->'AffectedNodes' IS NULL OR jsonb_typeof(meta_parsed->'AffectedNodes') != 'array' THEN
         RETURN NEW;
     END IF;
 
     -- Iterate through affected nodes
     -- In XRPL transactions, the AffectedNodes array in the metadata shows all ledger entries that were modified by the transaction.
     FOR affected_node IN 
-        SELECT jsonb_array_elements(NEW.meta_parsed->'AffectedNodes')
+        SELECT jsonb_array_elements(meta_parsed->'AffectedNodes')
     LOOP
         -- Only process RippleState entries for PFT
         IF affected_node->'ModifiedNode'->>'LedgerEntryType' = 'RippleState' 
@@ -158,7 +176,7 @@ BEGIN
             VALUES (
                 account_address,
                 new_balance,
-                NEW.close_time_iso,
+                NEW.close_time_iso::timestamp,
                 NEW.hash
             )
             ON CONFLICT (account) DO UPDATE

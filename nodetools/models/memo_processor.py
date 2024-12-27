@@ -17,71 +17,6 @@ class LegacyMemoProcessor:
     """Handles processing of legacy format memos"""
     
     @staticmethod
-    def find_complete_group(group: MemoGroup) -> Optional[MemoGroup]:
-        """
-        Find first complete sequence of chunks that can be processed.
-        Handles cases where duplicate sequences exist due to retries/errors.
-        
-        Returns None if no complete sequence is found.
-        """
-        if not group.messages:
-            return None
-        
-        current_sequence = []
-        highest_chunk_num = 0
-        sequences = []  # List to store all found sequences
-
-        # Sort messages by datetime to process in order
-        sorted_msgs = sorted(group.messages, key=lambda tx: tx.get('datetime'))
-
-        for msg in sorted_msgs:
-            structure = MemoStructure.from_transaction(msg)
-            if not structure.chunk_index:
-                continue
-
-            # If we see chunk_1 and already have chunks, this might be a new sequence
-            if structure.chunk_index == 1 and current_sequence:
-                # Check if previous sequence was complete
-                expected_chunks = set(range(1, highest_chunk_num + 1))
-                actual_chunks = {
-                    MemoStructure.from_transaction(tx).chunk_index 
-                    for tx in current_sequence
-                }
-
-                if expected_chunks == actual_chunks:
-                    # First sequence is complete, add it to our list
-                    sequences.append(current_sequence.copy())
-                
-                # Start fresh sequence either way
-                current_sequence = []
-                highest_chunk_num = 0
-
-            current_sequence.append(msg)
-            highest_chunk_num = max(highest_chunk_num, structure.chunk_index)
-
-        # Don't forget to check the last sequence
-        if current_sequence:
-            expected_chunks = set(range(1, highest_chunk_num + 1))
-            actual_chunks = {
-                MemoStructure.from_transaction(tx).chunk_index 
-                for tx in current_sequence
-            }
-            if expected_chunks == actual_chunks:
-                sequences.append(current_sequence)
-
-        # Try each sequence until we find one that successfully processes
-        for sequence in sequences:
-            try:
-                # Just attempt to process - if it works, this is our sequence
-                LegacyMemoProcessor.process_group(sequence)
-                return sequence
-            except Exception as e:
-                logger.debug(f"Sequence processing failed: {e}")
-                continue
-
-        return None
-    
-    @staticmethod
     def _determine_secret_type(address: str, node_config: NodeConfig) -> SecretType:
         """Determine the SecretType based on the address"""
         if address == node_config.node_address:
@@ -93,7 +28,7 @@ class LegacyMemoProcessor:
 
     @staticmethod
     def process_group(
-        sequence: List[Dict[str, Any]], 
+        group: MemoGroup, 
         credential_manager: Optional[CredentialManager] = None,
         message_encryption: Optional[MessageEncryption] = None,
         node_config: Optional[NodeConfig] = None
@@ -113,12 +48,12 @@ class LegacyMemoProcessor:
 
         Raises exception if processing fails.
         """
-        if not sequence:
+        if not group:
             raise ValueError("Empty sequence")
 
-        # Sort by chunk index
+        # Sort memos in MemoGroup by chunk index
         sorted_sequence = sorted(
-            sequence,
+            group.memos,
             key=lambda tx: MemoStructure.from_transaction(tx).chunk_index or 0
         )
 
@@ -135,8 +70,9 @@ class LegacyMemoProcessor:
             processed_data = processed_data.replace('COMPRESSED__', '', 1)
             try:
                 processed_data = decompress_data(processed_data)
-            except Exception as e:
-                raise ValueError(f"Decompression failed: {e}")
+            except CompressionError: 
+                # This will happen often with legacy memos since they're processed asynchronously and system may not have all chunks yet
+                raise
 
         # Handle decryption
         if processed_data.startswith('WHISPER__'):
@@ -150,8 +86,17 @@ class LegacyMemoProcessor:
             
             # Get channel details from first transaction
             first_tx = sorted_sequence[0]
-            channel_address = first_tx['destination']
-            channel_counterparty = first_tx['account']
+
+            # Channel addresses and channel counterparties vary depending on the direction of the message
+            # For example, if the message is from the node to the user, the account is the node's address and the destination is the user's address
+            # But the channel address must always be the node's address, and the channel counterparty must always be the user's address
+            # node_config.auto_handshake_addresses corresponds to the node's addresses that support encrypted channels
+            if first_tx['destination'] in node_config.auto_handshake_addresses:
+                channel_address = first_tx['destination']
+                channel_counterparty = first_tx['account']
+            else:  # The message is from the user to the node
+                channel_address = first_tx['account']
+                channel_counterparty = first_tx['destination']
             
             try:
                 # Determine secret type based on receiving address
@@ -163,7 +108,7 @@ class LegacyMemoProcessor:
                     channel_counterparty=channel_counterparty
                 )
                 if not (channel_key and counterparty_key):
-                    logger.warning("LegacyMemoProcessor.process_sequence: Cannot decrypt message - no handshake found")
+                    logger.warning("LegacyMemoProcessor.process_group: Cannot decrypt message - no handshake found")
                     return processed_data
             
                 # Get shared secret using credential manager's API
@@ -178,7 +123,7 @@ class LegacyMemoProcessor:
 
             except Exception as e:
                 message = (
-                    f"LegacyMemoProcessor.process_sequence: Error decrypting message "
+                    f"LegacyMemoProcessor.process_group: Error decrypting message "
                     f"between address {channel_address} and counterparty {channel_counterparty}: {processed_data}"
                 )
                 logger.error(message)
@@ -226,10 +171,10 @@ class StandardizedMemoProcessor:
         
         Raises ValueError if group is incomplete or processing fails.
         """
-        if not group.messages:
+        if not group.memos:
             raise ValueError("Empty group")
         
-        structure = MemoStructure.from_transaction(group.messages[0])
+        structure = MemoStructure.from_transaction(group.memos[0])
         if not structure.is_standardized_format:
             raise ValueError("Not a standardized format group")
         
@@ -245,7 +190,7 @@ class StandardizedMemoProcessor:
                 
             # Sort and join chunks
             sorted_msgs = sorted(
-                group.messages,
+                group.memos,
                 key=lambda tx: MemoStructure.from_transaction(tx).chunk_index or 0
             )
             
@@ -255,14 +200,15 @@ class StandardizedMemoProcessor:
                 
         else:
             # Single message
-            processed_data = group.messages[0]['memo_data']
+            processed_data = group.memos[0]['memo_data']
         
         # Apply decompression if specified
         if structure.compression_type == MemoDataStructureType.BROTLI:
             try:
                 processed_data = decompress_data(processed_data)
-            except Exception as e:
-                raise ValueError(f"Decompression failed: {e}")
+            except CompressionError as e:
+                logger.error(f"Decompression failed for group {group.group_id}: {e}")
+                raise
                 
         # Handle encryption if specified
         if structure.encryption_type == MemoDataStructureType.ECDH:
@@ -276,9 +222,18 @@ class StandardizedMemoProcessor:
                 return processed_data
 
             # Get channel details from first transaction
-            first_tx = group.messages[0]
-            channel_address = first_tx['destination']
-            channel_counterparty = first_tx['account']
+            first_tx = group.memos[0]
+
+            # Channel addresses and channel counterparties vary depending on the direction of the message
+            # For example, if the message is from the node to the user, the account is the node's address and the destination is the user's address
+            # But the channel address must always be the node's address, and the channel counterparty must always be the user's address
+            # node_config.auto_handshake_addresses corresponds to the node's addresses that support encrypted channels
+            if first_tx['destination'] in node_config.auto_handshake_addresses:
+                channel_address = first_tx['destination']
+                channel_counterparty = first_tx['account']
+            else:  # The message is from the user to the node
+                channel_address = first_tx['account']
+                channel_counterparty = first_tx['destination']
 
             try:
                 # Determine secret type based on receiving address
@@ -314,15 +269,15 @@ class StandardizedMemoProcessor:
         """
         Validate that all messages in the group have consistent structure.
         """
-        if not group.messages:
+        if not group.memos:
             return False
             
-        first_structure = MemoStructure.from_transaction(group.messages[0])
+        first_structure = MemoStructure.from_transaction(group.memos[0])
         if not first_structure.is_standardized_format:
             return False
             
         # Check all messages have same format
-        for msg in group.messages[1:]:
+        for msg in group.memos[1:]:
             structure = MemoStructure.from_transaction(msg)
             if not structure.is_standardized_format:
                 return False
@@ -345,34 +300,27 @@ class MemoProcessor:
         node_config: Optional[NodeConfig] = None
     ) -> Optional[str]:
         """Process a group of memos based on their format"""
-        if not group.messages:
+        if not group.memos:
             return None
         
-        first_tx = group.messages[0]
+        first_tx = group.memos[0]
         structure = MemoStructure.from_transaction(first_tx)
 
-        try:
-            if structure.is_standardized_format:
-                if StandardizedMemoProcessor.validate_group(group):
-                    return StandardizedMemoProcessor.process_group(
-                        group,
-                        credential_manager=credential_manager,
-                        message_encryption=message_encryption,
-                        node_config=node_config
-                    )
-                else:
-                    logger.warning("Invalid standardized format group")
-                    return None
+        if structure.is_standardized_format:
+            if StandardizedMemoProcessor.validate_group(group):
+                return StandardizedMemoProcessor.process_group(
+                    group,
+                    credential_manager=credential_manager,
+                    message_encryption=message_encryption,
+                    node_config=node_config
+                )
             else:
-                group = LegacyMemoProcessor.find_complete_group(group)
-                if group:
-                    return LegacyMemoProcessor.process_group(
-                        group,
-                        credential_manager=credential_manager,
-                        message_encryption=message_encryption,
-                        node_config=node_config
-                    )
+                logger.warning("Invalid standardized format group")
                 return None
-        except Exception as e:
-            logger.error(f"Failed to process memo group: {e}")
-            return None
+        else:
+            return LegacyMemoProcessor.process_group(
+                group,
+                credential_manager=credential_manager,
+                message_encryption=message_encryption,
+                node_config=node_config
+            )

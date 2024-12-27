@@ -1,4 +1,5 @@
 DROP VIEW IF EXISTS decoded_memos;
+DROP VIEW IF EXISTS enriched_transaction_results;
 
 CREATE VIEW decoded_memos AS
 WITH parsed_json AS (
@@ -28,3 +29,23 @@ SELECT
     (p.tx_json_parsed->'Memos'->0->'Memo') as main_memo_data
 FROM parsed_json p
 LEFT JOIN transaction_memos tm ON p.hash = tm.hash;
+
+CREATE VIEW enriched_transaction_results AS
+SELECT 
+    r.hash,
+    r.processed,
+    r.rule_name,
+    r.response_tx_hash,
+    r.notes,
+    r.reviewed_at,
+    m.account,
+    m.destination,
+    m.pft_amount,
+    m.xrp_fee,
+    m.memo_format,
+    m.memo_type,
+    m.memo_data,
+    m.transaction_time,
+    m.transaction_result
+FROM transaction_processing_results r
+LEFT JOIN transaction_memos m ON r.hash = m.hash;
