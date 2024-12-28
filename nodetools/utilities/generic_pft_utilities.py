@@ -589,11 +589,6 @@ class GenericPFTUtilities:
     def get_auto_handshake_addresses(self) -> set[str]:
         """Get a list of registered auto-handshake addresses"""
         return self.message_encryption.get_auto_handshake_addresses()
-    
-    def get_pending_handshakes(self, channel_counterparty: str):
-        """Get pending handshakes for a specific address"""
-        memo_history = self.get_account_memo_history(account_address=channel_counterparty, pft_only=False)
-        return self.message_encryption.get_pending_handshakes(memo_history=memo_history, channel_counterparty=channel_counterparty)
 
     def get_handshake_for_address(self, channel_address: str, channel_counterparty: str):
         """Get handshake for a specific address"""
@@ -1200,26 +1195,6 @@ class GenericPFTUtilities:
             return str(value) if isinstance(value, dict) else value
         except AttributeError:
             return None
-        
-    # @staticmethod
-    # def _process_memos(memos: Union[dict, list, None]) -> Optional[str]:
-    #     """Process memos for PostgreSQL storage.
-        
-    #     Args:
-    #         memos: List of memo dictionaries or single memo dict
-            
-    #     Returns:
-    #         JSON string representation of memos or None
-    #     """
-    #     if memos is None:
-    #         return None
-            
-    #     # Ensure memos is a list
-    #     memos = [memos] if not isinstance(memos, list) else memos
-        
-    #     # Extract only the 'Memo' part from each dictionary
-    #     processed_memos = [memo.get('Memo', memo) for memo in memos]
-    #     return json.dumps(processed_memos)
 
     def fetch_formatted_transaction_history(self, account_address: str) -> List[Dict[str, Any]]:
         """Fetch and format transaction history for an account.

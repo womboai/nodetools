@@ -73,27 +73,6 @@ XRPL_TESTNET = NetworkConfig(
     explorer_tx_url_mask='https://testnet.xrpl.org/transactions/{hash}/detailed'
 )
 
-# Node configurations
-MAINNET_NODE = NodeConfig(
-    node_name="postfiatfoundation",
-    node_address="r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD",
-    remembrancer_name="postfiatfoundation_remembrancer",
-    remembrancer_address="rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn",
-    discord_guild_id=1061800464045310053,
-    discord_activity_channel_id=1239280089699450920,
-    auto_handshake_addresses=set()  # use defaults
-)
-
-TESTNET_NODE = NodeConfig(
-    node_name="postfiatfoundation_testnet",
-    node_address="rUWuJJLLSH5TUdajVqsHx7M59Vj3P7giQV",
-    remembrancer_name="postfiatfoundation_testnet_remembrancer",
-    remembrancer_address="rN2oaXBhFE9urGN5hXup937XpoFVkrnUhu",
-    discord_guild_id=510536760367906818,
-    discord_activity_channel_id=1308884322199277699,
-    auto_handshake_addresses=set()  # use defaults
-)
-
 def get_network_config() -> NetworkConfig:
     """Get current network configuration based on runtime settings"""
     return XRPL_TESTNET if RuntimeConfig.USE_TESTNET else XRPL_MAINNET

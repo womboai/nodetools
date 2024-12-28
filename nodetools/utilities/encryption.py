@@ -262,28 +262,6 @@ class MessageEncryption:
             logger.error(f"MessageEncryption.get_handshake_for_address: Error checking handshake status: {e}")
             raise ValueError(f"Failed to get handshake status: {e}") from e
 
-    @staticmethod
-    def get_pending_handshakes(memo_history: pd.DataFrame, channel_counterparty: str) -> pd.DataFrame:
-        """Get pending handshakes that need responses for a specific address.
-        
-        Args:
-            memo_history: DataFrame containing memo history
-            channel_counterparty: Address to check for pending handshakes
-            
-        Returns:
-            DataFrame containing pending handshake requests
-        """
-        return memo_history[
-            (memo_history['memo_type'] == global_constants.SystemMemoType.HANDSHAKE.value) &
-            (memo_history['destination'] == channel_counterparty) &
-            ~memo_history['account'].isin(  # Exclude accounts that have received responses
-                memo_history[
-                    (memo_history['memo_type'] == global_constants.SystemMemoType.HANDSHAKE.value) &
-                    (memo_history['account'] == channel_counterparty)
-                ]['destination'].unique()
-            )
-        ]
-
     def send_handshake(self, channel_private_key: str, channel_counterparty: str, username: str = None) -> bool:
         """Send a handshake transaction containing the ECDH public key.
         
