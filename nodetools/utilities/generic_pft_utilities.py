@@ -41,6 +41,7 @@ from nodetools.utilities.exceptions import *
 from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
 from nodetools.utilities.transaction_orchestrator import TransactionOrchestrator
 from nodetools.utilities.transaction_repository import TransactionRepository
+from nodetools.models.models import BusinessLogicProvider
 
 nest_asyncio.apply()
 
@@ -60,7 +61,7 @@ class GenericPFTUtilities:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self):
+    def __init__(self, business_logic_provider: BusinessLogicProvider):
         if not self.__class__._initialized:
             # Get network and node configurations
             self.network_config = config.get_network_config()
@@ -97,7 +98,9 @@ class GenericPFTUtilities:
             )
 
             # Initialize transaction orchestrator
+            self.business_logic_provider = business_logic_provider
             self.transaction_orchestrator = TransactionOrchestrator(
+                business_logic_provider=self.business_logic_provider,
                 generic_pft_utilities=self, 
                 transaction_repository=self.transaction_repository,
                 credential_manager=self.credential_manager,

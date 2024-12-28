@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import setup, find_packages  # type: ignore
 
 setup(
     name='nodetools',
@@ -18,8 +18,16 @@ setup(
         'plotly',
         'matplotlib',
         'PyNaCl',
-        'loguru'
+        'loguru',
+        'asyncpg'
     ],
+    include_package_data=True, 
+    package_data={
+        'nodetools': [
+            'sql/*/*.sql',      # Include all .sql files in sql/ subdirectories
+            'sql/*.sql',        # Include .sql files directly in sql/
+        ],
+    },
     author='Alex Good',
     author_email='alex@agti.net',
     description='Post Fiat task completion node',
@@ -32,4 +40,9 @@ setup(
         'Operating System :: OS Independent',
     ],
     python_requires='>=3.11',
+    entry_points={
+        'console_scripts': [
+            'nodetools=nodetools.cli:main',
+        ],
+    },
 )

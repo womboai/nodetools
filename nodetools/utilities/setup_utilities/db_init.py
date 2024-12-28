@@ -440,6 +440,38 @@ def print_prerequisites():
         Download and install from: https://www.postgresql.org/download/windows/
         """)
 
+def main(drop_tables=False, create_db=False, help_install=False, revoke_privileges=False):
+    """Entry point for CLI command
+    
+    Args:
+        drop_tables (bool): Drop and recreate tables if True
+        create_db (bool): Create database if it doesn't exist
+        help_install (bool): Show installation prerequisites
+        revoke_privileges (bool): Revoke privileges for testing
+    """
+    try:
+
+        if help_install:
+            print_prerequisites()
+            sys.exit(0)
+        
+        if revoke_privileges:
+            # Get credentials and revoke privileges
+            encryption_password = getpass.getpass("Enter your encryption password: ")
+            cm = CredentialManager(password=encryption_password)
+            postgres_keys = [key for key in cm.list_credentials() if 'postgresconnstring' in key]
+            
+            for key in postgres_keys:
+                db_conn_string = cm.get_credential(key)
+                revoke_all_privileges(db_conn_string)
+            sys.exit(0)
+
+        init_database(drop_tables=drop_tables, create_db=create_db)
+
+    except KeyboardInterrupt:
+        print("\nDatabase initialization cancelled.")
+        sys.exit(0)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Initialize the NodeTools database.")
     parser.add_argument("--drop-tables", action="store_true", help="Drop and recreate tables (WARNING: Destructive)")
@@ -447,20 +479,10 @@ if __name__ == "__main__":
     parser.add_argument("--help-install", action="store_true", help="Show installation prerequisites")
     parser.add_argument("--revoke-privileges", action="store_true", help="Revoke privileges for testing (WARNING: Destructive)")
     args = parser.parse_args()
-
-    if args.help_install:
-        print_prerequisites()
-        sys.exit(0)
     
-    if args.revoke_privileges:
-        # Get credentials and revoke privileges
-        encryption_password = getpass.getpass("Enter your encryption password: ")
-        cm = CredentialManager(password=encryption_password)
-        postgres_keys = [key for key in cm.list_credentials() if 'postgresconnstring' in key]
-        
-        for key in postgres_keys:
-            db_conn_string = cm.get_credential(key)
-            revoke_all_privileges(db_conn_string)
-        sys.exit(0)
-
-    init_database(drop_tables=args.drop_tables, create_db=args.create_db)
+    main(
+        drop_tables=args.drop_tables,
+        create_db=args.create_db,
+        help_install=args.help_install,
+        revoke_privileges=args.revoke_privileges
+    )

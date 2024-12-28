@@ -17,6 +17,7 @@ from nodetools.models.models import (
     MemoGroup
 )
 from nodetools.models.memo_processor import MemoProcessor
+from nodetools.models.models import BusinessLogicProvider
 from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
 from nodetools.protocols.transaction_repository import TransactionRepository
 from nodetools.protocols.credentials import CredentialManager
@@ -24,7 +25,6 @@ from nodetools.protocols.openrouter import OpenRouterTool
 from nodetools.protocols.encryption import MessageEncryption
 from nodetools.utilities.compression import CompressionError
 from nodetools.configuration.configuration import NodeConfig
-from nodetools.task_processing.task_management_rules import create_business_logic, BusinessLogicProvider
 import traceback
 import time
 from datetime import datetime, timedelta, timezone
@@ -706,7 +706,8 @@ class TransactionOrchestrator:
     - Sequential processing of transactions
     """
     def __init__(
-            self, 
+            self,
+            business_logic_provider: BusinessLogicProvider,
             generic_pft_utilities: GenericPFTUtilities, 
             transaction_repository: TransactionRepository,
             credential_manager: CredentialManager,
@@ -714,6 +715,7 @@ class TransactionOrchestrator:
             node_config: NodeConfig,
             openrouter: OpenRouterTool
     ):
+        self.business_logic_provider = business_logic_provider
         self.dependencies = Dependencies(
             generic_pft_utilities=generic_pft_utilities,
             transaction_repository=transaction_repository,
@@ -732,16 +734,14 @@ class TransactionOrchestrator:
     async def start(self):
         """Coordinate transaction processing"""
         try:
-            business_logic = create_business_logic()
-
             if not self.reviewer:
                 self.reviewer = TransactionReviewer(
-                    business_logic=business_logic,
+                    business_logic=self.business_logic_provider,
                     dependencies=self.dependencies
                 )
             if not self.response_manager:
                 self.response_manager = ResponseQueueRouter(
-                    business_logic=business_logic,
+                    business_logic=self.business_logic_provider,
                     review_queue=self.review_queue,
                     transaction_repository=self.dependencies.transaction_repository,
                     shutdown_event=self._shutdown_event

@@ -1,3 +1,4 @@
+from importlib import resources
 import pathlib
 from typing import Optional
 from loguru import logger
@@ -8,8 +9,10 @@ class SQLManager:
     
     def __init__(self, base_path: Optional[str] = None):
         if base_path is None:
-            base_path = pathlib.Path(__file__).parent.parent / 'sql'
-        self.base_path = pathlib.Path(base_path)
+            # No need to calculate path - we'll use package resources
+            self.base_path = None
+        else:
+            self.base_path = pathlib.Path(base_path)
 
     def load_query(self, category: str, name: str, module: Optional[str] = None) -> str:
         """Load SQL query from file
@@ -22,17 +25,29 @@ class SQLManager:
         Returns:
             str: The contents of the SQL file
         """
-        if module:
-            file_path = self.base_path / module / f"{name}.sql"
+        if self.base_path:
+            # Use direct file system path if provided
+            if module:
+                file_path = self.base_path / module / f"{name}.sql"
+            else:
+                file_path = self.base_path / category / f"{name}.sql"
+            
+            try:
+                return file_path.read_text()
+            except FileNotFoundError:
+                logger.error(f"SQL file not found: {file_path}")
+                logger.error(traceback.format_exc())
+                raise
         else:
-            file_path = self.base_path / category / f"{name}.sql"
-        
-        try:
-            return file_path.read_text()
-        except FileNotFoundError:
-            logger.error(f"SQL file not found: {file_path}")
-            logger.error(traceback.format_exc())
-            raise
+            # Use package resources
+            try:
+                package_path = f"nodetools.sql.{module if module else category}"
+                with resources.files(package_path).joinpath(f"{name}.sql").open('r') as f:
+                    return f.read()
+            except Exception as e:
+                logger.error(f"Failed to load SQL file: {name}.sql from {package_path}")
+                logger.error(traceback.format_exc())
+                raise
 
     async def execute_script(self, db_manager, category: str, name: str, *args, module: Optional[str] = None):
         """Execute a SQL script using the database manager

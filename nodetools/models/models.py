@@ -504,7 +504,13 @@ class StandaloneRule(InteractionRule):
     transaction_type = InteractionType.STANDALONE
     
 @dataclass
-class BusinessLogicProvider:
-    """Centralizes all business logic configuration"""
+class BusinessLogicProvider(ABC):
+    """Abstract base class that defines required business logic interface"""
     transaction_graph: InteractionGraph
     pattern_rule_map: Dict[str, InteractionRule]  # Maps pattern_id to rule instance
+
+    @classmethod
+    @abstractmethod
+    def create(cls) -> 'BusinessLogicProvider':
+        """Factory method that implementations must provide"""
+        pass
