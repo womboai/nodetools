@@ -3,7 +3,7 @@ Orchestrates the processing of both historical and real-time XRPL transactions,
 ensuring proper sequencing and consistency of transaction processing.
 """
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import asyncio
 from loguru import logger
 from nodetools.models.models import (
@@ -38,6 +38,7 @@ def format_duration(seconds: float) -> str:
 @dataclass
 class ReviewingResult:
     """Represents the outcome of reviewing a single transaction"""
+    tx: Dict[str, Any]
     processed: bool
     rule_name: str
     response_tx_hash: Optional[str] = None
@@ -178,6 +179,7 @@ class TransactionReviewer:
             if not self.pending_groups[group_id].add_memo(tx):
                 logger.warning(f"Failed to add message to group {group_id}")
                 return ReviewingResult(
+                    tx=tx,
                     processed=True,
                     rule_name="NoRule",
                     notes=f"Message doesn't belong to group {group_id}"
@@ -189,6 +191,7 @@ class TransactionReviewer:
         # For standardized format, only attempting processing when we have all chunks
         if is_standardized and len(group.chunk_indices) < structure.total_chunks:
             return ReviewingResult(
+                tx=tx,
                 processed=False,
                 rule_name="NoRule",
                 notes=f"Waiting for more chunks ({len(group.chunk_indices)}/{structure.total_chunks})"
@@ -202,11 +205,14 @@ class TransactionReviewer:
                 message_encryption=self.dependencies.message_encryption,
                 node_config=self.dependencies.node_config
             )
+
+            # DEBUGGING
+            logger.debug(f"Processed content for group {group_id}: {processed_content}")
             
             # Create synthetic transaction with processed content
             complete_tx = tx.copy()
             complete_tx['memo_data'] = processed_content
-            self.pending_groups.pop(group_id) 
+            self.pending_groups.pop(group_id)
             return await self._review_direct_match(complete_tx)
         
         except CompressionError as e:
@@ -216,6 +222,7 @@ class TransactionReviewer:
                 # chunk_indices = group.chunk_indices
                 # logger.warning(f"Failed to process group {group_id} (legacy). May be due to missing chunks. Received indices: {chunk_indices}")
                 return ReviewingResult(
+                    tx=tx,
                     processed=True,
                     rule_name="NoRule",
                     notes=f"Failed to process group (legacy). May be due to missing chunks."
@@ -231,6 +238,7 @@ class TransactionReviewer:
             # Remove the failed group
             self.pending_groups.pop(group_id)
             return ReviewingResult(
+                tx=tx,
                 processed=True,
                 rule_name="ProcessingError",
                 notes=f"Failed to process group: {str(e)}"
@@ -245,6 +253,7 @@ class TransactionReviewer:
 
         if not pattern_id:
             return ReviewingResult(
+                tx=tx,
                 processed=True,  # We've reviewed it and found no matching pattern
                 rule_name="NoRule",
                 notes="No matching pattern found"
@@ -259,6 +268,7 @@ class TransactionReviewer:
         if not rule:
             logger.error(f"No rule found for pattern_id: {pattern_id}")
             return ReviewingResult(
+                tx=tx,
                 processed=True,
                 rule_name="NoRule",
                 notes=f"No rule found for pattern {pattern_id}"
@@ -277,6 +287,7 @@ class TransactionReviewer:
                         # logger.debug(f"Processed '{pattern.transaction_type.value}' transaction. No action required.")
 
                         return ReviewingResult(
+                            tx=tx,
                             processed=True, 
                             rule_name=rule.__class__.__name__,
                             notes=f"Processed {pattern.transaction_type.value} transaction"
@@ -301,6 +312,7 @@ class TransactionReviewer:
                             # logger.debug(f"No response found for tx {tx['hash']} using rule {rule.__class__.__name__}. Marking as unprocessed.")
 
                             return ReviewingResult(
+                                tx=tx,
                                 processed=False,  # We've reviewed it and found no response
                                 rule_name=rule.__class__.__name__,
                                 notes="Required response not found",
@@ -311,6 +323,7 @@ class TransactionReviewer:
 
                         # 5. Response found
                         return ReviewingResult(
+                            tx=tx,
                             processed=True,  # We've reviewed it and found the required response
                             rule_name=rule.__class__.__name__,
                             response_tx_hash=response_tx.get("hash"),
@@ -322,6 +335,7 @@ class TransactionReviewer:
                 # logger.debug(f"Rule {rule.__class__.__name__} failed validation for transaction {tx['hash']}. No action required.")
 
                 return ReviewingResult(
+                    tx=tx,
                     processed=True,  # We've reviewed it and determined it failed validation
                     rule_name=rule.__class__.__name__,
                     notes=f"Failed validation for rule {rule.__class__.__name__}"
@@ -410,7 +424,17 @@ class ResponseQueueRouter:
     async def route_transaction(self, tx: Dict[str, Any]) -> bool:
         """Route transaction to appropriate response queue based on its matching rule"""
         try:
+
+            # DEBUGGING
+            logger.debug(f"Routing transaction {tx['hash']}")
+            logger.debug(f"Transaction memo_type: {tx.get('memo_type')}")
+            logger.debug(f"Transaction memo_format: {tx.get('memo_format')}")
+            logger.debug(f"Transaction memo_data: {tx.get('memo_data')}")
+
             result = await self._determine_response_pattern(tx)
+
+            logger.debug(f"Routing result: {result}")
+
             if result.success:
                 # Store original transaction before routing
                 self.pending_responses[tx['hash']] = tx
@@ -757,15 +781,15 @@ class TransactionOrchestrator:
             # Sync and process historical data
             self.dependencies.generic_pft_utilities.sync_pft_transaction_history()
             
-            # Get unverified transactions and add them to review queue
-            logger.debug("TransactionOrchestrator: Getting unverified transactions")
-            unverified_txs = await self.dependencies.transaction_repository.get_unprocessed_transactions(
+            # Get unprocessed transactions and add them to review queue
+            logger.debug("TransactionOrchestrator: Getting unprocessed transactions")
+            unprocessed_txs = await self.dependencies.transaction_repository.get_unprocessed_transactions(
                 order_by="close_time_iso ASC",
                 include_processed=False   # Set to True for debugging only
             )
-            logger.debug(f"TransactionOrchestrator: Found {len(unverified_txs)} unverified transactions")
+            logger.debug(f"TransactionOrchestrator: Found {len(unprocessed_txs)} unprocessed transactions")
 
-            for tx in unverified_txs:
+            for tx in unprocessed_txs:
                 await self.review_queue.put(tx)
 
             # Start all processing tasks
@@ -808,15 +832,16 @@ class TransactionOrchestrator:
                     # Wait for next transaction with timeout
                     tx = await asyncio.wait_for(self.review_queue.get(), timeout=IDLE_LOG_INTERVAL)
                     
+                    # Review transaction. Result includes the transaction post-processing (result.tx)
                     result = await self.reviewer.review_transaction(tx)
-                    await self.dependencies.transaction_repository.store_reviewing_result(tx['hash'], result)
+                    await self.dependencies.transaction_repository.store_reviewing_result(result)
                     reviewed_count += 1
                     last_activity_time = time.time()
 
                     # If transaction needs a response, add to processing queue
                     if not result.processed:
-                        logger.debug(f"TransactionOrchestrator: Transaction {tx['hash']} with memo type {tx['memo_type']} needs a response.")
-                        await self.routing_queue.put(tx)
+                        logger.debug(f"TransactionOrchestrator: Transaction {result.tx['hash']} with memo type {result.tx['memo_type']} needs a response.")
+                        await self.routing_queue.put(result.tx)
 
                     # Check if queue just became empty
                     queue_size = self.review_queue.qsize()
@@ -861,7 +886,7 @@ class TransactionOrchestrator:
         last_log_time = time.time()
         last_activity_time = time.time()
         LOG_INTERVAL = 60  # Log progress every minute
-        IDLE_LOG_INTERVAL = 300  # Log idle status every 5 minutes
+        IDLE_LOG_INTERVAL = 60  # Log idle status every 5 minutes
         ROUTE_LOG_INTERVAL = 100  # Log count every 100 transactions
 
         try:
@@ -879,7 +904,7 @@ class TransactionOrchestrator:
                     # Log progress by count
                     queue_size = self.routing_queue.qsize()
                     if queue_size == 0:
-                        logger.debug(f"Finished routing. Total routed: {routed_count}")
+                        logger.info(f"Finished routing. Total routed: {routed_count}.")
 
                     if routed_count % ROUTE_LOG_INTERVAL == 0:
                         queue_size = self.routing_queue.qsize()
@@ -905,14 +930,15 @@ class TransactionOrchestrator:
                     idle_duration = current_time - last_activity_time
                     pending_count = len(self.response_manager.pending_responses)
                     logger.debug(
-                        f"TransactionOrchestrator: Process loop idle for {format_duration(idle_duration)}.\n"
+                        f"TransactionOrchestrator: Route loop idle for {format_duration(idle_duration)}.\n"
                         f"  - Total routed: {routed_count}\n"
-                        f"  - Pending responses: {pending_count}"
+                        f"  - Pending responses: {pending_count}\n"
+                        f"  - Routing queue size: {self.routing_queue.qsize()}"
                     )
                     continue
                     
                 except Exception as e:
-                    logger.error(f"Error processing transaction: {e}")
+                    logger.error(f"Error routing transaction: {e}")
                     logger.error(traceback.format_exc())
 
                     # debugging

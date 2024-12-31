@@ -172,10 +172,16 @@ class GenericPFTUtilities:
         return date_object
 
     @staticmethod
-    def is_over_1kb(string):
-        # 1KB = 1024 bytes
-        return len(string.encode('utf-8')) > 1024
-    
+    def is_over_1kb(value: Union[str, int, float]) -> bool:
+        if isinstance(value, str):
+            # For strings, convert to bytes and check length
+            return len(value.encode('utf-8')) > 1024
+        elif isinstance(value, (int, float)):
+            # For numbers, compare directly
+            return value > 1024
+        else:
+            raise TypeError(f"Expected string or number, got {type(value)}")
+        
     @staticmethod
     def to_hex(string):
         return binascii.hexlify(string.encode()).decode()
@@ -865,17 +871,15 @@ class GenericPFTUtilities:
             memo_format=memo_format,
             memo_type=memo_type,
             memo_data=memo_data,
-            validate_size=(is_system_memo and chunk) or not chunk
+            validate_size=(is_system_memo and chunk)
         )
 
         if is_system_memo:
-            if chunk:
-                raise ValueError("System memos cannot be chunked")
-            else:
-                return self._send_memo_single(wallet, destination, memo, pft_amount)
+            return self._send_memo_single(wallet, destination, memo, pft_amount)
 
-        # Handle chunking for non-system memos if requested
-        if chunk:
+        # Handle chunking for non-system memos if requested, or if the memo is over 1KB
+        size_info = self.calculate_memo_size(memo_format, memo_type, memo_data)
+        if chunk or self.is_over_1kb(size_info['total_size']):
             try:
                 chunk_memos = self._chunk_memos_legacy(memo)
                 responses = []
@@ -2013,7 +2017,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
     #     amount = 2
     #     """
     #     wallet = self.spawn_wallet_from_seed(seed)
-    #     memo = self.construct_standardized_xrpl_memo(memo_data=message, memo_type='DISCORD_SERVER', memo_format=user_name)
+    #     memo = self.construct_memo(memo_data=message, memo_type='DISCORD_SERVER', memo_format=user_name)
     #     action_response = self.send_PFT_with_info(sending_wallet=wallet,
     #         amount=amount,
     #         memo=memo,

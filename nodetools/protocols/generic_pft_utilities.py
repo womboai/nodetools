@@ -64,7 +64,7 @@ class GenericPFTUtilities(Protocol):
         """Construct a handshake memo"""
         ...
 
-    def construct_standardized_xrpl_memo(self, memo_data: str, memo_type: str, memo_format: str) -> Memo:
+    def construct_memo(self, memo_data: str, memo_type: str, memo_format: str) -> Memo:
         """Construct a standardized memo object for XRPL transactions"""
         ...
 

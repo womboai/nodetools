@@ -114,7 +114,7 @@ class TransactionRepository:
             logger.error(traceback.format_exc())
             raise
 
-    async def store_reviewing_result(self, tx_hash: str, result: 'ReviewingResult') -> None:
+    async def store_reviewing_result(self, result: 'ReviewingResult') -> None:
         """Store the reviewing result for a transaction"""
         try:
             pool = await self.db_manager.get_pool(self.username)
@@ -133,7 +133,7 @@ class TransactionRepository:
                     
                     await conn.execute(
                         query,
-                        tx_hash,
+                        result.tx['hash'],
                         result.processed,
                         result.rule_name,
                         result.response_tx_hash,
