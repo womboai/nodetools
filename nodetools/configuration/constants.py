@@ -14,11 +14,11 @@ DEFAULT_ANTHROPIC_MODEL = 'claude-3-5-sonnet-20241022'
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
+# XRPL CONSTANTS
 MIN_XRP_PER_TRANSACTION = Decimal('0.000001')  # Minimum XRP amount per transaction
-MIN_XRP_BALANCE = 12  # Minimum XRP balance to be able to perform a transaction
-
-# Maximum chunk size for a memo
-MAX_MEMO_CHUNK_SIZE = 900
+MIN_XRP_BALANCE = 2  # Minimum XRP balance to be able to perform a transaction
+MAX_CHUNK_SIZE = 1024
+XRP_MEMO_STRUCTURAL_OVERHEAD = 100  # JSON structure, quotes, etc.
 
 # Maximum length for a commitment sentence
 MAX_COMMITMENT_SENTENCE_LENGTH = 950
@@ -32,6 +32,6 @@ class SystemMemoType(Enum):
     HANDSHAKE = 'HANDSHAKE'
     INITIATION_RITE = 'INITIATION_RITE'
     GOOGLE_DOC_CONTEXT_LINK = 'google_doc_context_link'
-    INITIATION_GRANT = 'discord_wallet_funding'  # TODO: Deprecate this
+    # INITIATION_GRANT = 'discord_wallet_funding'  # TODO: Deprecate this
 
 SYSTEM_MEMO_TYPES = [memo_type.value for memo_type in SystemMemoType]

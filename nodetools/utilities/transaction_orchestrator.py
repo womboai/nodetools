@@ -624,14 +624,13 @@ class ResponseProcessor:
                 self.dependencies.credential_manager.get_credential(f'{response_params.source}__v1xrpsecret')
             )
 
-            # TODO: uncomment this when ready to send responses
-            # # Send response transaction
-            # return await self.dependenciesgeneric_pft_utilities.process_queue_transaction(
-            #     wallet=node_wallet,
-            #     memo=response_params.memo,
-            #     destination=response_params.destination,
-            #     pft_amount=response_params.pft_amount
-            # )
+            # Send response transaction
+            return await self.dependencies.generic_pft_utilities.process_queue_transaction(
+                wallet=node_wallet,
+                memo=response_params.memo,
+                destination=response_params.destination,
+                pft_amount=response_params.pft_amount
+            )
 
         except Exception as e:
             logger.error(f"ResponseProcessor._process_transaction: Error processing transaction: {e}")
@@ -762,7 +761,7 @@ class TransactionOrchestrator:
             logger.debug("TransactionOrchestrator: Getting unverified transactions")
             unverified_txs = await self.dependencies.transaction_repository.get_unprocessed_transactions(
                 order_by="close_time_iso ASC",
-                include_processed=True   # For debugging only
+                include_processed=False   # Set to True for debugging only
             )
             logger.debug(f"TransactionOrchestrator: Found {len(unverified_txs)} unverified transactions")
 
