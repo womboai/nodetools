@@ -152,6 +152,7 @@ class TransactionReviewer:
         match structural_result:
             case StructuralPattern.NO_MEMO:
                 return ReviewingResult(
+                    tx=tx,
                     processed=True,
                     rule_name="NoRule",
                     notes="No memo present"
@@ -207,7 +208,7 @@ class TransactionReviewer:
             )
 
             # DEBUGGING
-            logger.debug(f"Processed content for group {group_id}: {processed_content}")
+            # logger.debug(f"Processed content for group {group_id}: {processed_content}")
             
             # Create synthetic transaction with processed content
             complete_tx = tx.copy()
@@ -886,7 +887,7 @@ class TransactionOrchestrator:
         last_log_time = time.time()
         last_activity_time = time.time()
         LOG_INTERVAL = 60  # Log progress every minute
-        IDLE_LOG_INTERVAL = 60  # Log idle status every 5 minutes
+        IDLE_LOG_INTERVAL = 300  # Log idle status every 5 minutes
         ROUTE_LOG_INTERVAL = 100  # Log count every 100 transactions
 
         try:

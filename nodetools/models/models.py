@@ -400,7 +400,7 @@ class InteractionGraph:
         """Find the first pattern ID whose pattern matches the transaction"""
 
         # DEBUGGING
-        logger.debug(f"Finding pattern for transaction {tx.get('hash')}")
+        # logger.debug(f"Finding pattern for transaction {tx.get('hash')}")
 
         for pattern_id, pattern in self.patterns.items():
 
@@ -408,7 +408,7 @@ class InteractionGraph:
             # logger.debug(f"Testing pattern '{pattern_id}' with memo_type: {pattern.memo_pattern.memo_type}")
 
             if pattern.memo_pattern.matches(tx):
-                logger.debug(f"Found matching pattern: {pattern_id}")
+                # logger.debug(f"Found matching pattern: {pattern_id}")
                 return pattern_id
             
             # logger.debug(f"Pattern '{pattern_id}' did not match")
