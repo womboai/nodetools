@@ -1,3 +1,4 @@
+from typing import Dict
 from xrpl.wallet import Wallet
 import discord
 from discord import Object, Interaction, SelectOption, app_commands
@@ -12,9 +13,9 @@ from nodetools.performance.monitor import PerformanceMonitor
 from nodetools.configuration.configuration import RuntimeConfig, get_network_config
 from nodetools.task_processing.user_context_parsing import UserTaskParser
 import asyncio
-from datetime import datetime, time
 import pytz
 import datetime
+from datetime import datetime, time, timezone, timedelta
 import nodetools.configuration.constants as constants
 import nodetools.configuration.configuration as config
 import getpass
@@ -28,8 +29,37 @@ from nodetools.chatbots.odv_sprint_planner import ODVSprintPlannerO1
 from nodetools.chatbots.odv_context_doc_improvement import ODVContextDocImprover
 from nodetools.ai.openrouter import OpenRouterTool
 from nodetools.chatbots.corbanu_beta import CorbanuChatBot
+from nodetools.chatbots.odv_focus_analyzer import ODVFocusAnalyzer
+
+@dataclass
+class AccountInfo:
+    address: str
+    username: str = ''
+    xrp_balance: float = 0
+    pft_balance: float = 0
+    transaction_count: int = 0
+    monthly_pft_avg: float = 0
+    weekly_pft_avg: float = 0
+    google_doc_link: Optional[str] = None
+
+@dataclass
+class DeathMarchSettings:
+    # Configuration
+    timezone: str
+    start_time: time    # Daily start time
+    end_time: time      # Daily end time
+    check_interval: int # Minutes between check-ins
+
+    # Session-specific data
+    channel_id: Optional[int] = None
+    session_start: Optional[datetime] = None
+    session_end: Optional[datetime] = None
+    last_checkin: Optional[datetime] = None
 
 class MyClient(discord.Client):
+
+    NON_EPHEMERAL_USERS = {402536023483088896}
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Get network configuration and set network-specific attributes
@@ -55,8 +85,14 @@ class MyClient(discord.Client):
         self.sprint_planners = {}  # Dictionary: user_id -> ODVSprintPlanner instance
         self.user_steps = {}       # Dictionary: user_id -> current step in the sprint process
         self.user_questions = {}
-
+        self.user_deathmarch_settings: Dict[int, DeathMarchSettings] = {}
+        self.death_march_tasks = {}
         self.tree = app_commands.CommandTree(self)
+
+    def is_special_user_non_ephemeral(self, interaction: discord.Interaction) -> bool:
+        """Return False if the user is not in the NON_EPHEMERAL_USERS set, else True."""
+        output = not (interaction.user.id in self.NON_EPHEMERAL_USERS)
+        return output
 
     def chunk_message(self, message, max_length=1900):
             """Split a message into multiple parts to avoid exceeding Discord's 2000-char limit."""
@@ -80,13 +116,12 @@ class MyClient(discord.Client):
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         logger.debug(f"MyClient.setup_hook: Slash commands synced to guild ID: {guild_id}")
-
         self.bg_task = self.loop.create_task(self.transaction_checker())
-
         @self.tree.command(name="odv_sprint", description="Start an ODV sprint planning session")
+        
         async def odv_sprint(interaction: discord.Interaction):
             user_id = interaction.user.id
-
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
                     "You must store a seed using /pf_store_seed before starting an ODV sprint planning session.", 
@@ -109,7 +144,7 @@ class MyClient(discord.Client):
                 return
 
             # Defer early
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
 
             try:
                 odv_planner = ODVSprintPlannerO1(
@@ -130,7 +165,7 @@ class MyClient(discord.Client):
                 await self.send_long_interaction_response(
                     interaction, 
                     f"**ODV Sprint Planning Initialized**\n\n{initial_response}", 
-                    ephemeral=True
+                    ephemeral=ephemeral_setting
                 )
             except Exception as e:
                 logger.error(f"Error in odv_sprint: {str(e)}")
@@ -143,24 +178,24 @@ class MyClient(discord.Client):
         @app_commands.describe(message="Your next input to ODV")
         async def odv_sprint_reply(interaction: discord.Interaction, message: str):
             user_id = interaction.user.id
-
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             if user_id not in self.sprint_planners:
                 await interaction.response.send_message(
                     "No active ODV sprint planning session. Start one with /odv_sprint.", 
-                    ephemeral=True
+                    ephemeral=ephemeral_setting
                 )
                 return
 
             odv_planner: ODVSprintPlannerO1 = self.sprint_planners[user_id]
             logger.debug(f"MyClient.odv_sprint_reply: Continuing ODV sprint planning session for {interaction.user.name}")
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
 
             try:
                 # Now using async version
                 logger.debug(f"MyClient.odv_sprint_reply: Getting response for {interaction.user.name}")
                 response = await odv_planner.get_response_async(message)
                 logger.debug(f"MyClient.odv_sprint_reply: Response received for {interaction.user.name}")
-                await self.send_long_interaction_response(interaction, response, ephemeral=True)
+                await self.send_long_interaction_response(interaction, response, ephemeral=ephemeral_setting)
             except Exception as e:
                 logger.error(f"Error in odv_sprint_reply: {str(e)}")
                 await interaction.followup.send(
@@ -168,16 +203,331 @@ class MyClient(discord.Client):
                     ephemeral=True
                 )
 
+        @self.tree.command(name="pf_configure_deathmarch", description="Configure your death march")
+        async def pf_configure_deathmarch(interaction: discord.Interaction):
+            # Common timezone options
+            timezone_options = [
+                SelectOption(label="US/Pacific", description="Los Angeles, Seattle, Vancouver (UTC-7/8)"),
+                SelectOption(label="US/Mountain", description="Denver, Phoenix (UTC-6/7)"),
+                SelectOption(label="US/Central", description="Chicago, Mexico City (UTC-5/6)"),
+                SelectOption(label="US/Eastern", description="New York, Toronto, Miami (UTC-4/5)"),
+                SelectOption(label="Europe/London", description="London, Dublin, Lisbon (UTC+0/1)"),
+                SelectOption(label="Europe/Paris", description="Paris, Berlin, Rome (UTC+1/2)"),
+                SelectOption(label="Asia/Tokyo", description="Tokyo, Seoul (UTC+9)"),
+                SelectOption(label="Australia/Sydney", description="Sydney, Melbourne (UTC+10/11)"),
+                SelectOption(label="Pacific/Auckland", description="Auckland, Wellington (UTC+12/13)")
+            ]
+
+            # Time options vary based on environment
+            if config.RuntimeConfig.USE_TESTNET:
+                # Testing: Allow any hour
+                start_time_options = [
+                    SelectOption(label=f"{hour:02d}:00", value=f"{hour:02d}:00") 
+                    for hour in range(0, 24)  # 0-23 hours
+                ]
+                end_time_options = [
+                    SelectOption(label=f"{hour:02d}:00", value=f"{hour:02d}:00") 
+                    for hour in range(0, 24)  # 0-23 hours
+                ]
+                # Add shorter intervals for testing
+                interval_options = [
+                    SelectOption(label="1 minute", value="1", description="⚠️ Testing only"),
+                    SelectOption(label="5 minutes", value="5", description="⚠️ Testing only"),
+                    SelectOption(label="15 minutes", value="15", description="⚠️ Testing only"),
+                    SelectOption(label="30 minutes", value="30"),
+                    SelectOption(label="1 hour", value="60"),
+                    SelectOption(label="2 hours", value="120")
+                ]
+            else:
+                # Production: Restricted hours
+                start_time_options = [
+                    SelectOption(label=f"{hour:02d}:00", value=f"{hour:02d}:00") 
+                    for hour in range(5, 13)  # 5 AM to 12 PM
+                ]
+                end_time_options = [
+                    SelectOption(label=f"{hour:02d}:00", value=f"{hour:02d}:00") 
+                    for hour in range(16, 24)  # 4 PM to 11 PM
+                ]
+                # Production intervals
+                interval_options = [
+                    SelectOption(label="30 minutes", value="30"),
+                    SelectOption(label="1 hour", value="60"),
+                    SelectOption(label="2 hours", value="120"),
+                    SelectOption(label="3 hours", value="180"),
+                    SelectOption(label="4 hours", value="240")
+                ]
+
+            user_id = interaction.user.id
+
+            # 1. Check user has a stored seed
+            if user_id not in self.user_seeds:
+                await interaction.response.send_message(
+                    "You must store a seed using /pf_store_seed first.", 
+                    ephemeral=True
+                )
+                return
+
+            # Create the Select menus
+            timezone_select = Select(
+                custom_id="timezone",
+                placeholder="Choose your timezone",
+                options=timezone_options,
+                row=0
+            )
+            
+            start_time_select = Select(
+                custom_id="start_time",
+                placeholder="Choose start time",
+                options=start_time_options,
+                row=1
+            )
+            
+            end_time_select = Select(
+                custom_id="end_time",
+                placeholder="Choose end time",
+                options=end_time_options,
+                row=2
+            )
+            
+            interval_select = Select(
+                custom_id="interval",
+                placeholder="Choose check-in interval",
+                options=interval_options,
+                row=3
+            )
+
+            user_choices = {}
+            
+            async def select_callback(interaction: discord.Interaction):
+                select_id = interaction.data["custom_id"]
+                selected_value = interaction.data["values"][0]
+                user_choices[select_id] = selected_value
+                
+                # Check if all selections have been made
+                if len(user_choices) == 4:  # All selections made
+                    try:
+                        # Convert time strings to time objects
+                        start_time = datetime.strptime(user_choices["start_time"], "%H:%M").time()
+                        end_time = datetime.strptime(user_choices["end_time"], "%H:%M").time()
+                        
+                        # Create or update DeathMarchSettings
+                        settings = DeathMarchSettings(
+                            timezone=user_choices["timezone"],
+                            start_time=start_time,
+                            end_time=end_time,
+                            check_interval=int(user_choices["interval"])
+                        )
+
+                        # Calculate costs
+                        checks_per_day, daily_cost = self._calculate_death_march_costs(settings)
+                        
+                        # Store settings
+                        self.user_deathmarch_settings[interaction.user.id] = settings
+                        
+                        settings_msg = (
+                            f"Settings saved:\n"
+                            f"• Timezone: {settings.timezone}\n"
+                            f"• Focus window: {start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}\n"
+                            f"• Check-in interval: {settings.check_interval} minutes\n\n"
+                            f"📊 Cost Analysis:\n"
+                            f"• Check-ins per day: {checks_per_day}\n"
+                            f"• Daily cost: {daily_cost} PFT\n"
+                            f"• Weekly cost: {daily_cost * 7} PFT\n"
+                            f"• Monthly cost: {daily_cost * 30} PFT\n\n"
+                            "Use /pf_death_march_start to begin your death march."
+                        )
+                        
+                        ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
+                        await interaction.response.send_message(
+                            settings_msg,
+                            ephemeral=ephemeral_setting
+                        )
+                    except Exception as e:
+                        await interaction.response.send_message(
+                            f"An error occurred: {str(e)}",
+                            ephemeral=True
+                        )
+                else:
+                    await interaction.response.defer()
+
+            # Attach callbacks
+            timezone_select.callback = select_callback
+            start_time_select.callback = select_callback
+            end_time_select.callback = select_callback
+            interval_select.callback = select_callback
+
+            # Create view and add all selects
+            view = discord.ui.View()
+            view.add_item(timezone_select)
+            view.add_item(start_time_select)
+            view.add_item(end_time_select)
+            view.add_item(interval_select)
+
+            # Send the message with all dropdowns
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
+            await interaction.response.send_message(
+                "Please set your preferences:",
+                view=view,
+                ephemeral=ephemeral_setting
+            )
+
+        @self.tree.command(name="pf_death_march_start", description="Kick off a death march.")
+        @app_commands.describe(days="Number of days to continue the death march")
+        async def pf_death_march_start(interaction: discord.Interaction, days: int):
+            user_id = interaction.user.id
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
+            # 1. Check user has a stored seed
+            if user_id not in self.user_seeds:
+                await interaction.response.send_message(
+                    "You must store a seed using /pf_store_seed first.", 
+                    ephemeral=True
+                )
+                return
+
+            seed = self.user_seeds[user_id]
+            user_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+            user_address = user_wallet.classic_address
+
+            # 2. Check initiation
+            initiation_check_success = await self._check_initiation_rite(
+                interaction=interaction,
+                wallet_address=user_address
+            )
+            if not initiation_check_success:
+                await interaction.response.send_message(
+                    "You must perform the initiation rite first ( /pf_initiate ).", 
+                    ephemeral=True
+                )
+                return
+
+            # 3. Check user has configured death march settings
+            if user_id not in self.user_deathmarch_settings:
+                await interaction.response.send_message(
+                    "You must set your death march configuration using /pf_configure_deathmarch first.", 
+                    ephemeral=True
+                )
+                return
+            
+            # 4. Check if user is already in a death march
+            if user_id in self.user_deathmarch_settings and self.user_deathmarch_settings[user_id].session_end is not None:
+                await interaction.response.send_message(
+                    "You are already in an active death march. Use /pf_death_march_end to end it first.", 
+                    ephemeral=True
+                )
+                return
+
+            await interaction.response.defer(ephemeral=ephemeral_setting)
+
+            # Calculate cost based on check-in frequency
+            settings = self.user_deathmarch_settings[user_id]
+            checks_per_day, cost = self._calculate_death_march_costs(settings, days)
+
+            # 5. Check user PFT balance
+            try:
+                user_pft_balance = self.generic_pft_utilities.get_pft_balance(user_address)
+            except:
+                await interaction.followup.send("Error fetching your PFT balance. Try again later.", ephemeral=True)
+                return
+            
+            if user_pft_balance < cost:
+                await interaction.followup.send(
+                    f"You need {cost} PFT but only have {user_pft_balance} PFT.\n"
+                    f"This cost is based on {checks_per_day} check-ins per day for {days} days.\n"
+                    "Please acquire more PFT first.", 
+                    ephemeral=ephemeral_setting
+                )
+                return
+
+            # 6. Process payment
+            memo_data = f"DEATH_MARCH Payment: {days} days, {checks_per_day} checks/day"
+            
+            try:
+                response = self.generic_pft_utilities.send_memo(
+                    wallet_seed_or_wallet=user_wallet,
+                    destination=self.node_config.remembrancer_address,  # Or wherever you want the PFT to go
+                    memo=memo_data,
+                    username=interaction.user.name,
+                    chunk=False,
+                    compress=False,
+                    encrypt=False,
+                    pft_amount=Decimal(cost)
+                )
+                # Verify
+                if not self.generic_pft_utilities.verify_transaction_response(response):
+                    await interaction.followup.send("Transaction for Death March payment failed.", ephemeral=ephemeral_setting)
+                    return
+            except Exception as e:
+                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
+                return
+            
+            # 7. Update death march settings
+            session_start = datetime.now(timezone.utc)
+            session_end = session_start + timedelta(days=days)
+            
+            settings.channel_id = interaction.channel_id
+            settings.session_start = session_start
+            settings.session_end = session_end
+            settings.last_checkin = None
+
+            # Create a new task for this user's death march
+            task = self.loop.create_task(
+                self.death_march_checker_for_user(user_id),
+                name=f"death_march_{user_id}"
+            )
+            self.death_march_tasks[user_id] = task
+
+            await interaction.followup.send(
+                f"Death March started for {days} day(s).\n"
+                f"• Cost: {cost} PFT ({checks_per_day} check-ins per day)\n"
+                f"• Check-in window: {settings.start_time.strftime('%H:%M')} - {settings.end_time.strftime('%H:%M')} "
+                f"({settings.timezone})\n"
+                f"• Check-in interval: Every {settings.check_interval} minutes\n"
+                f"• Session ends: {session_end} UTC\n\n"
+                "Use /pf_death_march_end to stop it sooner (no refunds).",
+                ephemeral=ephemeral_setting
+            )
+
+        @self.tree.command(name="pf_death_march_end", description="End your Death March session early (no refunds).")
+        async def pf_death_march_end(interaction: discord.Interaction):
+            user_id = interaction.user.id
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
+
+            # Check if user has settings and an active session
+            if (user_id in self.user_deathmarch_settings and 
+                    self.user_deathmarch_settings[user_id].session_end is not None):
+
+                # Cancel the death march task
+                if user_id in self.death_march_tasks:
+                    self.death_march_tasks[user_id].cancel()
+                    del self.death_march_tasks[user_id]
+
+                settings = self.user_deathmarch_settings[user_id]
+                # Clear session data but keep configuration
+                settings.session_start = None
+                settings.session_end = None
+                settings.channel_id = None
+                settings.last_checkin = None
+                
+                await interaction.response.send_message(
+                    "Your Death March session has ended. Configuration saved for future use.",
+                    ephemeral=ephemeral_setting
+                )
+            else:
+                await interaction.response.send_message(
+                    "You do not currently have a Death March session active.",
+                    ephemeral=ephemeral_setting
+                )
+
         # Inside MyClient.setup_hook or a similar initialization section in your MyClient class
         @self.tree.command(name="odv_context_doc", description="Start an ODV context document improvement session")
         async def odv_context_doc(interaction: discord.Interaction):
             user_id = interaction.user.id
-
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
                     "You must store a seed using /pf_store_seed before starting an ODV context document improvement session.", 
-                    ephemeral=True
+                    ephemeral=ephemeral_setting
                 )
                 return
 
@@ -197,7 +547,7 @@ class MyClient(discord.Client):
                 return
 
             # Defer early so Discord knows we're working
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
 
             try:
                 # Initialize the ODVContextDocImprover
@@ -224,7 +574,7 @@ class MyClient(discord.Client):
                 await self.send_long_interaction_response(
                     interaction, 
                     f"**ODV Context Document Improvement Initialized**\n\n{initial_response}", 
-                    ephemeral=True
+                    ephemeral=ephemeral_setting
                 )
             except Exception as e:
                 logger.error(f"Error in odv_context_doc: {str(e)}")
@@ -237,24 +587,25 @@ class MyClient(discord.Client):
         @app_commands.describe(message="Your next input to ODV")
         async def odv_context_doc_reply(interaction: discord.Interaction, message: str):
             user_id = interaction.user.id
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
 
             # Check if we have a doc improver session in progress
             if not hasattr(self, 'doc_improvers') or user_id not in self.doc_improvers:
                 await interaction.response.send_message(
                     "No active ODV context document improvement session. Start one with /odv_context_doc.", 
-                    ephemeral=True
+                    ephemeral=ephemeral_setting
                 )
                 return
 
             doc_improver: ODVContextDocImprover = self.doc_improvers[user_id]
             logger.debug(f"MyClient.odv_context_doc_reply: Continuing ODV context document improvement session for {interaction.user.name}")
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
 
             try:
                 logger.debug(f"MyClient.odv_context_doc_reply: Getting response for {interaction.user.name}")
                 response = await doc_improver.get_response_async(message)
                 logger.debug(f"MyClient.odv_context_doc_reply: Response received for {interaction.user.name}")
-                await self.send_long_interaction_response(interaction, response, ephemeral=True)
+                await self.send_long_interaction_response(interaction, response, ephemeral=ephemeral_setting)
             except Exception as e:
                 logger.error(f"Error in odv_context_doc_reply: {str(e)}")
                 await interaction.followup.send(
@@ -266,6 +617,7 @@ class MyClient(discord.Client):
         @self.tree.command(name="corbanu_offering", description="Generate a Corbanu offering")
         async def corbanu_offering(interaction: discord.Interaction):
             user_id = interaction.user.id
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
 
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
@@ -294,12 +646,12 @@ class MyClient(discord.Client):
             if user_id in self.user_questions:
                 await interaction.response.send_message(
                     f"Corbanu Offering:\n\n{self.user_questions[user_id]}",
-                    ephemeral=True
+                    ephemeral=ephemeral_setting
                 )
                 return
 
             # Defer the response since generating the Corbanu offering might take time
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
 
             try:
                 # Initialize the CorbanuChatBot instance
@@ -328,7 +680,7 @@ class MyClient(discord.Client):
 
                 await interaction.followup.send(
                     f"Corbanu Offering:\n\n{question}",
-                    ephemeral=True
+                    ephemeral=ephemeral_setting
                 )
 
             except Exception as e:
@@ -343,6 +695,7 @@ class MyClient(discord.Client):
         @app_commands.describe(answer="Your answer to the last Corbanu question")
         async def corbanu_reply(interaction: discord.Interaction, answer: str):
             user_id = interaction.user.id
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
 
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
@@ -369,11 +722,11 @@ class MyClient(discord.Client):
             if user_id not in self.user_questions:
                 await interaction.response.send_message(
                     "No Corbanu question found. Please use /corbanu_offering first.",
-                    ephemeral=True
+                    ephemeral=ephemeral_setting
                 )
                 return
 
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
 
             try:
                 question = self.user_questions[user_id]
@@ -404,7 +757,7 @@ class MyClient(discord.Client):
                 # Send a short summary to the user in Discord
                 summary_chunks = self.chunk_message(f"**Corbanu Summary**\n{full_message}")
                 for chunk in summary_chunks:
-                    await interaction.followup.send(chunk, ephemeral=True)
+                    await interaction.followup.send(chunk, ephemeral=ephemeral_setting)
 
                 # Now the user will send the Q&A to the remembrancer
                 # Similar to pf_log, we need to ensure a handshake if encrypt=True
@@ -412,7 +765,7 @@ class MyClient(discord.Client):
                 user_name = interaction.user.name
                 message_obj = await interaction.followup.send(
                     "Preparing to send Q&A to the remembrancer...",
-                    ephemeral=True,
+                    ephemeral=ephemeral_setting,
                     wait=True
                 )
 
@@ -498,7 +851,7 @@ class MyClient(discord.Client):
 
                 reward_chunks = self.chunk_message(f"Reward transaction sent successfully:\n{reward_clean_string}")
                 for chunk in reward_chunks:
-                    await interaction.followup.send(chunk, ephemeral=True)
+                    await interaction.followup.send(chunk, ephemeral=ephemeral_setting)
 
                 # Clear stored question
                 del self.user_questions[user_id]
@@ -514,7 +867,7 @@ class MyClient(discord.Client):
         @app_commands.describe(message="Your message to Corbanu")
         async def corbanu_request(interaction: discord.Interaction, message: str):
             user_id = interaction.user.id
-
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
@@ -539,7 +892,7 @@ class MyClient(discord.Client):
                 return
 
             # Defer since response might be long
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
 
             try:
                 # Add the user message to their conversation history
@@ -562,7 +915,7 @@ class MyClient(discord.Client):
                 # Chunk the response if needed and send to user
                 response_chunks = self.chunk_message(response)
                 for chunk in response_chunks:
-                    await interaction.followup.send(chunk, ephemeral=True)
+                    await interaction.followup.send(chunk, ephemeral=ephemeral_setting)
 
                 # Append Corbanu's response to conversation history
                 self.conversations[user_id].append({"role": "assistant", "content": response})
@@ -579,7 +932,7 @@ class MyClient(discord.Client):
                 # Notify user we're sending to remembrancer
                 message_obj = await interaction.followup.send(
                     "Sending the Q&A record (summarized) to the remembrancer...",
-                    ephemeral=True,
+                    ephemeral=ephemeral_setting,
                     wait=True
                 )
 
@@ -633,6 +986,7 @@ class MyClient(discord.Client):
         @self.tree.command(name="pf_send", description="Open a transaction form")
         async def pf_send(interaction: Interaction):
             user_id = interaction.user.id
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
 
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
@@ -664,7 +1018,7 @@ class MyClient(discord.Client):
 
                 async def on_submit(self, interaction: discord.Interaction):
                     # Defer the interaction response to avoid timeout
-                    await interaction.response.defer(ephemeral=True)
+                    await interaction.response.defer(ephemeral=ephemeral_setting)
 
                     # Perform the transaction using the details provided in the modal
                     destination_address = self.address.value
@@ -692,7 +1046,7 @@ class MyClient(discord.Client):
 
                     await interaction.followup.send(
                         f'Transaction result: {tx_info}',
-                        ephemeral=True
+                        ephemeral=ephemeral_setting
                     )
 
             # Pass the user's seed to the modal
@@ -702,6 +1056,7 @@ class MyClient(discord.Client):
         async def pf_accept_menu(interaction: discord.Interaction):
             # Fetch the user's seed
             user_id = interaction.user.id
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             if user_id not in self.user_seeds:
                 await interaction.response.send_message("You must store a seed using /store_seed before accepting tasks.", ephemeral=True)
                 return
@@ -726,7 +1081,7 @@ class MyClient(discord.Client):
 
             # Return immediately if memo history is empty
             if memo_history.empty:
-                await interaction.response.send_message("You have no tasks to accept.", ephemeral=True)
+                await interaction.response.send_message("You have no tasks to accept.", ephemeral=ephemeral_setting)
                 return
 
             # Get pending proposals
@@ -734,7 +1089,7 @@ class MyClient(discord.Client):
 
             # Return immediately if proposal acceptance pairs are empty
             if pf_df.empty:
-                await interaction.response.send_message("You have no tasks to accept.", ephemeral=True)
+                await interaction.response.send_message("You have no tasks to accept.", ephemeral=ephemeral_setting)
                 return
 
             # Create dropdown options based on the non-accepted tasks
@@ -777,7 +1132,7 @@ class MyClient(discord.Client):
 
                 async def on_submit(self, interaction: discord.Interaction):
                     # Defer the response to avoid interaction timeout
-                    await interaction.response.defer(ephemeral=True)
+                    await interaction.response.defer(ephemeral=ephemeral_setting)
                     
                     acceptance_string = self.acceptance_string.value
                     
@@ -790,7 +1145,7 @@ class MyClient(discord.Client):
                     )
                     
                     # Send a follow-up message with the result
-                    await interaction.followup.send(output_string, ephemeral=True)
+                    await interaction.followup.send(output_string, ephemeral=ephemeral_setting)
 
             # Define the callback for when a user selects an option
             async def select_callback(interaction: discord.Interaction):
@@ -812,12 +1167,13 @@ class MyClient(discord.Client):
             view.add_item(select)
 
             # Send the message with the dropdown menu
-            await interaction.response.send_message("Please choose a task to accept:", view=view, ephemeral=True)
+            await interaction.response.send_message("Please choose a task to accept:", view=view, ephemeral=ephemeral_setting)
         
         @self.tree.command(name="pf_refuse", description="Refuse tasks")
         async def pf_refuse_menu(interaction: discord.Interaction):
             # Fetch the user's seed
             user_id = interaction.user.id
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             if user_id not in self.user_seeds:
                 await interaction.response.send_message("You must store a seed using /store_seed before refusing tasks.", ephemeral=True)
                 return
@@ -844,7 +1200,7 @@ class MyClient(discord.Client):
 
             # Return immediately if proposal refusal pairs are empty
             if pf_df.empty:
-                await interaction.response.send_message("You have no tasks to refuse.", ephemeral=True)
+                await interaction.response.send_message("You have no tasks to refuse.", ephemeral=ephemeral_setting)
                 return
 
             eligible_tasks = pf_df.copy()
@@ -853,7 +1209,7 @@ class MyClient(discord.Client):
 
             # If there are no non-accepted tasks, notify the user
             if map_of_eligible_tasks.empty:
-                await interaction.response.send_message("You have no tasks to refuse.", ephemeral=True)
+                await interaction.response.send_message("You have no tasks to refuse.", ephemeral=ephemeral_setting)
                 return
 
             # Create dropdown options based on the non-accepted tasks
@@ -892,7 +1248,7 @@ class MyClient(discord.Client):
 
                 async def on_submit(self, interaction: discord.Interaction):
                     # Defer the response to avoid interaction timeout
-                    await interaction.response.defer(ephemeral=True)
+                    await interaction.response.defer(ephemeral=ephemeral_setting)
                     
                     refusal_string = self.refusal_string.value
                     
@@ -905,7 +1261,7 @@ class MyClient(discord.Client):
                     )
                     
                     # Send a follow-up message with the result
-                    await interaction.followup.send(output_string, ephemeral=True)
+                    await interaction.followup.send(output_string, ephemeral=ephemeral_setting)
 
             # Define the callback for when a user selects an option
             async def select_callback(interaction: discord.Interaction):
@@ -927,10 +1283,11 @@ class MyClient(discord.Client):
             view.add_item(select)
 
             # Send the message with the dropdown menu
-            await interaction.response.send_message("Please choose a task to refuse:", view=view, ephemeral=True)
+            await interaction.response.send_message("Please choose a task to refuse:", view=view, ephemeral=ephemeral_setting)
 
         @self.tree.command(name="wallet_info", description="Get information about a wallet")
         async def wallet_info(interaction: discord.Interaction, wallet_address: str):
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             try:
                 account_info = self.generate_basic_balance_info_string(address=wallet_address, owns_wallet=False)
                 
@@ -939,14 +1296,67 @@ class MyClient(discord.Client):
                 embed.add_field(name="Wallet Address", value=wallet_address, inline=False)
                 embed.add_field(name="Account Info", value=account_info, inline=False)
                 
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+                await interaction.response.send_message(embed=embed, ephemeral=ephemeral_setting)
             except Exception as e:
-                await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
+                await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=ephemeral_setting)
+
+        @self.tree.command(name="admin_debug_full_user_context", description="Return the full user context")
+        async def admin_debug_full_user_context(interaction: discord.Interaction, wallet_address: str):
+            # Check if the user has permission (matches the specific ID)
+            if interaction.user.id not in constants.DISCORD_SUPER_USER_IDS:
+                await interaction.response.send_message(
+                    "You don't have permission to use this command.", 
+                    ephemeral=True
+                )
+                return
+
+            try:
+                await interaction.response.defer(ephemeral=True)
+
+                full_user_context = self.user_task_parser.get_full_user_context_string(
+                    account_address=wallet_address,
+                    n_memos_in_context=20
+                )
+
+                await self.send_long_interaction_response(
+                        interaction, 
+                        f"\n{full_user_context}", 
+                        ephemeral=True
+                    )
+            except Exception as e:
+                logger.error(f"Error in pd_debug_full_user_context: {str(e)}")
+                await interaction.followup.send(
+                    f"An error occurred while fetching the full user context: {str(e)}", 
+                    ephemeral=True
+                )
+
+        @self.tree.command(name="admin_change_ephemeral_setting", description="Change the ephemeral setting for self")
+        async def admin_change_ephemeral_setting(interaction: discord.Interaction, public: bool):
+            # Check if the user has permission (matches the specific ID)
+            if interaction.user.id not in constants.DISCORD_SUPER_USER_IDS:
+                await interaction.response.send_message(
+                    "You don't have permission to use this command.", 
+                    ephemeral=True
+                )
+                return
+            
+            user_id = interaction.user.id
+            if public:
+                self.NON_EPHEMERAL_USERS.add(user_id)
+                setting = "PUBLIC"
+            else:
+                self.NON_EPHEMERAL_USERS.discard(user_id)
+                setting = "PRIVATE"
+            
+            await interaction.response.send_message(
+                f"Your messages will now be {setting}",
+                ephemeral=True
+            )
 
         @self.tree.command(name="pf_log", description="Send a long message to the remembrancer wallet")
         async def pf_remembrancer(interaction: discord.Interaction, message: str, encrypt: bool = False):
             user_id = interaction.user.id
-            
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Check if the user has a stored seed
             if user_id not in client.user_seeds:
                 await interaction.response.send_message(
@@ -970,13 +1380,13 @@ class MyClient(discord.Client):
                 return
 
             # Defer the response to avoid timeout for longer operations
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
 
             try:
 
                 message_obj = await interaction.followup.send(
                     "Sending message to remembrancer...",
-                    ephemeral=True,
+                    ephemeral=ephemeral_setting,
                     wait=True  # returns message object
                 )
 
@@ -992,7 +1402,9 @@ class MyClient(discord.Client):
                     if not handshake_success:
                         return
                     
-                    await message_obj.edit(content="Handshake verified. Proceeding to send memo...")
+                    await message_obj.edit(content=f"""Handshake verified. Proceeding to send message
+                    {message}
+                    ...""")
 
                 response = generic_pft_utilities.send_memo(
                     wallet_seed_or_wallet=wallet,
@@ -1012,15 +1424,17 @@ class MyClient(discord.Client):
 
                 mode = "Encrypted message" if encrypt else "Message"
                 await message_obj.edit(
-                    content=f"{mode} sent to remembrancer successfully. Last chunk details:\n{clean_string}", 
+                    content=f"""Post Fiat Log: {message} 
+{mode} sent to remembrancer successfully. Last chunk details:\n{clean_string}""", 
                 )
 
             except Exception as e:
-                await interaction.followup.send(f"An error occurred while sending the message: {str(e)}", ephemeral=True)
+                await interaction.followup.send(f"An error occurred while sending the message: {str(e)}", ephemeral=ephemeral_setting)
         
         @self.tree.command(name="pf_chart", description="Generate a chart of your PFT rewards and metrics")
         async def pf_chart(interaction: discord.Interaction):
             user_id = interaction.user.id
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
@@ -1044,7 +1458,7 @@ class MyClient(discord.Client):
                 return
 
             # Defer the response since chart generation might take time
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
 
             try:
                 # Call the charting function
@@ -1066,7 +1480,7 @@ class MyClient(discord.Client):
                 await interaction.followup.send(
                     file=chart_file,
                     embed=embed,
-                    ephemeral=True
+                    ephemeral=ephemeral_setting
                 )
                 
                 # Clean up the file after sending
@@ -1126,7 +1540,7 @@ class MyClient(discord.Client):
         @self.tree.command(name="pf_outstanding", description="Show your outstanding tasks and verification tasks")
         async def pf_outstanding(interaction: discord.Interaction):
             user_id = interaction.user.id
-            
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
@@ -1149,7 +1563,7 @@ class MyClient(discord.Client):
                 return
 
             # Defer the response to avoid timeout for longer operations
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
 
             try:
                 # Get the unformatted output message
@@ -1161,11 +1575,11 @@ class MyClient(discord.Client):
                 formatted_chunks = self.format_tasks_for_discord(output_message)
                 
                 # Send the first chunk
-                await interaction.followup.send(formatted_chunks[0], ephemeral=True)
+                await interaction.followup.send(formatted_chunks[0], ephemeral=ephemeral_setting)
 
                 # Send the rest of the chunks
                 for chunk in formatted_chunks[1:]:
-                    await interaction.followup.send(chunk, ephemeral=True)
+                    await interaction.followup.send(chunk, ephemeral=ephemeral_setting)
 
             except Exception as e:
                 logger.error(f"MyClient.pf_outstanding: Error fetching outstanding tasks: {str(e)}")
@@ -1178,7 +1592,7 @@ class MyClient(discord.Client):
         @self.tree.command(name="xrp_send", description="Send XRP to a destination address")
         async def xrp_send(interaction: discord.Interaction):
             user_id = interaction.user.id
-
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
@@ -1208,7 +1622,7 @@ class MyClient(discord.Client):
                 )
 
                 async def on_submit(self, interaction: discord.Interaction):
-                    await interaction.response.defer(ephemeral=True)
+                    await interaction.response.defer(ephemeral=ephemeral_setting)
 
                     destination_address = self.address.value
                     amount = self.amount.value
@@ -1250,7 +1664,7 @@ class MyClient(discord.Client):
                         if 'xrpl_explorer_url' in transaction_info:
                             embed.add_field(name="Explorer Link", value=transaction_info['xrpl_explorer_url'], inline=False)
                         
-                        await interaction.followup.send(embed=embed, ephemeral=True)
+                        await interaction.followup.send(embed=embed, ephemeral=ephemeral_setting)
                     except Exception as e:
                         await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
 
@@ -1270,7 +1684,6 @@ class MyClient(discord.Client):
 
                 async def on_submit(self, interaction: discord.Interaction):
                     user_id = interaction.user.id
-
                     # Test seed for validity
                     try:
                         generic_pft_utilities.spawn_wallet_from_seed(self.seed.value.strip())
@@ -1296,7 +1709,7 @@ class MyClient(discord.Client):
         @self.tree.command(name="pf_initiate", description="Initiate your commitment")
         async def pf_initiate(interaction: discord.Interaction):
             user_id = interaction.user.id
-
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
@@ -1340,7 +1753,7 @@ class MyClient(discord.Client):
                     )
 
                     async def on_submit(self, interaction: discord.Interaction):
-                        await interaction.response.defer(ephemeral=True)
+                        await interaction.response.defer(ephemeral=ephemeral_setting)
                         
                         try:
                             handshake_success, user_key, node_key, message_obj = await self.client._ensure_handshake(
@@ -1379,12 +1792,12 @@ class MyClient(discord.Client):
 
             except Exception as e:
                 logger.error(f"MyClient.setup_hook.pf_initiate: Error during initiation: {str(e)}")
-                await interaction.followup.send(f"An error occurred during initiation: {str(e)}", ephemeral=True)
+                await interaction.followup.send(f"An error occurred during initiation: {str(e)}", ephemeral=ephemeral_setting)
 
         @self.tree.command(name="pf_update_link", description="Update your Google Doc link")
         async def pf_update_link(interaction: discord.Interaction):
             user_id = interaction.user.id
-
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
@@ -1412,7 +1825,7 @@ class MyClient(discord.Client):
                 class UpdateLinkModal(discord.ui.Modal, title='Update Google Doc Link'):
                     def __init__(self, client_instance: discord.Client, *args, **kwargs):
                         super().__init__(*args, **kwargs)
-                        self.client = client_instance
+                        self.client: MyClient = client_instance
 
                     google_doc_link = discord.ui.TextInput(
                         label='Please enter new Google Doc Link', 
@@ -1421,7 +1834,7 @@ class MyClient(discord.Client):
                     )
 
                     async def on_submit(self, interaction: discord.Interaction):
-                        await interaction.response.defer(ephemeral=True)
+                        await interaction.response.defer(ephemeral=ephemeral_setting)
 
                         try:
                             handshake_success, user_key, node_key, message_obj = await self.client._ensure_handshake(
@@ -1460,7 +1873,7 @@ class MyClient(discord.Client):
         @self.tree.command(name="pf_request_task", description="Request a Post Fiat task")
         async def pf_task_slash(interaction: discord.Interaction, task_request: str):
             user_id = interaction.user.id
-            
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Check if the user has stored a seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message("You must store a seed using /pf_store_seed before generating a task.", ephemeral=True)
@@ -1481,7 +1894,7 @@ class MyClient(discord.Client):
                 return
 
             # Defer the response to avoid timeout
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
             
             try:
                 # Send the Post Fiat request
@@ -1496,14 +1909,14 @@ class MyClient(discord.Client):
                 clean_string = transaction_info['clean_string']
                 
                 # Send the response
-                await interaction.followup.send(f"Task Requested with Details: {clean_string}", ephemeral=True)
+                await interaction.followup.send(f"Task Requested with Details: {clean_string}", ephemeral=ephemeral_setting)
             except Exception as e:
                 await interaction.followup.send(f"An error occurred while processing your request: {str(e)}", ephemeral=True)
 
         @self.tree.command(name="pf_initial_verification", description="Submit a task for verification")
         async def pf_submit_for_verification(interaction: discord.Interaction):
             user_id = interaction.user.id
-
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
@@ -1532,7 +1945,7 @@ class MyClient(discord.Client):
 
             # Return immediately if proposal acceptance pairs are empty
             if pf_df.empty:
-                await interaction.response.send_message("You have no tasks to submit for verification.", ephemeral=True)
+                await interaction.response.send_message("You have no tasks to submit for verification.", ephemeral=ephemeral_setting)
                 return
 
             # Filter for accepted tasks that have not been completed yet
@@ -1545,7 +1958,7 @@ class MyClient(discord.Client):
             
             # If there are no accepted tasks, notify the user
             if accepted_tasks.empty:
-                await interaction.response.send_message("You have no accepted tasks to submit for verification.", ephemeral=True)
+                await interaction.response.send_message("You have no accepted tasks to submit for verification.", ephemeral=ephemeral_setting)
                 return
 
             # Create dropdown options based on the accepted tasks
@@ -1584,7 +1997,7 @@ class MyClient(discord.Client):
 
                 async def on_submit(self, interaction: discord.Interaction):
                     # Defer the response to avoid interaction timeout
-                    await interaction.response.defer(ephemeral=True)
+                    await interaction.response.defer(ephemeral=ephemeral_setting)
                     
                     completion_string = self.completion_justification.value
                     
@@ -1597,7 +2010,7 @@ class MyClient(discord.Client):
                     )
                     
                     # Send a follow-up message with the result
-                    await interaction.followup.send(output_string, ephemeral=True)
+                    await interaction.followup.send(output_string, ephemeral=ephemeral_setting)
 
             # Define the callback for when a user selects an option
             async def select_callback(interaction: discord.Interaction):
@@ -1619,7 +2032,7 @@ class MyClient(discord.Client):
             view.add_item(select)
 
             # Send the message with the dropdown menu
-            await interaction.response.send_message("Please choose a task to submit for verification:", view=view, ephemeral=True)
+            await interaction.response.send_message("Please choose a task to submit for verification:", view=view, ephemeral=ephemeral_setting)
 
         @self.tree.command(name="pf_new_wallet", description="Generate a new XRP wallet")
         async def pf_new_wallet(interaction: Interaction):
@@ -1632,7 +2045,7 @@ class MyClient(discord.Client):
             class WalletInfoModal(discord.ui.Modal, title='New XRP Wallet'):
                 def __init__(self, client):
                     super().__init__()
-                    self.client = client
+                    self.client: MyClient = client
 
                 address = discord.ui.TextInput(
                     label='Address (Do not modify)',
@@ -1737,9 +2150,9 @@ Note: XRP wallets need 15 XRP to transact.
         @self.tree.command(name="pf_my_wallet", description="Show your wallet information")
         async def pf_my_wallet(interaction: discord.Interaction):
             user_id = interaction.user.id
-
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Defer the response to avoid timeout
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
             
             if user_id not in self.user_seeds:
                 await interaction.followup.send(
@@ -1797,7 +2210,7 @@ Note: XRP wallets need 15 XRP to transact.
                     embeds.append(embed2)
 
                 # Send all embeds
-                await interaction.followup.send(embeds=embeds, ephemeral=True)
+                await interaction.followup.send(embeds=embeds, ephemeral=ephemeral_setting)
             
             except Exception as e:
                 error_message = f"An unexpected error occurred: {str(e)}. Please try again later or contact support if the issue persists."
@@ -1807,7 +2220,7 @@ Note: XRP wallets need 15 XRP to transact.
         @self.tree.command(name="pf_rewards", description="Show your recent Post Fiat rewards")
         async def pf_rewards(interaction: discord.Interaction):
             user_id = interaction.user.id
-            
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
@@ -1830,39 +2243,24 @@ Note: XRP wallets need 15 XRP to transact.
                 return
 
             # Defer the response to avoid timeout for longer operations
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=ephemeral_setting)
 
             try:
                 memo_history = generic_pft_utilities.get_account_memo_history(wallet.address).copy().sort_values('datetime')
 
                 # Return immediately if memo history is empty
                 if memo_history.empty:
-                    await interaction.followup.send("You have no rewards to show.", ephemeral=True)
+                    await interaction.followup.send("You have no rewards to show.", ephemeral=ephemeral_setting)
                     return
 
-                reward_summary_map = self.generic_pft_utilities.get_reward_data(all_account_info=memo_history)
+                reward_summary_map = self.get_reward_data(all_account_info=memo_history)
                 recent_rewards = self.format_reward_summary(reward_summary_map['reward_summaries'].tail(10))
 
-                # Split the message into chunks if it's too long
-                chunks = []
-                while len(recent_rewards) > 0:
-                    if len(recent_rewards) > 1900:
-                        chunk = recent_rewards[:1900]
-                        last_newline = chunk.rfind('\n')
-                        if last_newline != -1:
-                            chunk = recent_rewards[:last_newline]
-                        chunks.append(f"```\n{chunk}\n```")
-                        recent_rewards = recent_rewards[len(chunk):]
-                    else:
-                        chunks.append(f"```\n{recent_rewards}\n```")
-                        recent_rewards = ""
-
-                # Send the first chunk
-                await interaction.followup.send(chunks[0], ephemeral=True)
-
-                # Send the rest of the chunks
-                for chunk in chunks[1:]:
-                    await interaction.followup.send(chunk, ephemeral=True)
+                await self.send_long_interaction_response(
+                    interaction=interaction,
+                    content=recent_rewards,
+                    ephemeral=ephemeral_setting
+                )
 
             except Exception as e:
                 await interaction.followup.send(f"An error occurred while fetching your rewards: {str(e)}", ephemeral=True)
@@ -1870,7 +2268,7 @@ Note: XRP wallets need 15 XRP to transact.
         @self.tree.command(name="pf_final_verification", description="Submit final verification for a task")
         async def pf_final_verification(interaction: discord.Interaction):
             user_id = interaction.user.id
-
+            ephemeral_setting = self.is_special_user_non_ephemeral(interaction)
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
                 await interaction.response.send_message(
@@ -1896,14 +2294,14 @@ Note: XRP wallets need 15 XRP to transact.
 
             # Return immediately if memo history is empty
             if memo_history.empty:
-                await interaction.response.send_message("You have no tasks in the verification queue.", ephemeral=True)
+                await interaction.response.send_message("You have no tasks in the verification queue.", ephemeral=ephemeral_setting)
                 return
 
             outstanding_verification = post_fiat_task_generation_system.get_verification_proposals(account=memo_history)
             
             # If there are no tasks in the verification queue, notify the user
             if outstanding_verification.empty:
-                await interaction.response.send_message("You have no tasks in the verification queue.", ephemeral=True)
+                await interaction.response.send_message("You have no tasks in the verification queue.", ephemeral=ephemeral_setting)
                 return
 
             # Create dropdown options based on the tasks in the verification queue
@@ -1946,7 +2344,7 @@ Note: XRP wallets need 15 XRP to transact.
 
                 async def on_submit(self, interaction: discord.Interaction):
                     # Defer the response to avoid interaction timeout
-                    await interaction.response.defer(ephemeral=True)
+                    await interaction.response.defer(ephemeral=ephemeral_setting)
                     
                     justification_string = self.verification_justification.value
                     
@@ -1959,7 +2357,7 @@ Note: XRP wallets need 15 XRP to transact.
                     )
                     
                     # Send a follow-up message with the result
-                    await interaction.followup.send(output_string, ephemeral=True)
+                    await interaction.followup.send(output_string, ephemeral=ephemeral_setting)
 
             # Define the callback for when a user selects an option
             async def select_callback(interaction: discord.Interaction):
@@ -1981,7 +2379,7 @@ Note: XRP wallets need 15 XRP to transact.
             view.add_item(select)
 
             # Send the message with the dropdown menu
-            await interaction.response.send_message("Please choose a task for final verification:", view=view, ephemeral=True)
+            await interaction.response.send_message("Please choose a task for final verification:", view=view, ephemeral=ephemeral_setting)
 
     async def _check_initiation_rite(
         self,
@@ -2117,7 +2515,6 @@ Note: XRP wallets need 15 XRP to transact.
         await self.tree.sync()
         logger.debug('MyClient.on_ready: Slash commands synced across all guilds.')
 
-
     async def send_message_chunks(self, channel, message, user):
         max_chunk_size = 1900
         max_chunks = 5
@@ -2162,21 +2559,30 @@ Note: XRP wallets need 15 XRP to transact.
             await channel.send(to_send)
 
     async def send_long_interaction_response(self, interaction: discord.Interaction, content: str, ephemeral: bool = True):
-        max_length = 1900
-        lines = content.split('\n')
-        current_chunk = ""
-
-        for line in lines:
-            if len(current_chunk) + len(line) + 1 > max_length:
-                # Send the current chunk
-                await interaction.followup.send(current_chunk.strip(), ephemeral=ephemeral)
-                current_chunk = line + "\n"
-            else:
-                current_chunk += line + "\n"
-
-        # Send any remaining content
-        if current_chunk.strip():
-            await interaction.followup.send(current_chunk.strip(), ephemeral=ephemeral)
+        max_chunk_size = 1900  # Leave room for code block formatting
+        prefix = "```\n"
+        suffix = "\n```"
+        wrapper_length = len(prefix) + len(suffix)
+        
+        # Split content into chunks based on character count
+        chunks = []
+        while content:
+            if len(content) <= max_chunk_size - wrapper_length:
+                chunks.append(content)
+                break
+                
+            # Find the last space within the limit to avoid splitting words
+            split_index = content[:max_chunk_size - wrapper_length].rfind(' ')
+            if split_index == -1:  # No space found, force split at max length
+                split_index = max_chunk_size - wrapper_length
+                
+            chunks.append(content[:split_index])
+            content = content[split_index:].lstrip()  # Remove leading whitespace from next chunk
+        
+        # Send each chunk with code block formatting
+        for chunk in chunks:
+            formatted_chunk = f"{prefix}{chunk}{suffix}"
+            await interaction.followup.send(formatted_chunk, ephemeral=ephemeral)
         
     async def send_long_message(self, message, long_message):
         sent_messages = []
@@ -2262,6 +2668,70 @@ Note: XRP wallets need 15 XRP to transact.
             await self.check_and_notify_new_transactions()
             await asyncio.sleep(15)  # Check every 60 seconds
 
+    async def death_march_checker_for_user(self, user_id: int):
+        """Individual death march checker for a single user."""
+        settings = self.user_deathmarch_settings[user_id]
+
+        while not self.is_closed():
+            now_utc = datetime.now(timezone.utc)
+
+            # Check if death march has ended
+            if now_utc >= settings.session_end:
+                logger.debug(f"death_march_checker: user_id={user_id} - Death March ended; clearing session.")
+                settings.session_start = None
+                settings.session_end = None
+                settings.channel_id = None
+                settings.last_checkin = None
+                break
+
+            # Check local time window
+            user_tz = pytz.timezone(settings.timezone)
+            now_local = datetime.now(user_tz).time()
+
+            if settings.start_time <= now_local <= settings.end_time:
+                # Check if enough time has passed since last check-in
+                if settings.last_checkin:
+                    time_since_last = (now_utc - settings.last_checkin).total_seconds() / 60
+                    if time_since_last < settings.check_interval:
+                        await asyncio.sleep((settings.check_interval - time_since_last) * 60)
+                        continue
+                logger.debug(f"death_march_checker: user_id={user_id} is within time window and due for check-in.")
+                try:
+                    seed = self.user_seeds.get(user_id)
+                    if not seed:
+                        logger.debug(f"death_march_checker: user_id={user_id} has no stored seed; ending death march.")
+                        break
+
+                    user_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
+                    analyzer = ODVFocusAnalyzer(
+                        account_address=user_wallet.classic_address,
+                        openrouter=self.openrouter,
+                        user_context_parser=self.user_task_parser,
+                        pft_utils=self.generic_pft_utilities
+                    )
+                    focus_text = await analyzer.get_response_async("Death March Check-In")
+
+                    channel = self.get_channel(settings.channel_id)
+                    if channel:
+                        # Mention the user
+                        mention_string = f"<@{user_id}>"
+                        await channel.send(f"{mention_string} **Death March Check-In**\n{focus_text}")
+                        settings.last_checkin = now_utc
+                    else:
+                        logger.warning(
+                            f"death_march_checker: Channel {settings.channel_id} not found for user_id={user_id}."
+                        )
+                        break
+                except Exception as e:
+                    logger.error(
+                        f"death_march_checker: Error processing user_id={user_id}: {str(e)}"
+                    )
+
+            # Sleep until next interval
+            await asyncio.sleep(settings.check_interval * 60)
+
+        logger.info(f"death_march_checker: Ending death march loop for user_id={user_id}")
+
     async def death_march_reminder(self):
         await self.wait_until_ready()
         
@@ -2272,8 +2742,8 @@ Note: XRP wallets need 15 XRP to transact.
         channel_id = 1229917290254827521  # The specific channel ID
         
         est_tz = pytz.timezone('US/Eastern')
-        start_time = time(6, 30)  # 6:30 AM
-        end_time = time(21, 0)  # 9:00 PM
+        start_time = time(0, 30)  # 6:30 AM
+        end_time = time(23, 59)  # 9:00 PM
         
         while not self.is_closed():
             try:
@@ -2301,6 +2771,8 @@ Note: XRP wallets need 15 XRP to transact.
 
             # Wait for 30 minutes before the next reminder (10 seconds for testing)
             await asyncio.sleep(30*60)  # Change to 1800 (30 minutes) for production
+
+
             
     async def on_message(self, message):
         if message.author.id == self.user.id:
@@ -2487,23 +2959,32 @@ My specific question/request is: {user_query}"""
                 await message.reply("You must store a seed using /pf_store_seed before getting tactical advice.", mention_author=True)
 
         if message.content.startswith('!deathmarch'):
-            ## FOR REPEATED RESPONSE TARGET THIS AT USER ID 402536023483088896
-            if user_id in self.user_seeds:
+            user_id = message.author.id
+            if user_id not in self.user_seeds:
+                await message.reply("You must store a seed using /pf_store_seed first.", mention_author=True)
+                return
+
+            try:
                 seed = self.user_seeds[user_id]
+                user_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
                 
-                try:
-                    logger.debug(f"MyClient.deathmarch: Spawning wallet to fetch info for {message.author.name}")
-                    user_wallet = self.generic_pft_utilities.spawn_wallet_from_seed(seed=seed)
-                    user_address = user_wallet.classic_address
-                    tactical_string = self.post_fiat_task_generation_system.get_o1_coaching_string_for_account(user_address)
-                    
-                    await self.send_long_message(message, tactical_string)
-            
-                except Exception as e:
-                    error_message = f"An error occurred while generating tactical advice: {str(e)}"
-                    await message.reply(error_message, mention_author=True)
-            else:
-                await message.reply("You must store a seed using /pf_store_seed before getting tactical advice.", mention_author=True)
+                # Create the analyzer inline
+                analyzer = ODVFocusAnalyzer(
+                    account_address=user_wallet.classic_address,
+                    openrouter=self.openrouter,
+                    user_context_parser=self.user_task_parser,
+                    pft_utils=self.generic_pft_utilities
+                )
+                # If you want the same exact prompt
+                focus_text = analyzer.get_response("Death March Check-In")
+
+                #await message.channel.send(f"**Death March Check-In**\n{focus_text}")
+                await self.send_long_message(message, focus_text)
+
+            except Exception as e:
+                logger.error(f"!deathmarch: An error occurred for user {user_id}: {str(e)}")
+                await message.reply(f"An error occurred: {str(e)}", mention_author=True)
+
 
         if message.content.startswith('!redpill'):
             if user_id in self.user_seeds:
@@ -2720,7 +3201,7 @@ My specific question/request is: {user_query}"""
             """Format task ID and extract date"""
             try:
                 datetime_str = task_id.split('__')[0]
-                date_obj = datetime.datetime.strptime(datetime_str, '%Y-%m-%d_%H:%M')
+                date_obj = datetime.strptime(datetime_str, '%Y-%m-%d_%H:%M')
                 formatted_date = date_obj.strftime('%d %b %Y %H:%M')
                 return task_id, formatted_date
             except (ValueError, IndexError):
@@ -2978,17 +3459,24 @@ My specific question/request is: {user_query}"""
         
         output_string = "REWARD SUMMARY\n\n" + "\n".join(formatted_rewards)
         return output_string
-
-@dataclass
-class AccountInfo:
-    address: str
-    username: str = ''
-    xrp_balance: float = 0
-    pft_balance: float = 0
-    transaction_count: int = 0
-    monthly_pft_avg: float = 0
-    weekly_pft_avg: float = 0
-    google_doc_link: Optional[str] = None
+    
+    def _calculate_death_march_costs(self, settings: DeathMarchSettings, days: int = 1) -> tuple[int, int]:
+        """Calculate death march check-ins and costs.
+        
+        Args:
+            settings: User's death march settings
+            days: Number of days for the death march
+            
+        Returns:
+            tuple[int, int]: (checks_per_day, total_cost)
+        """
+        start_dt = datetime.combine(datetime.today(), settings.start_time)
+        end_dt = datetime.combine(datetime.today(), settings.end_time)
+        daily_duration = (end_dt - start_dt).total_seconds() / 60  # duration in minutes
+        checks_per_day = int(daily_duration / settings.check_interval)
+        total_cost = checks_per_day * days * 30  # 30 PFT per check-in
+        
+        return checks_per_day, total_cost
 
 def init_bot():
     """Initialize and return the Discord bot with required intents"""
