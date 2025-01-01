@@ -1,0 +1,1 @@
+SELECT * FROM decoded_memos WHERE hash = $1

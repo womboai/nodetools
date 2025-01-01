@@ -6,10 +6,10 @@ INSERT INTO postfiat_tx_cache (
     meta,
     validated
 ) VALUES (
-    %(hash)s,
-    %(ledger_index)s,
-    %(close_time_iso)s,
-    %(tx_json)s,
-    %(meta)s,
-    %(validated)s
+    $1,
+    $2,
+    $3,
+    $4,
+    $5,
+    $6
 ) ON CONFLICT (hash) DO NOTHING

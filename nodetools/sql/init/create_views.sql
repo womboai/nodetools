@@ -45,7 +45,7 @@ SELECT
     m.memo_format,
     m.memo_type,
     m.memo_data,
-    m.transaction_time,
+    m.datetime,
     m.transaction_result
 FROM transaction_processing_results r
 LEFT JOIN transaction_memos m ON r.hash = m.hash;

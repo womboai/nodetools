@@ -1,7 +1,7 @@
 INSERT INTO transaction_processing_results 
     (hash, processed, rule_name, response_tx_hash, notes)
 VALUES 
-    (%s, %s, %s, %s, %s)
+    ($1, $2, $3, $4, $5)
 ON CONFLICT (hash) DO UPDATE SET
     processed = EXCLUDED.processed,
     rule_name = EXCLUDED.rule_name,

@@ -22,7 +22,7 @@ class TransactionRepository(Protocol):
         """
         ...
 
-    async def store_reviewing_result(self, tx_hash: str, result: 'ReviewingResult') -> None:
+    async def store_reviewing_result(self, result: 'ReviewingResult') -> None:
         """Store the reviewing result for a transaction"""
         ...
 
@@ -63,8 +63,19 @@ class TransactionRepository(Protocol):
         """Insert a single transaction and return the processed record"""
         ...
 
-    async def get_decoded_transaction(self, tx_hash: str) -> Optional[Dict[str, Any]]:
+    async def get_decoded_memo(self, tx_hash: str) -> Optional[Dict[str, Any]]:
         """Get a specific transaction with decoded memos by hash.
+        
+        Args:
+            tx_hash: The transaction hash to look up
+            
+        Returns:
+            Dict containing transaction data with decoded memos if found, None otherwise
+        """
+        ...
+
+    async def get_decoded_memo_w_processing(self, tx_hash: str) -> Optional[Dict[str, Any]]:
+        """Get a specific transaction with decoded memos and processing results by hash.
         
         Args:
             tx_hash: The transaction hash to look up

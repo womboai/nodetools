@@ -526,7 +526,7 @@ class ResponseQueueRouter:
                     if current_time >= info['next_retry']:
                         try:
                             # Check if specific transaction exists in decoded_memos view
-                            tx = await self.transaction_repository.get_decoded_transaction(tx_hash)
+                            tx = await self.transaction_repository.get_decoded_memo_w_processing(tx_hash)
                             
                             if tx:
                                 # Found in database with decoded memos, queue for review
@@ -832,6 +832,11 @@ class TransactionOrchestrator:
                 try:
                     # Wait for next transaction with timeout
                     tx = await asyncio.wait_for(self.review_queue.get(), timeout=IDLE_LOG_INTERVAL)
+
+                    # Skip invalid transactions
+                    if not tx or not tx.get('hash'):
+                        logger.warning(f"Skipping invalid transaction: {tx}")
+                        continue
                     
                     # Review transaction. Result includes the transaction post-processing (result.tx)
                     result = await self.reviewer.review_transaction(tx)

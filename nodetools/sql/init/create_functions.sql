@@ -73,7 +73,7 @@ BEGIN
             memo_format,
             memo_type,
             memo_data,
-            transaction_time,
+            datetime,
             transaction_result
         ) VALUES (
             NEW.hash,
@@ -96,7 +96,7 @@ BEGIN
             memo_format = EXCLUDED.memo_format,
             memo_type = EXCLUDED.memo_type,
             memo_data = EXCLUDED.memo_data,
-            transaction_time = EXCLUDED.transaction_time,
+            datetime = EXCLUDED.datetime,
             transaction_result = EXCLUDED.transaction_result;
     END IF;
 

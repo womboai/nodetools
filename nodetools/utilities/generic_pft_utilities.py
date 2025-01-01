@@ -562,16 +562,15 @@ class GenericPFTUtilities:
         Returns:
             DataFrame containing transaction history with memo details
         """    
-        pft_issuer = self.pft_issuer if pft_only else None
         results = await self.transaction_repository.get_account_memo_history(
             account_address=account_address,
-            pft_issuer=pft_issuer
+            pft_only=pft_only
         )
-        
+
         df = pd.DataFrame(results)
-        # Convert simple_date column to datetime after DataFrame creation
-        if 'simple_date' in df.columns:
-            df['simple_date'] = pd.to_datetime(df['simple_date'])
+
+        # Convert datetime column to datetime after DataFrame creation
+        df['datetime'] = pd.to_datetime(df['datetime'])
         return df
     
     async def process_queue_transaction(

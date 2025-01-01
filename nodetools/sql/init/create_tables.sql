@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS transaction_memos (
     memo_format TEXT DEFAULT '',
     memo_type TEXT DEFAULT '',
     memo_data TEXT DEFAULT '',
-    transaction_time TIMESTAMP,
+    datetime TIMESTAMP,
     transaction_result VARCHAR(50),
     FOREIGN KEY (hash) REFERENCES postfiat_tx_cache(hash)
         ON DELETE CASCADE
