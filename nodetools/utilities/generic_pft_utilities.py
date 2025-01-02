@@ -603,7 +603,7 @@ class GenericPFTUtilities:
             pft_amount = Decimal(pft_amount) if pft_amount is not None else None
 
             # Send transaction
-            response = self.send_memo_legacy(
+            response = self.send_memo(
                 wallet_seed_or_wallet=wallet,
                 destination=destination,
                 memo=memo,
@@ -775,7 +775,7 @@ class GenericPFTUtilities:
 
         return chunked_memos
 
-    def send_memo_legacy(self, 
+    def send_memo(self, 
             wallet_seed_or_wallet: Union[str, xrpl.wallet.Wallet], 
             destination: str, 
             memo: Union[str, Memo], 
@@ -1440,12 +1440,15 @@ class GenericPFTUtilities:
         else:
             logger.error("Database error occurred: %s", error)
 
-    def fetch_pft_trustline_data(self) -> Dict[str, Dict[str, Any]]:
+    def fetch_pft_trustline_data(self, batch_size: int = 200) -> Dict[str, Dict[str, Any]]:
         """Get PFT token holder account information.
         
         Queries the XRPL for all accounts that have trustlines with the PFT issuer account.
         The balances are from the issuer's perspective, so they are negated to show actual
         holder balances (e.g., if issuer shows -100, holder has +100).
+
+        Args:
+            batch_size: Number of records to fetch per request (max 400)
 
         Returns:
             Dict of dictionaries with keys:
@@ -1458,22 +1461,43 @@ class GenericPFTUtilities:
         """
         # Create XRPL client and get account lines
         client = xrpl.clients.JsonRpcClient(self.https_url)
-        response = client.request(
-            xrpl.models.requests.AccountLines(
-                account=self.pft_issuer,
-                ledger_index="validated"
-            )
-        )
 
-        return {
-            line['account']: {
-                'balance': Decimal(line['balance']),
-                'currency': line['currency'],
-                'limit_peer': line['limit_peer'],
-                'pft_holdings': Decimal(line['balance']) * -1
-            }
-            for line in response.result['lines']
-        }
+        # Initialize result dictionary and marker
+        all_lines = {}
+        marker = None
+
+        while True:
+            try:
+                # Request account lines with pagination
+                request = xrpl.models.requests.AccountLines(
+                    account=self.pft_issuer,
+                    ledger_index="validated",
+                    limit=batch_size,
+                    marker=marker
+                )
+                
+                response = client.request(request)
+
+                # Process this batch of lines
+                for line in response.result['lines']:
+                    all_lines[line['account']] = {
+                        'balance': Decimal(line['balance']),
+                        'currency': line['currency'],
+                        'limit_peer': line['limit_peer'],
+                        'pft_holdings': Decimal(line['balance']) * -1
+                    }
+                
+                # Check if there are more results
+                marker = response.result.get('marker')
+                if not marker:
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Error fetching trustline data batch: {e}")
+                logger.error(traceback.format_exc())
+                break
+
+        return all_lines
     
     def sync_pft_transaction_history_for_account(self, account_address: str):
         """Sync transaction history for an account to the postfiat_tx_cache table.
@@ -1696,7 +1720,7 @@ class GenericPFTUtilities:
             )
             logger.debug(f"GenericPFTUtilities.send_google_doc: Sending Google Doc link transaction from {wallet.classic_address} to node {self.node_address}: {google_doc_link}")
             
-            response = self.send_memo_legacy(
+            response = self.send_memo(
                 wallet_seed_or_wallet=wallet,
                 username=username,
                 memo=google_doc_memo,
@@ -2148,7 +2172,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
                 memo_format=username
             )
             logger.debug(f"GenericPFTUtilities.handle_initiation_rite: Sending initiation rite transaction from {wallet.classic_address} to node {self.node_address}")
-            response = self.send_memo_legacy(
+            response = self.send_memo(
                 wallet_seed_or_wallet=wallet,
                 memo=initiation_memo,
                 destination=self.node_address,

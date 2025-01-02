@@ -38,7 +38,7 @@ class GenericPFTUtilities(Protocol):
         """Get memo history for a given account"""
         ...
 
-    def send_memo_legacy(self, 
+    def send_memo(self, 
             wallet_seed_or_wallet: Union[str, Wallet], 
             destination: str, 
             memo: Union[str, Memo], 
