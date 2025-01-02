@@ -6,6 +6,7 @@ from decimal import Decimal
 from nodetools.configuration.configuration import NetworkConfig, NodeConfig
 from nodetools.utilities.db_manager import DBConnectionManager
 from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
+from nodetools.protocols.transaction_repository import TransactionRepository
 
 class GenericPFTUtilities(Protocol):
     """Protocol defining the interface for GenericPFTUtilities implementations"""
@@ -28,6 +29,11 @@ class GenericPFTUtilities(Protocol):
     @property
     def xrpl_monitor(self) -> XRPLWebSocketMonitor:
         """Get the XRPL monitor"""
+        ...
+
+    @property
+    def transaction_repository(self) -> TransactionRepository:
+        """Get the transaction repository"""
         ...
 
     def sync_pft_transaction_history(self):
@@ -72,20 +78,6 @@ class GenericPFTUtilities(Protocol):
         """Spawn a wallet from a seed"""
         ...
 
-    def get_latest_outgoing_context_doc_link(
-        self, 
-        account_address: str,
-        memo_history: pd.DataFrame = None
-    ) -> Optional[str]:
-        """Get the most recent Google Doc context link sent by this wallet.
-        Handles both encrypted and unencrypted links for backwards compatibility.
-        """
-        ...
-
-    def get_google_doc_text(self, google_url: str) -> Optional[str]:
-        """Get the text of a Google Doc"""
-        ...
-
     def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
         """Get the most recent messages from a user's memo history"""
         ...
@@ -114,4 +106,44 @@ class GenericPFTUtilities(Protocol):
 
     def get_pft_balance(self, account_address: str) -> Decimal:
         """Get PFT balance for an account from the database"""
+        ...
+
+    def process_memo_data(
+        self,
+        memo_type: str,
+        memo_data: str,
+        decompress: bool = True,
+        decrypt: bool = True,
+        full_unchunk: bool = False, 
+        memo_history: Optional[pd.DataFrame] = None,
+        channel_address: Optional[str] = None,
+        channel_counterparty: Optional[str] = None,
+        channel_private_key: Optional[Union[str, Wallet]] = None
+    ) -> str:
+        ...
+
+    def verify_xrp_balance(self, address: str, minimum_xrp_balance: int) -> bool:
+        """
+        Verify that a wallet has sufficient XRP balance.
+        
+        Args:
+            wallet: XRPL wallet object
+            minimum_balance: Minimum required XRP balance
+            
+        Returns:
+            tuple: (bool, float) - Whether balance check passed and current balance
+        """
+        ...
+
+    def handle_trust_line(self, wallet: Wallet, username: str):
+        """
+        Check and establish PFT trustline if needed.
+        
+        Args:
+            wallet: XRPL wallet object
+            username: Discord username
+
+        Raises:
+            Exception: If there is an error creating the trust line
+        """
         ...

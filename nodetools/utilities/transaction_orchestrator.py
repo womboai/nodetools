@@ -835,7 +835,7 @@ class TransactionOrchestrator:
 
                     # Skip invalid transactions
                     if not tx or not tx.get('hash'):
-                        logger.warning(f"Skipping invalid transaction: {tx}")
+                        logger.warning(f"TransactionOrchestrator: Skipping invalid transaction: {tx}")
                         continue
                     
                     # Review transaction. Result includes the transaction post-processing (result.tx)

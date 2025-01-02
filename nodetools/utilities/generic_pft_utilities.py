@@ -464,34 +464,6 @@ class GenericPFTUtilities:
     
     # TODO: Move to MemoBuilder
     @staticmethod
-    def construct_google_doc_context_memo(user, google_doc_link):               
-        return GenericPFTUtilities.construct_memo(
-            memo_format=user, 
-            memo_type=global_constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value, 
-            memo_data=google_doc_link
-        ) 
-
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def construct_genesis_memo(user, task_id, full_output):
-        return GenericPFTUtilities.construct_memo(
-            memo_format=user, 
-            memo_type=task_id, 
-            memo_data=full_output
-        )
-    
-    # TODO: Move to MemoBuilder 
-    @staticmethod
-    def construct_basic_postfiat_memo(user, task_id, full_output):
-        """Constructs a basic memo object for Post Fiat tasks"""
-        return GenericPFTUtilities.construct_memo(
-            memo_data=full_output,
-            memo_type=task_id,
-            memo_format=user
-        )
-    
-    # TODO: Move to MemoBuilder
-    @staticmethod
     def construct_handshake_memo(user, ecdh_public_key):
         """Constructs a handshake memo for encrypted communication"""
         return GenericPFTUtilities.construct_memo(
@@ -561,7 +533,8 @@ class GenericPFTUtilities:
             
         Returns:
             DataFrame containing transaction history with memo details
-        """    
+        """
+        logger.debug(f"GenericPFTUtilities.get_account_memo_history_async: Getting memo history for {account_address} with pft_only={pft_only}")
         results = await self.transaction_repository.get_account_memo_history(
             account_address=account_address,
             pft_only=pft_only
@@ -1557,274 +1530,6 @@ class GenericPFTUtilities:
         pft_holders = self.get_pft_holders()
         return pft_holders.get(account_address, {}).get('balance', Decimal(0))
 
-    def get_latest_outgoing_context_doc_link(
-            self, 
-            account_address: str,
-            memo_history: pd.DataFrame = None
-        ) -> Optional[str]:
-        """Get the most recent Google Doc context link sent by this wallet.
-        Handles both encrypted and unencrypted links for backwards compatibility.
-            
-        Args:
-            account_address: Account address
-            memo_history: Optional DataFrame containing memo history
-            
-        Returns:
-            str or None: Most recent Google Doc link or None if not found
-        """
-        try:
-            if memo_history is None:
-                memo_history = self.get_account_memo_history(account_address=account_address, pft_only=False)
-
-            if memo_history.empty:
-                return None
-
-            context_docs = memo_history[
-                (memo_history['memo_type'].apply(lambda x: global_constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value in str(x))) &
-                (memo_history['account'] == account_address) &
-                (memo_history['transaction_result'] == "tesSUCCESS")
-            ]
-            
-            if len(context_docs) > 0:
-                latest_doc = context_docs.iloc[-1]
-                
-                return self.process_memo_data(
-                    memo_type=latest_doc['memo_type'],
-                    memo_data=latest_doc['memo_data'],
-                    channel_address=self.node_address,
-                    channel_counterparty=account_address,
-                    memo_history=memo_history,
-                    channel_private_key=self.credential_manager.get_credential(f"{self.node_name}__v1xrpsecret")
-                )
-
-            return None
-            
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities.get_latest_outgoing_context_doc_link: Error getting latest context doc link: {e}")
-            return None
-    
-    @staticmethod
-    def get_google_doc_text(share_link):
-        """Get the plain text content of a Google Doc.
-        
-        Args:
-            share_link: Google Doc share link
-            
-        Returns:
-            str: Plain text content of the Google Doc
-        """
-        # Extract the document ID from the share link
-        doc_id = share_link.split('/')[5]
-    
-        # Construct the Google Docs API URL
-        url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
-    
-        # Send a GET request to the API URL
-        response = requests.get(url)
-    
-        # Check if the request was successful
-        if response.status_code == 200:
-            # Return the plain text content of the document
-            return response.text
-        else:
-            # Return an error message if the request was unsuccessful
-            # DON'T CHANGE THIS STRING, IT'S USED FOR GOOGLE DOC VALIDATION
-            return f"Failed to retrieve the document. Status code: {response.status_code}"
-    
-    @staticmethod
-    def retrieve_xrp_address_from_google_doc(google_doc_text):
-        """ Retrieves the XRP address from the google doc """
-        # NOTE: legacy method, unclear if we'll need it
-        # Split the text into lines
-        lines = google_doc_text.split('\n')      
-
-        # Regular expression for XRP address
-        xrp_address_pattern = r'r[1-9A-HJ-NP-Za-km-z]{25,34}'
-
-        wallet_at_front_of_doc = None
-        # look through the first 5 lines for an XRP address
-        for line in lines[:5]:
-            match = re.search(xrp_address_pattern, line)
-            if match:
-                wallet_at_front_of_doc = match.group()
-                break
-
-        return wallet_at_front_of_doc
-    
-    def check_if_google_doc_is_valid(self, wallet: xrpl.wallet.Wallet, google_doc_link):
-        """ Checks if the google doc is valid """
-
-        # Check 1: google doc is a valid url
-        if not google_doc_link.startswith('https://docs.google.com/document/d/'):
-            raise InvalidGoogleDocException(google_doc_link)
-        
-        google_doc_text = self.get_google_doc_text(google_doc_link)
-
-        # Check 2: google doc exists
-        if "Status code: 404" in google_doc_text:
-            raise GoogleDocNotFoundException(google_doc_link)
-
-        # Check 3: google doc is shared
-        if "Status code: 401" in google_doc_text:
-            raise GoogleDocIsNotSharedException(google_doc_link)
-        
-        # # Check 4: google doc contains the correct XRP address at the top
-        # wallet_at_front_of_doc = self.retrieve_xrp_address_from_google_doc(google_doc_text)
-        # logger.debug(f"wallet_at_front_of_doc: {wallet_at_front_of_doc}")
-        # if wallet_at_front_of_doc != wallet.classic_address:
-        #     raise GoogleDocDoesNotContainXrpAddressException(wallet.classic_address)
-        
-        # # Check 5: XRP address has a balance
-        # if self.get_xrp_balance(wallet.classic_address) == 0:
-        #     raise GoogleDocIsNotFundedException(google_doc_link)
-    
-    def handle_google_doc(self, wallet: xrpl.wallet.Wallet, google_doc_link: str, username: str):
-        """
-        Validate and process Google Doc submission.
-        
-        Args:
-            wallet: XRPL wallet object
-            google_doc_link: Link to the Google Doc
-            username: Discord username
-            
-        Returns:
-            dict: Status of Google Doc operation with keys:
-                - success (bool): Whether operation was successful
-                - message (str): Description of what happened
-                - tx_hash (str, optional): Transaction hash if doc was sent
-        """
-        logger.debug(f"GenericPFTUtilities.handle_google_doc: Handling google doc for {username} ({wallet.classic_address})")
-        try:
-            self.check_if_google_doc_is_valid(wallet, google_doc_link)
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities.handle_google_doc: Error validating Google Doc: {e}")
-            raise
-        
-        return self.send_google_doc(wallet, google_doc_link, username)
-
-    def send_google_doc(self, wallet: xrpl.wallet.Wallet, google_doc_link: str, username: str) -> dict:
-        """Send Google Doc context link to the node.
-        
-        Args:
-            wallet: XRPL wallet object
-            google_doc_link: Google Doc URL
-            username: Discord username
-            
-        Returns:
-            dict: Transaction status
-        """
-        try:
-            google_doc_memo = self.construct_google_doc_context_memo(
-                user=username,
-                google_doc_link=google_doc_link
-            )
-            logger.debug(f"GenericPFTUtilities.send_google_doc: Sending Google Doc link transaction from {wallet.classic_address} to node {self.node_address}: {google_doc_link}")
-            
-            response = self.send_memo(
-                wallet_seed_or_wallet=wallet,
-                username=username,
-                memo=google_doc_memo,
-                destination=self.node_address,
-                encrypt=True  # Google Doc link is always encrypted
-            )
-
-            if not self.verify_transaction_response(response):
-                raise Exception(f"GenericPFTUtilities.send_google_doc: Failed to send Google Doc link: {response}")
-
-            return response  # Return last response for compatibility with existing code
-
-        except Exception as e:
-            raise Exception(f"GenericPFTUtilities.send_google_doc: Error sending Google Doc: {str(e)}")
-
-    def format_recent_chunk_messages(self, message_df):
-        """
-        Format the last fifteen messages into a singular text block.
-        
-        Args:
-        df (pandas.DataFrame): DataFrame containing 'datetime', 'cleaned_message', and 'direction' columns.
-        
-        Returns:
-        str: Formatted text block of the last fifteen messages.
-        """
-        df= message_df
-        formatted_messages = []
-        for _, row in df.iterrows():
-            formatted_message = f"[{row['datetime']}] ({row['direction']}): {row['cleaned_message']}"
-            formatted_messages.append(formatted_message)
-        
-        return "\n".join(formatted_messages)
-    
-    def dump_google_doc_links(self, output_file: str = "google_doc_links.csv") -> None:
-        """Dump all Google Doc context links to a file for review.
-        
-        Creates a file containing wallet addresses, usernames, and their associated
-        decrypted Google Doc links for node operator review.
-        
-        Args:
-            output_file: Path to output file. Defaults to "google_doc_links.txt"
-        """
-        try:
-            # Get all transactions for the node
-            memo_history = self.get_account_memo_history(
-                account_address=self.node_address,
-                pft_only=False
-            )
-
-            # Filter for Google Doc context links
-            doc_links = memo_history[
-                (memo_history['memo_type'] == global_constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value) &
-                (memo_history['transaction_result'] == "tesSUCCESS")
-            ]
-
-            if doc_links.empty:
-                return
-            
-            # Get latest link for each account using pandas operations
-            latest_links = (doc_links
-                .sort_values('datetime')
-                .groupby('account')
-                .last()
-                .reset_index()[['account', 'memo_format', 'memo_data', 'datetime']]
-                .rename(columns={'memo_format': 'username', 'datetime': 'last_updated'})
-            )
-
-            # Process using node's address/secret since that's the end we have the key for
-            latest_links['google_doc_link'] = latest_links.apply(
-                lambda row: self.process_memo_data(
-                    memo_type=global_constants.SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value,
-                    memo_data=row['memo_data'],
-                    channel_address=self.node_address,  # The end we have the key for
-                    channel_counterparty=row['account'],         # The other end of the channel
-                    memo_history=memo_history,
-                    channel_private_key=self.credential_manager.get_credential(f"{self.node_name}__v1xrpsecret")
-                ),
-                axis=1
-            )
-
-            # Drop the memo_data column and save
-            latest_links.drop('memo_data', axis=1).to_csv(output_file, index=False)
-            # logger.debug(f"Google Doc links dumped to {output_file}")
-            
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities.dump_google_doc_links: Error dumping Google Doc links: {e}")
-            raise
-
-    # def format_refusal_frame(self, refusal_frame_constructor):
-    #     """
-    #     Format the refusal frame constructor into a nicely formatted string.
-        
-    #     :param refusal_frame_constructor: DataFrame containing refusal data
-    #     :return: Formatted string representation of the refusal frame
-    #     """
-    #     formatted_string = ""
-    #     for idx, row in refusal_frame_constructor.iterrows():
-    #         formatted_string += f"Task ID: {idx}\n"
-    #         formatted_string += f"Refusal Reason: {row['refusal']}\n"
-    #         formatted_string += f"Proposal: {row['proposal']}\n"
-    #         formatted_string += "-" * 50 + "\n"
-        
-    #     return formatted_string
-
     def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
         """Get the most recent messages from a user's memo history.
         
@@ -1841,15 +1546,18 @@ class GenericPFTUtilities:
         """
         try:
             # Get all messages and select relevant columns
-            messages_df = self.get_all_account_compressed_messages(
+            df = self.get_all_account_compressed_messages(
                 account_address=account_address,
                 channel_private_key=self.credential_manager.get_credential(
                     f"{self.node_config.remembrancer_name}__v1xrpsecret"
                 )
-            )[['processed_message', 'datetime']]
+            )
 
-            if messages_df.empty:
+            if df.empty:
+                logger.debug(f"GenericPFTUtilities.get_recent_user_memos: No memo history found for {account_address}. Returning empty JSON")
                 return json.dumps({})
+        
+            messages_df = df[['processed_message', 'datetime']]
             
             # Get most recent messages, sort by time, and convert to JSON
             recent_messages = (messages_df
@@ -2114,73 +1822,6 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
             response = f"Submit failed: {e}"
             raise Exception(f"Trust line creation failed: {response}")
         return response
-    
-    def has_initiation_rite(self, wallet: xrpl.wallet.Wallet, allow_reinitiation: bool = False) -> bool:
-        """Check if wallet has a successful initiation rite.
-        
-        Args:
-            wallet: XRPL wallet object
-            allow_reinitiation: if True, always returns False to allow re-initiation (for testing)
-            
-        Returns:
-            bool: True if successful initiation exists
-
-        Raises:
-            Exception: If there is an error checking for the initiation rite
-        """
-        if allow_reinitiation and config.RuntimeConfig.USE_TESTNET:
-            logger.debug(f"GenericPFTUtilities.has_initiation_rite: Re-initiation allowed for {wallet.classic_address} (test mode)")
-            return False
-        
-        try: 
-            memo_history = self.get_account_memo_history(account_address=wallet.classic_address, pft_only=False)
-            successful_initiations = memo_history[
-                (memo_history['memo_type'] == global_constants.SystemMemoType.INITIATION_RITE.value) & 
-                (memo_history['transaction_result'] == "tesSUCCESS")
-            ]
-            return len(successful_initiations) > 0
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities.has_initiation_rite: Error checking if user {wallet.classic_address} has a successful initiation rite: {e}")
-            return False
-    
-    def handle_initiation_rite(
-            self, 
-            wallet: xrpl.wallet.Wallet, 
-            initiation_rite: str, 
-            username: str,
-            allow_reinitiation: bool = False
-        ) -> dict:
-        """Send initiation rite if none exists.
-        
-        Args:
-            wallet: XRPL wallet object
-            initiation_rite: Commitment message
-            username: Discord username
-            allow_reinitiation: If True, allows re-initiation when in test mode
-
-        Raises:
-            Exception: If there is an error sending the initiation rite
-        """
-        logger.debug(f"GenericPFTUtilities.handle_initiation_rite: Handling initiation rite for {username} ({wallet.classic_address})")
-
-        if self.has_initiation_rite(wallet, allow_reinitiation):
-            logger.debug(f"GenericPFTUtilities.handle_initiation_rite: Initiation rite already exists for {username} ({wallet.classic_address})")
-        else:
-            initiation_memo = self.construct_memo(
-                memo_data=initiation_rite, 
-                memo_type=global_constants.SystemMemoType.INITIATION_RITE.value, 
-                memo_format=username
-            )
-            logger.debug(f"GenericPFTUtilities.handle_initiation_rite: Sending initiation rite transaction from {wallet.classic_address} to node {self.node_address}")
-            response = self.send_memo(
-                wallet_seed_or_wallet=wallet,
-                memo=initiation_memo,
-                destination=self.node_address,
-                username=username,
-                compress=False
-            )
-            if not self.verify_transaction_response(response):
-                raise Exception("Initiation rite failed to send")
 
     def get_recent_messages(self, wallet_address): 
         incoming_messages = None

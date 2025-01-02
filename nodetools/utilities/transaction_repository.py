@@ -45,8 +45,16 @@ class TransactionRepository:
                 else:
                     param_values = []
 
+                # Get the record schema
+                statement = await conn.prepare(query)
+                attributes = statement.get_attributes()
+
                 # Execute query and fetch results
                 rows = await conn.fetch(query, *param_values)
+                if not rows:
+                    # Use attribute names as keys instead of Attribute objects
+                    empty_result = {attr.name: None for attr in attributes}
+                    return [empty_result]
                 return [dict(row) for row in rows]
                 
         except Exception as e:
@@ -161,10 +169,8 @@ class TransactionRepository:
         Returns:
             List of dictionaries containing transaction history with memo details
         """ 
-        params = [
-            account_address, account_address, account_address,
-            account_address, account_address, pft_only
-        ]
+        params = [account_address, pft_only]
+
         return await self._execute_query(
             query_name='get_account_memo_history',
             query_category='xrpl',
