@@ -302,6 +302,8 @@ class TransactionReviewer:
                             response_query.query,
                             response_query.params
                         )
+                        # Assumes that no response found will return None (execute_query returns None)
+                        # So we need enforce_column_structure=False arg in execute_query to allow for None results
                         response_tx = result[0] if result else None
 
                         # logger.debug(f"Response query for rule {rule.__class__.__name__}: {response_query.query}")

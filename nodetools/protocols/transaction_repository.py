@@ -45,7 +45,8 @@ class TransactionRepository(Protocol):
     async def execute_query(
         self,
         query: str,
-        params: Optional[Dict[str, Any]] = None
+        params: Optional[Dict[str, Any]] = None,
+        enforce_column_structure: bool = False
     ) -> List[Dict[str, Any]]:
         """
         Execute a custom query with parameters.
@@ -53,6 +54,9 @@ class TransactionRepository(Protocol):
         Args:
             query: SQL query string
             params: Optional dictionary of query parameters
+            enforce_column_structure: If True, enforce the column structure of the query, 
+                otherwise empty results will return None
+                Useful when placing results into a pandas dataframe that requires a consistent structure
             
         Returns:
             List of dictionaries containing query results

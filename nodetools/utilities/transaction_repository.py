@@ -27,9 +27,22 @@ class TransactionRepository:
     async def execute_query(
         self,
         query: str,
-        params: Optional[Dict[str, Any]] = None
+        params: Optional[Dict[str, Any]] = None,
+        enforce_column_structure: bool = False
     ) -> List[Dict[str, Any]]:
-        """Execute a custom query with parameters."""
+        """
+        Execute a custom query with parameters.
+        
+        Args:
+            query: SQL query string
+            params: Optional dictionary of query parameters
+            enforce_column_structure: If True, enforce the column structure of the query, 
+                otherwise empty results will return None. 
+                Useful when placing results into a pandas dataframe that requires a consistent structure
+            
+        Returns:
+            List of dictionaries containing query results
+        """
         try:
             pool = await self.db_manager.get_pool(self.username)
             
@@ -46,15 +59,19 @@ class TransactionRepository:
                     param_values = []
 
                 # Get the record schema
-                statement = await conn.prepare(query)
-                attributes = statement.get_attributes()
+                if enforce_column_structure:
+                    statement = await conn.prepare(query)
+                    attributes = statement.get_attributes()
 
                 # Execute query and fetch results
                 rows = await conn.fetch(query, *param_values)
-                if not rows:
-                    # Use attribute names as keys instead of Attribute objects
-                    empty_result = {attr.name: None for attr in attributes}
-                    return [empty_result]
+
+                if enforce_column_structure:
+                    if not rows:
+                        # Use attribute names as keys instead of Attribute objects
+                        empty_result = {attr.name: None for attr in attributes}
+                        return [empty_result]
+
                 return [dict(row) for row in rows]
                 
         except Exception as e:
@@ -68,7 +85,8 @@ class TransactionRepository:
         self,
         query_name: str,
         query_category: str,
-        params: List[Any]
+        params: List[Any],
+        enforce_column_structure: bool = False
     ) -> List[Dict[str, Any]]:
         """Execute a query and return results with consistent structure.
         
@@ -76,6 +94,9 @@ class TransactionRepository:
             query_name: Name of the SQL file without extension
             query_category: Category/folder containing the SQL file
             params: List of parameters to pass to the query
+            enforce_column_structure: If True, enforce the column structure of the query, 
+                otherwise empty results will return None. 
+                Useful when placing results into a pandas dataframe that requires a consistent structure
             
         Returns:
             List of dictionaries containing query results or empty structure if no results
@@ -88,14 +109,17 @@ class TransactionRepository:
                 query = sql_manager.load_query(query_category, query_name)
                 
                 # Get the record schema
-                statement = await conn.prepare(query)
-                attributes = statement.get_attributes()
+                if enforce_column_structure:
+                    statement = await conn.prepare(query)
+                    attributes = statement.get_attributes()
                 
                 rows = await conn.fetch(query, *params)
-                if not rows:
-                    # Use attribute names as keys instead of Attribute objects
-                    empty_result = {attr.name: None for attr in attributes}
-                    return [empty_result]
+
+                if enforce_column_structure:
+                    if not rows:
+                        # Use attribute names as keys instead of Attribute objects
+                        empty_result = {attr.name: None for attr in attributes}
+                        return [empty_result]
 
                 return [dict(row) for row in rows]
 
@@ -174,7 +198,8 @@ class TransactionRepository:
         return await self._execute_query(
             query_name='get_account_memo_history',
             query_category='xrpl',
-            params=params
+            params=params,
+            enforce_column_structure=True
         )
     
     async def get_account_memo_histories(self, wallet_addresses: List[str]) -> List[Dict[str, Any]]:
