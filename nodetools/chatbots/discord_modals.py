@@ -172,13 +172,15 @@ class InitiationModal(discord.ui.Modal, title='Initiation Rite'):
             
             await message_obj.edit(content="Sending commitment and encrypted google doc link to node...")
 
-            # Attempt the initiation rite
-            self.post_fiat_task_generation_system.discord__initiation_rite(
-                user_seed=self.seed, 
-                initiation_rite=self.commitment_sentence.value, 
-                google_doc_link=self.google_doc_link.value, 
-                username=self.username,
-                allow_reinitiation=config.RuntimeConfig.USE_TESTNET and config.RuntimeConfig.ENABLE_REINITIATIONS  # Allow re-initiation in test mode
+            # Run the blocking function in a thread pool
+            await interaction.client.loop.run_in_executor(
+                None,  # Uses default thread pool
+                self.post_fiat_task_generation_system.discord__initiation_rite,
+                self.seed, 
+                self.commitment_sentence.value, 
+                self.google_doc_link.value, 
+                self.username,
+                config.RuntimeConfig.USE_TESTNET and config.RuntimeConfig.ENABLE_REINITIATIONS  # Allow re-initiation in test mode
             )
             
             mode = "(TEST MODE)" if config.RuntimeConfig.USE_TESTNET else ""
@@ -229,11 +231,13 @@ class UpdateLinkModal(discord.ui.Modal, title='Update Google Doc Link'):
 
             await message_obj.edit(content="Sending encrypted google doc link to node...")
 
-            # Construct and send the encrypted memo
-            self.post_fiat_task_generation_system.discord__update_google_doc_link(
-                user_seed=self.seed,
-                google_doc_link=self.google_doc_link.value,
-                username=self.username
+            # Run the blocking function in a thread pool
+            await interaction.client.loop.run_in_executor(
+                None,  # Uses default thread pool
+                self.post_fiat_task_generation_system.discord__update_google_doc_link,
+                self.seed,
+                self.google_doc_link.value,
+                self.username
             )
 
             await message_obj.edit(content=f"Google Doc link updated to {self.google_doc_link.value}")
@@ -282,12 +286,14 @@ class AcceptanceModal(Modal):
 
         acceptance_string = self.acceptance_string.value
         
-        # Call the discord__task_acceptance function
-        output_string = self.post_fiat_task_generation_system.discord__task_acceptance(
-            user_seed=self.seed,
-            user_name=self.user_name,
-            task_id_to_accept=self.task_id,
-            acceptance_string=acceptance_string
+        # Run the blocking function in a thread pool
+        output_string = await interaction.client.loop.run_in_executor(
+            None,  # Uses default thread pool
+            self.post_fiat_task_generation_system.discord__task_acceptance,
+            self.seed,
+            self.user_name,
+            self.task_id,
+            acceptance_string
         )
         
         # Send a follow-up message with the result
@@ -332,12 +338,14 @@ class RefusalModal(Modal):
         
         refusal_string = self.refusal_string.value
         
-        # Call the discord__task_refusal function
-        output_string = self.post_fiat_task_generation_system.discord__task_refusal(
-            user_seed=self.seed,
-            user_name=self.user_name,
-            task_id_to_refuse=self.task_id,
-            refusal_string=refusal_string
+        # Run the blocking function in a thread pool
+        output_string = await interaction.client.loop.run_in_executor(
+            None,  # Uses default thread pool
+            self.post_fiat_task_generation_system.discord__task_refusal,
+            self.seed,
+            self.user_name,
+            self.task_id,
+            refusal_string
         )
         
         # Send a follow-up message with the result
@@ -382,12 +390,14 @@ class CompletionModal(Modal):
 
         completion_string = self.completion_justification.value
         
-        # Call the discord__initial_submission function
-        output_string = self.post_fiat_task_generation_system.discord__initial_submission(
-            user_seed=self.seed,
-            user_name=self.user_name,
-            task_id_to_accept=self.task_id,
-            initial_completion_string=completion_string
+        # Run the blocking function in a thread pool
+        output_string = await interaction.client.loop.run_in_executor(
+            None,  # Uses default thread pool
+            self.post_fiat_task_generation_system.discord__initial_submission,
+            self.seed,
+            self.user_name,
+            self.task_id,
+            completion_string
         )
         
         # Send a follow-up message with the result
@@ -432,12 +442,14 @@ class VerificationModal(Modal):
         
         justification_string = self.verification_justification.value
         
-        # Call the discord__final_submission function
-        output_string = self.post_fiat_task_generation_system.discord__final_submission(
-            user_seed=self.seed,
-            user_name=self.user_name,
-            task_id_to_submit=self.task_id,
-            justification_string=justification_string
+        # Run the blocking function in a thread pool
+        output_string = await interaction.client.loop.run_in_executor(
+            None,  # Uses default thread pool
+            self.post_fiat_task_generation_system.discord__final_submission,
+            self.seed,
+            self.user_name,
+            self.task_id,
+            justification_string
         )
         
         # Send a follow-up message with the result

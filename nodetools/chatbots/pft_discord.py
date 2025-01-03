@@ -1762,8 +1762,9 @@ Note: XRP wallets need 1 XRP to transact. We recommend you fund your wallet with
 
             # Check if the user has a stored seed
             if user_id not in self.user_seeds:
-                await interaction.response.send_message(
-                    "You must store a seed using /store_seed before submitting final verification.", ephemeral=True
+                await interaction.followup.send(
+                    "You must store a seed using /store_seed before submitting final verification.", 
+                    ephemeral=ephemeral_setting
                 )
                 return
 
@@ -1777,7 +1778,10 @@ Note: XRP wallets need 1 XRP to transact. We recommend you fund your wallet with
                 wallet_address=wallet.address
             )
             if not initiation_check_success:
-                await interaction.response.send_message("You must perform the initiation rite first. Run /pf_initiate to do so.", ephemeral=True)
+                await interaction.followup.send(
+                    "You must perform the initiation rite first. Run /pf_initiate to do so.", 
+                    ephemeral=ephemeral_setting
+                )
                 return
 
             # Fetch account history
@@ -1788,7 +1792,7 @@ Note: XRP wallets need 1 XRP to transact. We recommend you fund your wallet with
             
             # If there are no tasks in the verification queue, notify the user
             if verification_tasks.empty:
-                await interaction.response.send_message("You have no tasks pending final verification.", ephemeral=ephemeral_setting)
+                await interaction.followup.send("You have no tasks pending final verification.", ephemeral=ephemeral_setting)
                 return
 
             self.verification_tasks_cache[user_id] = verification_tasks
@@ -1804,7 +1808,7 @@ Note: XRP wallets need 1 XRP to transact. We recommend you fund your wallet with
             ]
 
             # Create the Select menu
-            select = Select(placeholder="Choose a task to submitfor final verification", options=options)
+            select = Select(placeholder="Choose a task to submit for final verification", options=options)
 
             # Define the callback for when a user selects an option
             async def select_callback(interaction: discord.Interaction):
@@ -2069,7 +2073,7 @@ Note: XRP wallets need 1 XRP to transact. We recommend you fund your wallet with
                 )
 
         # Sync the commands to the guild
-        self.tree.copy_global_to(guild=guild)
+        # self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         logger.debug(f"MyClient.setup_hook: Slash commands synced to guild ID: {guild_id}")
 
@@ -2203,9 +2207,9 @@ Note: XRP wallets need 1 XRP to transact. We recommend you fund your wallet with
         for guild in self.guilds:
             logger.debug(f'- {guild.name} (ID: {guild.id})')
 
-        # Optionally, re-sync slash commands in all guilds
-        await self.tree.sync()
-        logger.debug('MyClient.on_ready: Slash commands synced across all guilds.')
+        # # Optionally, re-sync slash commands in all guilds
+        # await self.tree.sync()
+        # logger.debug('MyClient.on_ready: Slash commands synced across all guilds.')
 
     async def _split_message_into_chunks(self, content: str, max_chunk_size: int = 1900) -> list[str]:
         """Split a message into chunks that fit within Discord's message limit.
