@@ -50,14 +50,15 @@ class XRPLWebSocketMonitor:
         """Start the monitor as an asyncio task"""
         self.review_queue = queue
         self._shutdown = False
-        self._monitor_task = asyncio.create_task(self.monitor())
+        self._monitor_task = asyncio.create_task(
+            self.monitor(),
+            name="XRPLWebSocketMonitor"
+        )
         return self._monitor_task
 
-    async def stop(self):
+    def stop(self):
         """Signal the monitor to stop and wait for it to complete"""
         self._shutdown = True
-        if self._monitor_task:
-            await self._monitor_task
 
     async def handle_connection_error(self, error_msg: str) -> bool:
         """Handle connection errors with exponential backoff"""
@@ -130,7 +131,10 @@ class XRPLWebSocketMonitor:
             logger.info(f"Successfully subscribed to updates on node {self.url}")
 
             # Start timeout checking
-            timeout_task = asyncio.create_task(self._check_timeouts())
+            timeout_task = asyncio.create_task(
+                self._check_timeouts(),
+                name="XRPLWebSocketMonitorTimeoutTask"
+            )
 
             try:
                 async for message in self.client:

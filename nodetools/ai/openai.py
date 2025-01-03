@@ -140,8 +140,13 @@ class OpenAIRequestTool:
                 logger.error(f"OpenAIRequestTool.get_completions: Task {job_name} failed: {e}")
                 return job_name, None
 
-        tasks = [asyncio.create_task(task_with_debug(job_name, args)) 
-                 for job_name, args in arg_async_map.items()]
+        tasks = [
+            asyncio.create_task(
+                task_with_debug(job_name, args),
+                name=f"OpenAIRequestTool_{job_name}"
+            ) 
+            for job_name, args in arg_async_map.items()
+        ]
         return await asyncio.gather(*tasks)
 
     def create_writable_df_for_async_chat_completion(self, arg_async_map):

@@ -11,6 +11,7 @@ LEFT JOIN discord_notifications dn ON dm.hash = dn.hash
 WHERE tpr.processed = TRUE 
 AND dm.datetime > %s  -- Only notify transactions after node start
 AND (dn.hash IS NULL)      -- Haven't been notified yet
+AND NOT dm.memo_type = ANY(%s)  -- Exclude these memo types first
 AND (
     dm.pft_absolute_amount != 0  -- Has PFT
     OR dm.memo_type = ANY(%s)    -- System memo types we want to display

@@ -19,9 +19,6 @@ MIN_XRP_PER_TRANSACTION = Decimal('0.000001')  # Minimum XRP amount per transact
 MIN_XRP_BALANCE = 2  # Minimum XRP balance to be able to perform a transaction
 MAX_CHUNK_SIZE = 1024
 XRP_MEMO_STRUCTURAL_OVERHEAD = 100  # JSON structure, quotes, etc.
-
-# Maximum length for a commitment sentence
-MAX_COMMITMENT_SENTENCE_LENGTH = 950
  
 # Maximum history length
 MAX_HISTORY = 15  # TODO: rename this to something more descriptive

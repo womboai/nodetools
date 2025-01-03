@@ -396,7 +396,10 @@ class ResponseQueueRouter:
         }
 
         # Start retry task
-        self.retry_task = asyncio.create_task(self._retry_pending_reviews())
+        self.retry_task = asyncio.create_task(
+            self._retry_pending_reviews(),
+            name="TransactionOrchestratorRetryTask"
+        )
 
     def _initialize_queue_configs(self) -> Dict[str, asyncio.Queue]:
         """Initialize queue configurations based on response patterns in business rules"""
@@ -412,7 +415,7 @@ class ResponseQueueRouter:
                         pattern=pattern,
                         rule=rule
                     )
-                    logger.debug(f"TransactionResponseManager: Adding queue config for pattern '{pattern_id}'")
+                    logger.debug(f"ResponseQueueRouter: Adding queue config for pattern '{pattern_id}'")
     
         return configs
     
@@ -707,7 +710,7 @@ class ResponseProcessorManager:
                 # Create and store task
                 task = asyncio.create_task(
                     consumer.run(),
-                    name=f"Consumer_{pattern_id}"
+                    name=f"ResponseProcessor_{pattern_id}"
                 )
                 self._tasks.append(task)
                 logger.debug(f"ResponseProcessorManager: Started ResponseProcessor for pattern: {pattern_id}")
@@ -797,11 +800,20 @@ class TransactionOrchestrator:
 
             # Start all processing tasks
             logger.debug("TransactionOrchestrator: Starting review task")
-            review_task = asyncio.create_task(self._review_loop())
+            review_task = asyncio.create_task(
+                self._review_loop(),
+                name="TransactionOrchestratorReviewLoop"
+            )
             logger.debug("TransactionOrchestrator: Starting response routing task")
-            route_task = asyncio.create_task(self._route_loop())
+            route_task = asyncio.create_task(
+                self._route_loop(),
+                name="TransactionOrchestratorRouteLoop"
+            )
             logger.debug("TransactionOrchestrator: Starting consumer manager")
-            consumer_task = asyncio.create_task(self._consumer_loop())
+            consumer_task = asyncio.create_task(
+                self._consumer_loop(),
+                name="TransactionOrchestratorConsumerLoop"
+            )
 
             try:
                 await asyncio.gather(review_task, route_task, consumer_task)
@@ -823,11 +835,12 @@ class TransactionOrchestrator:
     async def _review_loop(self):
         """Continuously review transactions from the review queue"""
         reviewed_count = 0
+        unprocessed_count = 0
         last_log_time = time.time()
         last_activity_time = time.time()
         LOG_INTERVAL = 60  # Log progress every minute
         IDLE_LOG_INTERVAL = 300  # Log idle status every 5 minutes
-        COUNT_LOG_INTERVAL = 100  # Log count every 100 transactions
+        COUNT_LOG_INTERVAL = 500  # Log count every 500 transactions
 
         try:
             while not self._shutdown_event.is_set():
@@ -848,6 +861,7 @@ class TransactionOrchestrator:
 
                     # If transaction needs a response, add to processing queue
                     if not result.processed:
+                        unprocessed_count += 1
                         logger.debug(f"TransactionOrchestrator: Transaction {result.tx['hash']} with memo type {result.tx['memo_type']} needs a response.")
                         await self.routing_queue.put(result.tx)
 
@@ -855,7 +869,7 @@ class TransactionOrchestrator:
                     queue_size = self.review_queue.qsize()
                     if queue_size == 0:
                         self.reviewer.end_sync_mode()
-                        logger.info(f"Finished reviewing. Total transactions reviewed: {reviewed_count}")
+                        logger.info(f"Finished reviewing. Total transactions reviewed: {reviewed_count}. Total transactions needing a response: {unprocessed_count}")
 
                     if reviewed_count % COUNT_LOG_INTERVAL == 0:
                         logger.debug(f"Progress: {reviewed_count} transactions reviewed. Current queue size: {queue_size}")
@@ -877,13 +891,6 @@ class TransactionOrchestrator:
                     logger.error(f"Error reviewing transaction: {e}")
                     logger.error(traceback.format_exc())
                     logger.error(f"Transaction: {tx}")
-
-                    # debugging
-                    raise
-
-        # debugging
-        except Exception as e:
-            raise
 
         finally:
             logger.debug("TransactionOrchestrator: Review loop shutdown complete")
@@ -948,13 +955,6 @@ class TransactionOrchestrator:
                 except Exception as e:
                     logger.error(f"Error routing transaction: {e}")
                     logger.error(traceback.format_exc())
-
-                    # debugging
-                    raise
-
-        # debugging
-        except Exception as e:
-            raise
 
         finally:
             logger.debug("TransactionOrchestrator: Route loop shutdown complete")

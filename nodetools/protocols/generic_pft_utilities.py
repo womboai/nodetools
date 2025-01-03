@@ -147,3 +147,37 @@ class GenericPFTUtilities(Protocol):
             Exception: If there is an error creating the trust line
         """
         ...
+
+    def extract_transaction_info_from_response_object(self, response):
+        """
+        Extract key information from an XRPL transaction response object.
+
+        Args:
+        response (Response): The XRPL transaction response object.
+
+        Returns:
+        dict: A dictionary containing extracted transaction information.
+        """
+        ...
+
+    def send_xrp(
+            self,
+            wallet_seed_or_wallet: Union[str, Wallet], 
+            amount: Union[Decimal, int, float], 
+            destination: str, 
+            memo: Memo, 
+            destination_tag: Optional[int] = None
+        ):
+        ...
+
+    def extract_transaction_info_from_response_object__standard_xrp(self, response):
+        """
+        Extract key information from an XRPL transaction response object.
+        
+        Args:
+        response (Response): The XRPL transaction response object.
+        
+        Returns:
+        dict: A dictionary containing extracted transaction information.
+        """
+        ...

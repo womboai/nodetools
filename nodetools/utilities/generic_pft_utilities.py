@@ -114,7 +114,11 @@ class GenericPFTUtilities:
 
             self.__class__._initialized = True
 
-    def initialize(self):
+    @property
+    def running(self):
+        return self._transaction_orchestrator_task is not None
+
+    def start(self):
         """Initialize components that require async operations"""
         try:
             loop = asyncio.get_running_loop()
@@ -132,11 +136,16 @@ class GenericPFTUtilities:
 
     def shutdown(self):
         """Clean shutdown of async components"""
+        TIMEOUT = 5.0
         tasks = []
         
         if self._transaction_orchestrator_task:
             self.transaction_orchestrator.stop()
             tasks.append(self._transaction_orchestrator_task)
+
+        if self.xrpl_monitor._monitor_task:
+            self.xrpl_monitor.stop()
+            tasks.append(self.xrpl_monitor._monitor_task)
     
         if tasks:
             try:
@@ -149,12 +158,21 @@ class GenericPFTUtilities:
                 
                 # Give tasks time to cleanup (5 seconds max)
                 try:
-                    loop.run_until_complete(asyncio.wait_for(
-                        asyncio.gather(*tasks), 
-                        timeout=5.0
+                    done, pending = loop.run_until_complete(asyncio.wait(
+                        tasks, 
+                        timeout=TIMEOUT
                     ))
+
+                    if pending:
+                        pending_names = [f"{task.get_name()} ({id(task)})" for task in pending]
+                        logger.warning(f"Timeout waiting for components to shutdown gracefully: {', '.join(pending_names)}")
+                        # Cancel any tasks that didn't complete
+                        for task in pending:
+                            task.cancel()
+
                 except asyncio.TimeoutError:
-                    logger.warning("Timeout waiting for components to shutdown gracefully")
+                    pending_names = [f"{task.get_name()} ({id(task)})" for task in tasks if not task.done()]
+                    logger.warning(f"Timeout waiting for components to shutdown gracefully: {', '.join(pending_names)}")
                 except asyncio.CancelledError:
                     pass
                 
@@ -472,19 +490,33 @@ class GenericPFTUtilities:
             memo_format=user
         )
 
-    def send_xrp_with_info__seed_based(self,wallet_seed, amount, destination, memo, destination_tag=None):
-        # TODO: Replace with send_xrp (reference pftpyclient/task_manager/basic_tasks.py)
-        sending_wallet =sending_wallet = xrpl.wallet.Wallet.from_seed(wallet_seed)
+    def send_xrp(
+            self,
+            wallet_seed_or_wallet: Union[str, xrpl.wallet.Wallet], 
+            amount: Union[Decimal, int, float], 
+            destination: str, 
+            memo: Memo, 
+            destination_tag: Optional[int] = None
+        ):
+        # Handle wallet input
+        if isinstance(wallet_seed_or_wallet, str):
+            wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
+        elif isinstance(wallet_seed_or_wallet, xrpl.wallet.Wallet):
+            wallet = wallet_seed_or_wallet
+        else:
+            logger.error("GenericPFTUtilities.send_memo: Invalid wallet input, raising ValueError")
+            raise ValueError("Invalid wallet input")
+
         client = xrpl.clients.JsonRpcClient(self.https_url)
         payment = xrpl.models.transactions.Payment(
-            account=sending_wallet.address,
+            account=wallet.address,
             amount=xrpl.utils.xrp_to_drops(Decimal(amount)),
             destination=destination,
             memos=[memo],
             destination_tag=destination_tag
         )
         try:    
-            response = xrpl.transaction.submit_and_wait(payment, client, sending_wallet)    
+            response = xrpl.transaction.submit_and_wait(payment, client, wallet)    
         except xrpl.transaction.XRPLReliableSubmissionException as e:    
             response = f"Submit failed: {e}"
     
@@ -534,7 +566,6 @@ class GenericPFTUtilities:
         Returns:
             DataFrame containing transaction history with memo details
         """
-        logger.debug(f"GenericPFTUtilities.get_account_memo_history_async: Getting memo history for {account_address} with pft_only={pft_only}")
         results = await self.transaction_repository.get_account_memo_history(
             account_address=account_address,
             pft_only=pft_only
@@ -685,11 +716,13 @@ class GenericPFTUtilities:
         
         # Calculate number of chunks needed
         data_bytes = memo_data.encode('utf-8')
-        return math.ceil(len(data_bytes) / max_data_size)
+        required_chunks = math.ceil(len(data_bytes) / max_data_size)
+        required_chunks = 1 if required_chunks == 0 else required_chunks
+        return required_chunks
     
     # TODO: Move to MemoBuilder
     @staticmethod
-    def _chunk_memos_legacy(memo: Memo, max_size: int = global_constants.MAX_CHUNK_SIZE) -> List[Memo]:
+    def _chunk_memos(memo: Memo, max_size: int = global_constants.MAX_CHUNK_SIZE) -> List[Memo]:
         """
         Splits a Memo object into multiple Memo objects, each under MAX_CHUNK_SIZE bytes.
         Only chunks the memo_data field while preserving memo_format and memo_type.
@@ -757,7 +790,8 @@ class GenericPFTUtilities:
             chunk: bool = False,
             compress: bool = False, 
             encrypt: bool = False,
-            pft_amount: Optional[Decimal] = None
+            pft_amount: Optional[Decimal] = None,
+            disable_pft_check: bool = False
         ) -> Union[dict, list[dict]]:
         """Primary method for sending memos on the XRPL with PFT requirements.
         
@@ -808,11 +842,13 @@ class GenericPFTUtilities:
             memo_type = message_id or self.generate_custom_id()
             memo_format = username or wallet.classic_address
 
+        # TODO: Adopt a spec for PFT requirements
         # Get per-tx PFT requirement
-        pft_amount = pft_amount or self.transaction_requirements.get_pft_requirement(
-            address=destination,
-            memo_type=memo_type
-        )
+        if not disable_pft_check:
+            pft_amount = pft_amount or self.transaction_requirements.get_pft_requirement(
+                address=destination,
+                memo_type=memo_type
+            )
 
         # Check if this is a system memo type
         is_system_memo = any(
@@ -849,11 +885,10 @@ class GenericPFTUtilities:
         if is_system_memo:
             return self._send_memo_single(wallet, destination, memo, pft_amount)
 
-        # Handle chunking for non-system memos if requested, or if the memo is over 1KB
-        size_info = self.calculate_memo_size(memo_format, memo_type, memo_data)
-        if chunk or self.is_over_1kb(size_info['total_size']):
+        # Handle chunking for non-system memos if requested, or if _chunk_memos returns more than one memo
+        chunk_memos = self._chunk_memos(memo)
+        if chunk or len(chunk_memos) > 1:
             try:
-                chunk_memos = self._chunk_memos_legacy(memo)
                 responses = []
 
                 for idx, chunk_memo in enumerate(chunk_memos):
@@ -1738,24 +1773,6 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
             transaction_info['clean_string'] = f"Error extracting transaction info: {str(e)}"
         
         return transaction_info
-
-    # def discord_send_pft_with_info_from_seed(self, destination_address, seed, user_name, message, amount):
-    #     """
-    #     For use in the discord tooling. pass in users user name 
-    #     destination_address = 'rKZDcpzRE5hxPUvTQ9S3y2aLBUUTECr1vN'
-    #     seed = 's_____x'
-    #     message = 'this is the second test of a discord message'
-    #     amount = 2
-    #     """
-    #     wallet = self.spawn_wallet_from_seed(seed)
-    #     memo = self.construct_memo(memo_data=message, memo_type='DISCORD_SERVER', memo_format=user_name)
-    #     action_response = self.send_PFT_with_info(sending_wallet=wallet,
-    #         amount=amount,
-    #         memo=memo,
-    #         destination_address=destination_address,
-    #         url=None)
-    #     printable_string = self.extract_transaction_info_from_response_object(action_response)['clean_string']
-    #     return printable_string
         
     def has_trust_line(self, wallet: xrpl.wallet.Wallet) -> bool:
         """Check if wallet has PFT trustline.
