@@ -1287,8 +1287,14 @@ class PostFiatTaskGenerationSystem:
             None
         """
         try:
+            ### ADDED BLACKLIST 
             memo_history = memo_history.sort_values('datetime').copy()
-
+            node_name = self.node_config.node_name
+            pf_dbconn= self.db_connection_manager.spawn_sqlalchemy_db_connection_for_user(node_name)
+            all_blacklisted_accounts = list(pd.read_sql('task_node_live_blacklist',pf_dbconn)['address'])
+            print(all_blacklisted_accounts)
+            memo_history = memo_history[(memo_history['account'].apply(lambda x: x not in all_blacklisted_accounts)) 
+                                        & (memo_history['destination'].apply(lambda x: x not in all_blacklisted_accounts))].copy()
             # Filter for task completion messages
             all_completions = memo_history[
                 memo_history['memo_data'].apply(
