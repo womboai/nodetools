@@ -398,7 +398,7 @@ class ResponseQueueRouter:
         # Start retry task
         self.retry_task = asyncio.create_task(
             self._retry_pending_reviews(),
-            name="TransactionOrchestratorRetryTask"
+            name="ResponseQueueRouterRetryTask"
         )
 
     def _initialize_queue_configs(self) -> Dict[str, asyncio.Queue]:
@@ -532,6 +532,7 @@ class ResponseQueueRouter:
                         try:
                             # Check if specific transaction exists in decoded_memos view
                             tx = await self.transaction_repository.get_decoded_memo_w_processing(tx_hash)
+                            logger.debug(f"ResponseQueueRouter: Checking for processed transaction {tx_hash} in database")
                             
                             if tx:
                                 # Found in database with decoded memos, queue for review
@@ -560,13 +561,6 @@ class ResponseQueueRouter:
                 logger.error(f"Error in retry loop: {e}")
                 logger.error(traceback.format_exc())
                 await asyncio.sleep(5.0)  # Longer sleep on error
-    
-    def get_queue_sizes(self) -> Dict[str, int]:
-        """Get current size of all response queues"""
-        return {
-            pattern_id: config.queue.qsize() 
-            for pattern_id, config in self.queue_configs.items()
-        }
 
 class ResponseProcessor:
     """Queue consumer that generates and submits responses to transactions.
@@ -592,8 +586,8 @@ class ResponseProcessor:
         self.processed_count = 0
         self.last_log_time = time.time()
         self.last_activity_time = time.time()
-        self.LOG_INTERVAL = 60  # Log progress every minute
         self.IDLE_LOG_INTERVAL = 3600  # Log idle status every 60 minutes
+        self.COUNT_LOG_INTERVAL = 10  # Log count every 10 transactions
 
     async def run(self):
         """Process transactions from the queue until shutdown"""
@@ -601,6 +595,7 @@ class ResponseProcessor:
             try:
                 # Get transaction from queue
                 tx = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                logger.debug(f"ResponseProcessor_{self.pattern_id}: Got transaction {tx['hash']} from queue")
 
                 # Process the transaction
                 success = await self._process_transaction(tx)
@@ -609,20 +604,24 @@ class ResponseProcessor:
                     self.processed_count += 1
                     self.last_activity_time = time.time()
                     self.last_idle_log_time = None  # Reset idle logging on activity
+                    logger.debug(f"ResponseProcessor_{self.pattern_id}: Confirming response sent for transaction {tx['hash']}")
                     await self.response_manager.confirm_response_sent(tx['hash'])
 
-                self.queue.task_done()
-
-                # Log progress if interval elapsed
-                current_time = time.time()
-                if current_time - self.last_log_time > self.LOG_INTERVAL:
-                    queue_size = self.queue.qsize()
+                # Log progress by count
+                queue_size = self.queue.qsize()
+                if queue_size == 0:
                     logger.info(
-                        f"Consumer_{self.pattern_id}: "
-                        f"Processed {self.processed_count} transactions. "
+                        f"ResponseProcessor_{self.pattern_id}: "
+                        f"Queue empty. Total processed: {self.processed_count}"
+                    )
+                elif self.processed_count % self.COUNT_LOG_INTERVAL == 0:
+                    logger.debug(
+                        f"ResponseProcessor_{self.pattern_id}: "
+                        f"Progress: {self.processed_count} transactions processed. "
                         f"Current queue size: {queue_size}"
                     )
-                    self.last_log_time = current_time
+
+                self.queue.task_done()
 
             except asyncio.TimeoutError:
                 # Log idle status if interval elapsed
@@ -650,9 +649,11 @@ class ResponseProcessor:
         """Process a single transaction using the generator"""
         try:
             # Evaluate the request
+            logger.debug(f"ResponseProcessor_{self.pattern_id}: Evaluating request")
             evaluation = await self.generator.evaluate_request(tx)
 
             # Construct response parameters
+            logger.debug(f"ResponseProcessor_{self.pattern_id}: Constructing response")
             response_params: ResponseParameters = await self.generator.construct_response(tx, evaluation)
 
             # Get appropriate wallet based on source
@@ -661,6 +662,7 @@ class ResponseProcessor:
             )
 
             # Send response transaction
+            logger.debug(f"ResponseProcessor_{self.pattern_id}: Sending response transaction")
             return await self.dependencies.generic_pft_utilities.process_queue_transaction(
                 wallet=node_wallet,
                 memo=response_params.memo,
@@ -842,9 +844,7 @@ class TransactionOrchestrator:
         """Continuously review transactions from the review queue"""
         reviewed_count = 0
         unprocessed_count = 0
-        last_log_time = time.time()
         last_activity_time = time.time()
-        LOG_INTERVAL = 60  # Log progress every minute
         IDLE_LOG_INTERVAL = 3600  # Log idle status every 60 minutes
         COUNT_LOG_INTERVAL = 500  # Log count every 500 transactions
 
@@ -880,13 +880,6 @@ class TransactionOrchestrator:
                     if reviewed_count % COUNT_LOG_INTERVAL == 0:
                         logger.debug(f"Progress: {reviewed_count} transactions reviewed. Current queue size: {queue_size}")
 
-                    # Log progress if interval elapsed
-                    current_time = time.time()
-                    if current_time - last_log_time > LOG_INTERVAL:
-                        queue_size = self.review_queue.qsize()
-                        logger.debug(f"TransactionOrchestrator: Progress: {reviewed_count} transactions reviewed. Current queue size: {queue_size}")
-                        last_log_time = current_time
-
                 except asyncio.TimeoutError:
                     current_time = time.time()
                     idle_duration = current_time - last_activity_time
@@ -904,9 +897,7 @@ class TransactionOrchestrator:
     async def _route_loop(self):
         """Continuously route transactions that need responses"""
         routed_count = 0
-        last_log_time = time.time()
         last_activity_time = time.time()
-        LOG_INTERVAL = 60  # Log progress every minute
         IDLE_LOG_INTERVAL = 3600  # Log idle status every 60 minutes
         ROUTE_LOG_INTERVAL = 100  # Log count every 100 transactions
 
@@ -930,21 +921,6 @@ class TransactionOrchestrator:
                     if routed_count % ROUTE_LOG_INTERVAL == 0:
                         queue_size = self.routing_queue.qsize()
                         logger.debug(f"TransactionOrchestrator: Progress: {routed_count} transactions routed. Current queue size: {queue_size}")
-
-                    # Log progress if interval elapsed
-                    current_time = time.time()
-                    if current_time - last_log_time > LOG_INTERVAL:
-                        queue_size = self.routing_queue.qsize()
-                        pending_count = len(self.response_manager.pending_responses)
-                        response_queue_sizes = self.response_manager.get_queue_sizes()
-                        logger.debug(
-                            f"TransactionOrchestrator: Progress update:\n"
-                            f"  - Total routed: {routed_count}\n"
-                            f"  - Routing queue size: {queue_size}\n"
-                            f"  - Pending responses: {pending_count}\n"
-                            f"  - Response queue sizes: {response_queue_sizes}"
-                        )
-                        last_log_time = current_time
 
                 except asyncio.TimeoutError:
                     current_time = time.time()
