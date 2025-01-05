@@ -792,19 +792,11 @@ class TransactionOrchestrator:
             # Start websocket with review queue
             self.dependencies.generic_pft_utilities.xrpl_monitor.start(queue=self.review_queue)
 
-            # Sync and process historical data
-            self.dependencies.generic_pft_utilities.sync_pft_transaction_history()
+            # Sync onchain data
+            await self.dependencies.generic_pft_utilities.sync_pft_transaction_history()
             
-            # Get unprocessed transactions and add them to review queue
-            logger.debug("TransactionOrchestrator: Getting unprocessed transactions")
-            unprocessed_txs = await self.dependencies.transaction_repository.get_unprocessed_transactions(
-                order_by="close_time_iso ASC",
-                include_processed=False   # Set to True for debugging only
-            )
-            logger.debug(f"TransactionOrchestrator: Found {len(unprocessed_txs)} unprocessed transactions")
-
-            for tx in unprocessed_txs:
-                await self.review_queue.put(tx)
+            # Queue any unprocessed transactions
+            await self.queue_unprocessed_transactions()
 
             # Start all processing tasks
             logger.debug("TransactionOrchestrator: Starting review task")
@@ -839,6 +831,22 @@ class TransactionOrchestrator:
             logger.error(f"TransactionOrchestrator: Error in transaction processing: {e}")
             logger.error(traceback.format_exc())
             raise
+
+    async def queue_unprocessed_transactions(self):
+        """Queue any unprocessed transactions for review.
+    
+        Returns:
+            int: Number of transactions queued
+        """
+        logger.debug("TransactionOrchestrator: Getting unprocessed transactions")
+        unprocessed_txs = await self.dependencies.transaction_repository.get_unprocessed_transactions(
+            order_by="close_time_iso ASC",
+            include_processed=False   # Set to True for debugging only
+        )
+        logger.debug(f"TransactionOrchestrator: Found {len(unprocessed_txs)} unprocessed transactions")
+
+        for tx in unprocessed_txs:
+            await self.review_queue.put(tx)
 
     async def _review_loop(self):
         """Continuously review transactions from the review queue"""

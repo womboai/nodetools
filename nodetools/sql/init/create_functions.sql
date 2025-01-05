@@ -1,4 +1,5 @@
 DROP TRIGGER IF EXISTS process_tx_memos_trigger ON postfiat_tx_cache;
+DROP TRIGGER IF EXISTS update_pft_holders_trigger ON transaction_memos;
 DROP FUNCTION IF EXISTS find_transaction_response(text, text, timestamp, text, text, text, boolean);
 
 CREATE OR REPLACE FUNCTION find_transaction_response(
@@ -113,79 +114,65 @@ CREATE TRIGGER process_tx_memos_trigger
 CREATE OR REPLACE FUNCTION update_pft_holders()
 RETURNS TRIGGER AS $$
 DECLARE
-    affected_node JSONB;
-    final_fields JSONB;
-    previous_fields JSONB;
-    account_address TEXT;
-    new_balance NUMERIC;
-    pft_issuer TEXT;
     meta_parsed JSONB;
+    current_balance NUMERIC;
 BEGIN
-    -- Set issuer based on database name
-    pft_issuer := CASE 
-        WHEN current_database() LIKE '%_testnet' THEN 'rLX2tgumpiUE6kjr757Ao8HWiJzC8uuBSN'
-        ELSE 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
-    END;
-
-    -- Skip if no meta data exists
-    IF NEW.meta IS NULL THEN
+    -- Skip if transaction wasn't successful
+    IF NEW.transaction_result != 'tesSUCCESS' THEN
         RETURN NEW;
     END IF;
 
-    -- Try to parse meta as JSON
-    BEGIN
-        meta_parsed := NEW.meta::jsonb;
-    EXCEPTION WHEN OTHERS THEN
-        RETURN NEW;
-    END;
+    -- Process sender's balance
+    IF NEW.account IS NOT NULL AND NEW.pft_amount IS NOT NULL THEN
+        -- Get current balance or default to 0
+        SELECT balance INTO current_balance
+        FROM pft_holders
+        WHERE account = NEW.account;
 
-    -- Only process successful PFT transactions
-    IF meta_parsed->>'TransactionResult' != 'tesSUCCESS' THEN
-        RETURN NEW;
-    END IF;
-
-    -- Only process if AffectedNodes exists and is an array
-    IF meta_parsed->'AffectedNodes' IS NULL OR jsonb_typeof(meta_parsed->'AffectedNodes') != 'array' THEN
-        RETURN NEW;
-    END IF;
-
-    -- Iterate through affected nodes
-    -- In XRPL transactions, the AffectedNodes array in the metadata shows all ledger entries that were modified by the transaction.
-    FOR affected_node IN 
-        SELECT jsonb_array_elements(meta_parsed->'AffectedNodes')
-    LOOP
-        -- Only process RippleState entries for PFT
-        IF affected_node->'ModifiedNode'->>'LedgerEntryType' = 'RippleState' 
-           AND affected_node->'ModifiedNode'->'FinalFields'->'Balance'->>'currency' = 'PFT' THEN
-            
-            final_fields := affected_node->'ModifiedNode'->'FinalFields';
-            previous_fields := affected_node->'ModifiedNode'->'PreviousFields';
-
-            -- Get the non-issuer account
-            IF final_fields->'LowLimit'->>'issuer' != pft_issuer THEN
-                account_address := final_fields->'LowLimit'->>'issuer';
-                new_balance := (final_fields->'Balance'->>'value')::NUMERIC;
-            ELSIF final_fields->'HighLimit'->>'issuer' != pft_issuer THEN
-                account_address := final_fields->'HighLimit'->>'issuer';
-                -- Negate the balance for high limit accounts
-                new_balance := -(final_fields->'Balance'->>'value')::NUMERIC;
-            END IF;
-
-            -- Update or insert the balance
-            INSERT INTO pft_holders (account, balance, last_updated, last_tx_hash)
-            VALUES (
-                account_address,
-                new_balance,
-                NEW.close_time_iso::timestamp,
-                NEW.hash
-            )
-            ON CONFLICT (account) DO UPDATE
-            SET 
-                balance = EXCLUDED.balance,
-                last_updated = EXCLUDED.last_updated,
-                last_tx_hash = EXCLUDED.last_tx_hash;
+        IF current_balance IS NULL THEN
+            current_balance := 0;
         END IF;
-    END LOOP;
+
+        -- Update sender's balance (subtract amount sent)
+        INSERT INTO pft_holders (account, balance, last_updated, last_tx_hash)
+        VALUES (
+            NEW.account,
+            current_balance - NEW.pft_amount,
+            NEW.datetime,
+            NEW.hash
+        )
+        ON CONFLICT (account) DO UPDATE
+        SET 
+            balance = EXCLUDED.balance,
+            last_updated = EXCLUDED.last_updated,
+            last_tx_hash = EXCLUDED.last_tx_hash;
+    END IF;
+
+    -- Process recipient's balance
+    IF NEW.destination IS NOT NULL AND NEW.pft_amount IS NOT NULL THEN
+        -- Get current balance or default to 0
+        SELECT balance INTO current_balance
+        FROM pft_holders
+        WHERE account = NEW.destination;
+
+        IF current_balance IS NULL THEN
+            current_balance := 0;
+        END IF;
+
+        -- Update recipient's balance (add amount received)
+        INSERT INTO pft_holders (account, balance, last_updated, last_tx_hash)
+        VALUES (
+            NEW.destination,
+            current_balance + NEW.pft_amount,
+            NEW.datetime,
+            NEW.hash
+        )
+        ON CONFLICT (account) DO UPDATE
+        SET 
+            balance = EXCLUDED.balance,
+            last_updated = EXCLUDED.last_updated,
+            last_tx_hash = EXCLUDED.last_tx_hash;
+    END IF;
 
     RETURN NEW;
 END;
@@ -193,6 +180,6 @@ $$ LANGUAGE plpgsql;
 
 -- Create trigger
 CREATE TRIGGER update_pft_holders_trigger
-    AFTER INSERT ON postfiat_tx_cache
+    AFTER INSERT ON transaction_memos
     FOR EACH ROW
     EXECUTE FUNCTION update_pft_holders();

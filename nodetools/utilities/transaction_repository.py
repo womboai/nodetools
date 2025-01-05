@@ -4,6 +4,7 @@ from nodetools.utilities.db_manager import DBConnectionManager
 from nodetools.sql.sql_manager import SQLManager
 import traceback
 import json
+from decimal import Decimal
 
 if TYPE_CHECKING:
     from nodetools.utilities.transaction_orchestrator import ReviewingResult
@@ -360,6 +361,7 @@ class TransactionRepository:
         Returns:
             Dict containing transaction data with decoded memos if found, None otherwise
         """
+        # TODO: Adjust get_decoded_memo to query the transaction_memos table instead of the decoded_memos view
         result = await self._execute_query(
             query_name='get_decoded_memo',
             query_category='xrpl',
@@ -384,6 +386,25 @@ class TransactionRepository:
         )
         
         return result[0] if result and result[0]['hash'] is not None else None
+    
+    async def get_last_ledger_index(self, account: str) -> Optional[int]:
+        """Get the last processed ledger index for an account.
+        
+        Args:
+            account: XRPL account address
+            
+        Returns:
+            The highest ledger_index processed for this account, or None if no transactions
+        """
+        results = await self._execute_query(
+            query_name='get_last_ledger_index',
+            query_category='xrpl',
+            params=[account]
+        )
+        
+        if results and results[0]['last_ledger'] is not None:
+            return results[0]['last_ledger']
+        return None
 
     async def get_pft_holders(self) -> Dict[str, Dict[str, Any]]:
         """Get current PFT holder data from database.
@@ -407,6 +428,51 @@ class TransactionRepository:
             for row in results
         }
     
+    async def get_pft_holder(self, account: str) -> Optional[Dict[str, Any]]:
+        """Get PFT holder data for a specific account from database.
+        
+        Args:
+            account: XRPL account address
+            
+        Returns:
+            Dictionary containing holder details or None if not found
+        """
+        results = await self._execute_query(
+            query_name='get_pft_holder',
+            query_category='xrpl',
+            params=[account]
+        )
+        
+        if not results:
+            return None
+            
+        return {
+            'balance': results[0]['balance'],
+            'last_updated': results[0]['last_updated'],
+            'last_tx_hash': results[0]['last_tx_hash']
+        }
+    
+    async def update_pft_holder(
+        self,
+        account: str,
+        balance: Decimal,
+        last_tx_hash: Optional[str]
+    ) -> None:
+        """Update or create a PFT holder record with the specified balance.
+        
+        Args:
+            account: XRPL account address
+            balance: Current PFT balance
+            last_tx_hash: Hash of the last known transaction, or None for new records
+        """
+        params = [account, balance, last_tx_hash]
+        
+        await self._execute_mutation(
+            query_name='update_pft_holder',
+            query_category='xrpl',
+            params=params
+        )
+
     async def is_address_authorized(self, account_address: str) -> bool:
         """Check if an address is authorized to interact with the node.
     

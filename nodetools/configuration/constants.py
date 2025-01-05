@@ -19,7 +19,10 @@ MIN_XRP_PER_TRANSACTION = Decimal('0.000001')  # Minimum XRP amount per transact
 MIN_XRP_BALANCE = 1  # Minimum XRP balance to be able to perform a transaction, corresponding to XRP reserve
 MAX_CHUNK_SIZE = 1024
 XRP_MEMO_STRUCTURAL_OVERHEAD = 100  # JSON structure, quotes, etc.
- 
+
+# Verification Constants
+VERIFY_STATE_INTERVAL = 900  # 15 minutes
+
 # Maximum history length
 MAX_HISTORY = 15  # TODO: rename this to something more descriptive
 

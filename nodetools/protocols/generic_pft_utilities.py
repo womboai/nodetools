@@ -36,7 +36,7 @@ class GenericPFTUtilities(Protocol):
         """Get the transaction repository"""
         ...
 
-    def sync_pft_transaction_history(self):
+    async def sync_pft_transaction_history(self):
         """Sync transaction history for all PFT holders"""
         ...
 
@@ -44,7 +44,7 @@ class GenericPFTUtilities(Protocol):
         """Get memo history for a given account"""
         ...
 
-    def send_memo(self, 
+    async def send_memo(self, 
             wallet_seed_or_wallet: Union[str, Wallet], 
             destination: str, 
             memo: Union[str, Memo], 
@@ -96,15 +96,15 @@ class GenericPFTUtilities(Protocol):
         """Send and track a node-initiated transaction for queue processing"""
         ...
 
-    def fetch_pft_balance(self, address: str) -> Decimal:
+    async def fetch_pft_balance(self, address: str) -> Decimal:
         """Get PFT balance for an account from the XRPL"""
         ...
 
-    def fetch_xrp_balance(self, address: str) -> Decimal:
+    async def fetch_xrp_balance(self, address: str) -> Decimal:
         """Get XRP balance for an account from the XRPL"""
         ...
 
-    def get_pft_balance(self, account_address: str) -> Decimal:
+    async def get_pft_balance(self, account_address: str) -> Decimal:
         """Get PFT balance for an account from the database"""
         ...
 
@@ -122,7 +122,7 @@ class GenericPFTUtilities(Protocol):
     ) -> str:
         ...
 
-    def verify_xrp_balance(self, address: str, minimum_xrp_balance: int) -> bool:
+    async def verify_xrp_balance(self, address: str, minimum_xrp_balance: int) -> bool:
         """
         Verify that a wallet has sufficient XRP balance.
         
@@ -135,7 +135,7 @@ class GenericPFTUtilities(Protocol):
         """
         ...
 
-    def handle_trust_line(self, wallet: Wallet, username: str):
+    async def handle_trust_line(self, wallet: Wallet, username: str):
         """
         Check and establish PFT trustline if needed.
         
@@ -160,7 +160,7 @@ class GenericPFTUtilities(Protocol):
         """
         ...
 
-    def send_xrp(
+    async def send_xrp(
             self,
             wallet_seed_or_wallet: Union[str, Wallet], 
             amount: Union[Decimal, int, float], 

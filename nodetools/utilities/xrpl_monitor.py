@@ -94,7 +94,8 @@ class XRPLWebSocketMonitor:
                     async with asyncio.timeout(self.PING_TIMEOUT):
                         is_alive = await self._ping_server()
                         if is_alive:
-                            logger.debug(f"Pinged websocket...")
+                            # logger.debug(f"Pinged websocket...")
+                            pass
                         else:
                             raise Exception("Ping failed - no valid response")
                     last_ping_time = current_time

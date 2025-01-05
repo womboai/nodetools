@@ -262,7 +262,7 @@ class MessageEncryption:
             logger.error(f"MessageEncryption.get_handshake_for_address: Error checking handshake status: {e}")
             raise ValueError(f"Failed to get handshake status: {e}") from e
 
-    def send_handshake(self, channel_private_key: str, channel_counterparty: str, username: str = None) -> bool:
+    async def send_handshake(self, channel_private_key: str, channel_counterparty: str, username: str = None) -> bool:
         """Send a handshake transaction containing the ECDH public key.
         
         Args:
@@ -287,7 +287,7 @@ class MessageEncryption:
             wallet = self.pft_utilities.spawn_wallet_from_seed(channel_private_key)
             log_message_source = f"{username} ({wallet.address})" if username else wallet.address
             logger.debug(f"MessageEncryption.send_handshake: Sending handshake from {log_message_source} to {channel_counterparty}...")
-            response = self.pft_utilities.send_memo(
+            response = await self.pft_utilities.send_memo(
                 wallet_seed_or_wallet=channel_private_key, 
                 destination=channel_counterparty, 
                 memo=handshake_memo,

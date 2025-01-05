@@ -25,7 +25,7 @@ import sqlalchemy
 import xrpl
 from xrpl.models.transactions import Memo
 from xrpl.wallet import Wallet
-from xrpl.clients import JsonRpcClient
+from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.models.requests import AccountInfo, AccountLines, AccountTx
 from xrpl.utils import str_to_hex
 from loguru import logger
@@ -111,6 +111,7 @@ class GenericPFTUtilities:
                 openrouter=self.openrouter,
             )
             self._transaction_orchestrator_task = None
+            self._verification_task = None  # TODO: This should be owned by the TransactionOrchestrator
 
             self.__class__._initialized = True
 
@@ -132,6 +133,14 @@ class GenericPFTUtilities:
             self.transaction_orchestrator.start(),
             name="TransactionOrchestratorTask"
         )
+
+        # Start verification task
+        # TODO: This should be owned by the TransactionOrchestrator
+        self._verification_task = loop.create_task(
+            self.verify_state_loop(),
+            name="StateVerificationTask"
+        )
+
         logger.debug("GenericPFTUtilities.initialize: Transaction orchestrator started")
 
     def shutdown(self):
@@ -146,6 +155,11 @@ class GenericPFTUtilities:
         if self.xrpl_monitor._monitor_task:
             self.xrpl_monitor.stop()
             tasks.append(self.xrpl_monitor._monitor_task)
+
+        # TODO: This should be owned by the TransactionOrchestrator
+        if self._verification_task:
+            self._verification_task.cancel()
+            tasks.append(self._verification_task)
     
         if tasks:
             try:
@@ -357,6 +371,34 @@ class GenericPFTUtilities:
             logger.error(traceback.format_exc())
             return False
 
+
+    def verify_transaction_hash(self, tx_hash: str) -> bool:
+        """
+        Verify that a transaction was successfully confirmed on-chain.
+
+        Args:
+            tx_hash: A transaction hash to verify
+
+        Returns:
+            bool: True if the transaction was successful, False otherwise
+        """
+        client = xrpl.clients.JsonRpcClient(self.https_url)
+        try:
+            tx_request = xrpl.models.requests.Tx(
+                transaction=tx_hash,
+                binary=False
+            )
+
+            tx_result = client.request(tx_request)
+
+            return self.verify_transaction_response(tx_result)
+        
+        except Exception as e:
+            logger.error(f"Error verifying transaction hash {tx_hash}: {e}")
+            logger.error(traceback.format_exc())
+            return False
+    
+    
     def verify_transaction_hash(self, tx_hash: str) -> bool:
         """
         Verify that a transaction was successfully confirmed on-chain.
@@ -490,7 +532,7 @@ class GenericPFTUtilities:
             memo_format=user
         )
 
-    def send_xrp(
+    async def send_xrp(
             self,
             wallet_seed_or_wallet: Union[str, xrpl.wallet.Wallet], 
             amount: Union[Decimal, int, float], 
@@ -507,7 +549,8 @@ class GenericPFTUtilities:
             logger.error("GenericPFTUtilities.send_memo: Invalid wallet input, raising ValueError")
             raise ValueError("Invalid wallet input")
 
-        client = xrpl.clients.JsonRpcClient(self.https_url)
+        client = AsyncJsonRpcClient(self.https_url)
+
         payment = xrpl.models.transactions.Payment(
             account=wallet.address,
             amount=xrpl.utils.xrp_to_drops(Decimal(amount)),
@@ -516,7 +559,7 @@ class GenericPFTUtilities:
             destination_tag=destination_tag
         )
         try:    
-            response = xrpl.transaction.submit_and_wait(payment, client, wallet)    
+            response = await xrpl.asyncio.transaction.submit_and_wait(payment, client, wallet)    
         except xrpl.transaction.XRPLReliableSubmissionException as e:    
             response = f"Submit failed: {e}"
     
@@ -607,7 +650,7 @@ class GenericPFTUtilities:
             pft_amount = Decimal(pft_amount) if pft_amount is not None else None
 
             # Send transaction
-            response = self.send_memo(
+            response = await self.send_memo(
                 wallet_seed_or_wallet=wallet,
                 destination=destination,
                 memo=memo,
@@ -626,9 +669,9 @@ class GenericPFTUtilities:
         """Check if a memo is encrypted"""
         return self.message_encryption.is_encrypted(memo)
     
-    def send_handshake(self, wallet_seed: str, destination: str, username: str = None):
+    async def send_handshake(self, wallet_seed: str, destination: str, username: str = None):
         """Sends a handshake memo to establish encrypted communication"""
-        return self.message_encryption.send_handshake(channel_private_key=wallet_seed, channel_counterparty=destination, username=username)
+        return await self.message_encryption.send_handshake(channel_private_key=wallet_seed, channel_counterparty=destination, username=username)
     
     def register_auto_handshake_wallet(self, wallet_address: str):
         """Register a wallet address for automatic handshake responses."""
@@ -781,7 +824,7 @@ class GenericPFTUtilities:
 
         return chunked_memos
 
-    def send_memo(self, 
+    async def send_memo(self, 
             wallet_seed_or_wallet: Union[str, xrpl.wallet.Wallet], 
             destination: str, 
             memo: Union[str, Memo], 
@@ -883,7 +926,7 @@ class GenericPFTUtilities:
         )
 
         if is_system_memo:
-            return self._send_memo_single(wallet, destination, memo, pft_amount)
+            return await self._send_memo_single(wallet, destination, memo, pft_amount)
 
         # Handle chunking for non-system memos if requested, or if _chunk_memos returns more than one memo
         chunk_memos = self._chunk_memos(memo)
@@ -901,12 +944,12 @@ class GenericPFTUtilities:
                 logger.error(traceback.format_exc())
                 raise e
         else:
-            return self._send_memo_single(wallet, destination, memo, pft_amount)
+            return await self._send_memo_single(wallet, destination, memo, pft_amount)
 
-    def _send_memo_single(self, wallet: Wallet, destination: str, memo: Memo, pft_amount: Decimal):
+    async def _send_memo_single(self, wallet: Wallet, destination: str, memo: Memo, pft_amount: Decimal):
         """ Sends a single memo to a destination """
-        client = xrpl.clients.JsonRpcClient(self.https_url)
-        
+        client = AsyncJsonRpcClient(self.https_url)
+
         payment_args = {
             "account": wallet.address,
             "destination": destination,
@@ -927,7 +970,7 @@ class GenericPFTUtilities:
 
         try:
             logger.debug(f"GenericPFTUtilities._send_memo_single: Submitting transaction to send memo from {wallet.address} to {destination}")
-            response = xrpl.transaction.submit_and_wait(payment, client, wallet)
+            response = await xrpl.asyncio.transaction.submit_and_wait(payment, client, wallet)
         except xrpl.transaction.XRPLReliableSubmissionException as e:
             response = f"GenericPFTUtilities._send_memo_single: Transaction submission failed: {e}"
             logger.error(response)
@@ -1301,7 +1344,7 @@ class GenericPFTUtilities:
             logger.error(f"GenericPFTUtilities.get_all_account_compressed_messages: Error processing memo data for {account_address}: {e}")
             return pd.DataFrame()
 
-    def fetch_account_transactions(
+    async def fetch_account_transactions(
             self,
             account_address: str,
             ledger_index_min: int = -1,
@@ -1311,12 +1354,11 @@ class GenericPFTUtilities:
             limit: int = 1000
         ) -> list[dict]:
         """Fetch transactions for an account from the XRPL"""
-        client = xrpl.clients.JsonRpcClient(self.https_url)
         all_transactions = []  # List to store all transactions
-
-        # Fetch transactions using marker pagination
-        marker = None
+        marker = None  # Fetch transactions using marker pagination
         attempt = 0
+        client = AsyncJsonRpcClient(self.https_url)
+
         while attempt < max_attempts:
             try:
                 request = xrpl.models.requests.account_tx.AccountTx(
@@ -1327,7 +1369,7 @@ class GenericPFTUtilities:
                     marker=marker,
                     forward=True
                 )
-                response = client.request(request)
+                response = await client.request(request)
                 transactions = response.result["transactions"]
                 all_transactions.extend(transactions)
 
@@ -1340,7 +1382,7 @@ class GenericPFTUtilities:
                 attempt += 1
                 if attempt < max_attempts:
                     logger.debug(f"GenericPFTUtilities.get_account_transactions: Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
+                    await asyncio.sleep(retry_delay)
                 else:
                     logger.warning("GenericPFTUtilities.get_account_transactions: Max attempts reached. Transactions may be incomplete.")
                     break
@@ -1364,7 +1406,11 @@ class GenericPFTUtilities:
         except AttributeError:
             return None
 
-    def fetch_formatted_transaction_history(self, account_address: str) -> List[Dict[str, Any]]:
+    async def fetch_formatted_transaction_history(
+            self, 
+            account_address: str,
+            fetch_new_only: bool = True
+        ) -> List[Dict[str, Any]]:
         """Fetch and format transaction history for an account.
         
         Retrieves transactions from XRPL and transforms them into a standardized
@@ -1372,12 +1418,25 @@ class GenericPFTUtilities:
         
         Args:
             account_address: XRPL account address to fetch transactions for
+            fetch_new_only: If True, only fetch transactions after the last known ledger index.
+                            If False, fetch entire transaction history.
                 
         Returns:
             List of dictionaries containing processed transaction data with standardized fields
         """
+        ledger_index_min = -1
+
+        if fetch_new_only:
+            # Get the last processed ledger index for this account
+            last_ledger = await self.transaction_repository.get_last_ledger_index(account=account_address)
+            if last_ledger is not None:
+                ledger_index_min = last_ledger + 1
+
         # Fetch transaction history and prepare DataFrame
-        transactions = self.fetch_account_transactions(account_address=account_address)
+        transactions = await self.fetch_account_transactions(
+            account_address=account_address, 
+            ledger_index_min=ledger_index_min
+        )
         if not transactions:
             return []
         
@@ -1448,7 +1507,7 @@ class GenericPFTUtilities:
         else:
             logger.error("Database error occurred: %s", error)
 
-    def fetch_pft_trustline_data(self, batch_size: int = 200) -> Dict[str, Dict[str, Any]]:
+    async def fetch_pft_trustline_data(self, batch_size: int = 200) -> Dict[str, Dict[str, Any]]:
         """Get PFT token holder account information.
         
         Queries the XRPL for all accounts that have trustlines with the PFT issuer account.
@@ -1467,13 +1526,11 @@ class GenericPFTUtilities:
                 - limit_peer (str): Trustline limit
                 - pft_holdings (float): Actual token balance (negated from issuer view)
         """
-        # Create XRPL client and get account lines
-        client = xrpl.clients.JsonRpcClient(self.https_url)
-
         # Initialize result dictionary and marker
         all_lines = {}
         marker = None
 
+        client = AsyncJsonRpcClient(self.https_url)
         while True:
             try:
                 # Request account lines with pagination
@@ -1484,7 +1541,7 @@ class GenericPFTUtilities:
                     marker=marker
                 )
                 
-                response = client.request(request)
+                response = await client.request(request)
 
                 # Process this batch of lines
                 for line in response.result['lines']:
@@ -1506,51 +1563,151 @@ class GenericPFTUtilities:
                 break
 
         return all_lines
-    
-    def sync_pft_transaction_history_for_account(self, account_address: str):
-        """Sync transaction history for an account to the postfiat_tx_cache table.
-        generate_postgres_writable_df_for_address
-        Args:
-            account_address: XRPL account address to sync
-            
-        Returns:
-            int: Number of new transactions synced
-        """
-        tx_hist = self.fetch_formatted_transaction_history(account_address=account_address)
-        if not tx_hist:
-            return 0
 
-        return asyncio.run(self._batch_insert_transactions(tx_hist))
+    # TODO: This should be owned by the TransactionOrchestrator
+    async def verify_state_loop(self):
+        """Start the periodic transaction verification task"""
+        while True:
+            await asyncio.sleep(global_constants.VERIFY_STATE_INTERVAL)
+            try:
+                stats = await self.sync_pft_transaction_history(is_initial_sync=False)
+                if any(v > 0 for k, v in stats.items() if k != 'accounts_processed'):
+                    logger.warning(
+                        "Periodic sync found inconsistencies: "
+                        f"{stats['transactions_found']} missing transactions, "
+                        f"{stats['balance_mismatches']} balance mismatches "
+                        f"(corrected {stats['balances_corrected']})"
+                    )
+            except Exception as e:
+                logger.error(f"Error in verification task: {e}")
+                await asyncio.sleep(60)  # Wait a minute before retrying if there's an error
     
     @PerformanceMonitor.measure('sync_pft_transaction_history')
-    def sync_pft_transaction_history(self):
-        """Sync transaction history for all PFT token holders.
+    async def sync_pft_transaction_history(self, is_initial_sync: bool = True) -> Dict[str, int]:
+        # TODO: This and all of its helper methods should be owned by the TransactionOrchestrator
+        """Synchronize and verify PFT state.
         
-        Updates the holders reference and syncs transaction history for each holder account.
+        This method:
+        1. Fetches all PFT holder accounts from XRPL
+        2. Syncs missing transactions for each account
+        3. Verifies and corrects database balances against XRPL state
+        4. Queues any unprocessed transactions for review
+
+        Args:
+        is_initial_sync: If True, this is the initial sync at application startup.
+                        If False, this is a periodic verification check.
         
-        Note: This operation can be time-consuming for many holder accounts.
+        Returns:
+            Dict containing statistics about the sync/verification process:
+            {
+                'accounts_processed': int,
+                'transactions_found': int,
+                'accounts_with_missing_data': int,
+                'balance_mismatches': int,
+                'balances_corrected': int,
+                'transactions_queued': int
+            }
         """
-        all_accounts = list(self.fetch_pft_trustline_data().keys())  # TODO: consider simplifying fetch_pft_trustline_data()
+        stats = {
+            'accounts_processed': 0,
+            'transactions_found': 0,
+            'accounts_with_missing_data': 0,
+            'balance_mismatches': 0,
+            'balances_corrected': 0,
+            'transactions_queued': 0,
+            'rows_inserted': 0
+        }
+
+        log_prefix = "Initial sync" if is_initial_sync else "Periodic sync"
+        logger.info(f"{log_prefix}: Starting PFT state synchronization...")
+
+        # Get all PFT holder accounts
+        trustline_data = await self.fetch_pft_trustline_data()
+        all_accounts = list(trustline_data.keys())
         total_accounts = len(all_accounts)
-        rows_inserted = 0
+
         logger.info(f"Starting transaction history sync for {total_accounts} accounts")
 
-        accounts_processed = 0
-        for account in all_accounts:
+        for idx, account in enumerate(all_accounts, 1):
             try:
-                rows_inserted += self.sync_pft_transaction_history_for_account(account_address=account)
-                accounts_processed += 1
+                tx_hist = await self.fetch_formatted_transaction_history(account_address=account)
+
+                if tx_hist:
+                    new_tx_count = await self._batch_insert_transactions(tx_hist)
+                    if new_tx_count > 0:
+                        stats['transactions_found'] += new_tx_count
+                        stats['accounts_with_missing_data'] += 1
+                        stats['rows_inserted'] += new_tx_count
+
+                        if not is_initial_sync:
+                            logger.warning(
+                                f"{log_prefix}: Found {new_tx_count} missing transactions "
+                                f"for account {account} - possible websocket drop"
+                            )
                 
+                # Verify balance against database
+                db_holder = await self.transaction_repository.get_pft_holder(account)
+                xrpl_balance = trustline_data[account]['pft_holdings']
+
+                # Handle missing or mismatched database records
+                if db_holder is None:
+                    if xrpl_balance != Decimal(0):
+                        if not is_initial_sync:
+                            logger.warning(
+                                f"{log_prefix}: Account {account} has XRPL balance of "
+                                f"{xrpl_balance} PFT but no database record - possible websocket drop"
+                            )
+                        stats['balance_mismatches'] += 1
+                        await self.transaction_repository.update_pft_holder(
+                            account=account,
+                            balance=xrpl_balance,
+                            last_tx_hash=None
+                        )
+                        stats['balances_corrected'] += 1
+                else:
+                    db_balance = db_holder['balance']
+                    if xrpl_balance != db_balance:
+                        if not is_initial_sync:
+                            logger.warning(
+                                f"{log_prefix}: Balance mismatch for account {account}: "
+                                f"XRPL: {xrpl_balance} PFT, Database: {db_balance} PFT - possible websocket drop"
+                            )
+                        stats['balance_mismatches'] += 1
+                        await self.transaction_repository.update_pft_holder(
+                            account=account,
+                            balance=xrpl_balance,
+                            last_tx_hash=db_holder.get('last_tx_hash')
+                        )
+                        stats['balances_corrected'] += 1
+
+                stats['accounts_processed'] += 1
+
                 # Log progress every 5 accounts
-                if accounts_processed % 5 == 0:
-                    progress = (accounts_processed / total_accounts) * 100
-                    logger.debug(f"Progress: {progress:.1f}% - Synced {accounts_processed}/{total_accounts} accounts, {rows_inserted} rows inserted")
+                if idx % 5 == 0:
+                    progress = (idx / total_accounts) * 100
+                    logger.debug(
+                        f"{log_prefix}: Progress: {progress:.1f}% - "
+                        f"Synced {idx}/{total_accounts} accounts, "
+                        f"{stats['rows_inserted']} rows inserted"
+                    )
                     
             except Exception as e:
-                logger.error(f"Error processing account {account}: {e}")
+                logger.error(f"{log_prefix}: Error processing account {account}: {e}")
+                logger.error(traceback.format_exc())
                 continue
+
+        # Queue any new transactions for processing
+        if stats['transactions_found'] > 0 and not is_initial_sync:
+            stats['transactions_queued'] = await self.transaction_orchestrator.queue_unprocessed_transactions()
                 
-        logger.info(f"Completed transaction history sync. Synced {accounts_processed}/{total_accounts} accounts")
+        logger.info(
+            f"{log_prefix}: Completed. Processed {stats['accounts_processed']}/{total_accounts} "
+            f"accounts, inserted {stats['rows_inserted']} rows, "
+            f"found {stats['transactions_found']} new transactions, "
+            f"corrected {stats['balances_corrected']} balances"
+        )
+
+        return stats
 
     async def get_pft_holders_async(self) -> Dict[str, Dict[str, Any]]:
         """Get current PFT holder data from database (async version)"""
@@ -1558,6 +1715,7 @@ class GenericPFTUtilities:
             return await self.transaction_repository.get_pft_holders()
         except Exception as e:
             logger.error(f"Error getting PFT holders: {e}")
+            logger.error(traceback.format_exc())
             return {}
         
     def get_pft_holders(self) -> Dict[str, Dict[str, Any]]:
@@ -1571,12 +1729,35 @@ class GenericPFTUtilities:
                 return asyncio.run(self.get_pft_holders_async())
         except Exception as e:
             logger.error(f"Error getting PFT holders: {e}")
+            logger.error(traceback.format_exc())
             return {}
-    
+        
+    async def get_pft_holder_async(self, account_address: str) -> Dict[str, Any]:
+        """Get PFT holder data for an account from the database (async version)"""
+        try:
+            return await self.transaction_repository.get_pft_holder(account_address)
+        except Exception as e:
+            logger.error(f"Error getting PFT holder: {e}")
+            logger.error(traceback.format_exc())
+            return {}
+
+    def get_pft_holder(self, account_address: str) -> Dict[str, Any]:
+        """Get PFT holder data for an account from the database (sync version)"""
+        try:
+            try:
+                loop = asyncio.get_running_loop()
+                return loop.run_until_complete(self.get_pft_holder_async(account_address))
+            except RuntimeError:  # No running event loop
+                return asyncio.run(self.get_pft_holder_async(account_address))
+        except Exception as e:
+            logger.error(f"Error getting PFT holder: {e}")
+            logger.error(traceback.format_exc())
+            return {}
+        
     def get_pft_balance(self, account_address: str) -> Decimal:
         """Get PFT balance for an account from the database"""
-        pft_holders = self.get_pft_holders()
-        return pft_holders.get(account_address, {}).get('balance', Decimal(0))
+        holder = self.get_pft_holder(account_address)
+        return holder['balance'] if holder else Decimal(0)
 
     def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
         """Get the most recent messages from a user's memo history.
@@ -1633,7 +1814,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
 """
         return output_string
     
-    def fetch_pft_balance(self, address: str) -> Decimal:
+    async def fetch_pft_balance(self, address: str) -> Decimal:
         """Get PFT balance for an account from the XRPL.
     
         Args:
@@ -1645,22 +1826,23 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         Raises:
             Exception: If there is an error getting the PFT balance
         """
-        client = JsonRpcClient(self.https_url)
+        client = AsyncJsonRpcClient(self.https_url)
         account_lines = AccountLines(
             account=address,
             ledger_index="validated"
         )
         try:
-            response = client.request(account_lines)
+            response = await client.request(account_lines)
             if response.is_successful():
                 pft_lines = [line for line in response.result['lines'] if line['account']==self.pft_issuer]
                 return Decimal(pft_lines[0]['balance']) if pft_lines else Decimal(0)
         
         except Exception as e:
             logger.error(f"GenericPFTUtilities.fetch_pft_balance: Error getting PFT balance for {address}: {e}")
-            return 0
+            logger.error(traceback.format_exc())
+            return Decimal(0)
     
-    def fetch_xrp_balance(self, address: str) -> Decimal:
+    async def fetch_xrp_balance(self, address: str) -> Decimal:
         """Get XRP balance for an account from the XRPL.
         
         Args:
@@ -1673,21 +1855,22 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
             XRPAccountNotFoundException: If the account is not found
             Exception: If there is an error getting the XRP balance
         """
-        client = JsonRpcClient(self.https_url)
+        client = AsyncJsonRpcClient(self.https_url)
         acct_info = AccountInfo(
             account=address,
             ledger_index="validated"
         )
         try:
-            response = client.request(acct_info)
+            response = await client.request(acct_info)
             if response.is_successful():
                 return Decimal(response.result['account_data']['Balance']) / 1_000_000
 
         except Exception as e:
             logger.error(f"GenericPFTUtilities.fetch_xrp_balance: Error getting XRP balance: {e}")
-            raise Exception(f"Error getting XRP balance: {e}")
+            logger.error(traceback.format_exc())
+            return Decimal(0)
 
-    def verify_xrp_balance(self, address: str, minimum_xrp_balance: int) -> bool:
+    async def verify_xrp_balance(self, address: str, minimum_xrp_balance: int) -> bool:
         """
         Verify that a wallet has sufficient XRP balance.
         
@@ -1698,7 +1881,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         Returns:
             tuple: (bool, float) - Whether balance check passed and current balance
         """
-        balance = self.fetch_xrp_balance(address)
+        balance = await self.fetch_xrp_balance(address)
         return (balance >= minimum_xrp_balance, balance)
 
     def extract_transaction_info_from_response_object(self, response):
@@ -1787,23 +1970,23 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         
         return transaction_info
         
-    def has_trust_line(self, wallet: xrpl.wallet.Wallet) -> bool:
+    async def has_trust_line(self, wallet: xrpl.wallet.Wallet) -> bool:
         """Check if wallet has PFT trustline.
         
         Args:
             wallet: XRPL wallet object
-            
+
         Returns:
             bool: True if trustline exists
         """
         try:
-            pft_holders = self.get_pft_holders()
+            pft_holders = await self.get_pft_holders()
             return wallet.classic_address in pft_holders
         except Exception as e:
             logger.error(f"GenericPFTUtilities.has_trust_line: Error checking if user {wallet.classic_address} has a trust line: {e}")
             return False
         
-    def handle_trust_line(self, wallet: xrpl.wallet.Wallet, username: str):
+    async def handle_trust_line(self, wallet: xrpl.wallet.Wallet, username: str):
         """
         Check and establish PFT trustline if needed.
         
@@ -1815,15 +1998,15 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
             Exception: If there is an error creating the trust line
         """
         logger.debug(f"GenericPFTUtilities.handle_trust_line: Handling trust line for {username} ({wallet.classic_address})")
-        if not self.has_trust_line(wallet):
+        if not await self.has_trust_line(wallet):
             logger.debug(f"GenericPFTUtilities.handle_trust_line: Trust line does not exist for {username} ({wallet.classic_address}), creating now...")
-            response = self.generate_trust_line_to_pft_token(wallet)
+            response = await self.generate_trust_line_to_pft_token(wallet)
             if not response.is_successful():
                 raise Exception(f"Error creating trust line: {response.result.get('error')}")
         else:
             logger.debug(f"GenericPFTUtilities.handle_trust_line: Trust line already exists for {wallet.classic_address}")
 
-    def generate_trust_line_to_pft_token(self, wallet: xrpl.wallet.Wallet):
+    async def generate_trust_line_to_pft_token(self, wallet: xrpl.wallet.Wallet):
         """
         Generate a trust line to the PFT token.
         
@@ -1836,7 +2019,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         Raises:
             Exception: If there is an error creating the trust line
         """
-        client = xrpl.clients.JsonRpcClient(self.https_url)
+        client = AsyncJsonRpcClient(self.https_url)
         trust_set_tx = xrpl.models.transactions.TrustSet(
             account=wallet.classic_address,
             limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
@@ -1847,7 +2030,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         )
         logger.debug(f"GenericPFTUtilities.generate_trust_line_to_pft_token: Establishing trust line transaction from {wallet.classic_address} to issuer {self.pft_issuer}...")
         try:
-            response = xrpl.transaction.submit_and_wait(trust_set_tx, client, wallet)
+            response = await xrpl.asyncio.transaction.submit_and_wait(trust_set_tx, client, wallet)
         except xrpl.transaction.XRPLReliableSubmissionException as e:
             response = f"Submit failed: {e}"
             raise Exception(f"Trust line creation failed: {response}")

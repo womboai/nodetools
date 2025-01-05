@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS pft_holders (
     account VARCHAR(255) PRIMARY KEY,
     balance NUMERIC NOT NULL DEFAULT 0,
     last_updated TIMESTAMP NOT NULL,
-    last_tx_hash VARCHAR(255)
+    last_tx_hash VARCHAR(255) NULL
 );
 
 CREATE TABLE IF NOT EXISTS authorized_addresses (
