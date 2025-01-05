@@ -88,3 +88,29 @@ class TransactionRepository(Protocol):
             Dict containing transaction data with decoded memos if found, None otherwise
         """
         ...
+
+    async def is_address_authorized(self, account_address: str) -> bool:
+        """Check if an address is authorized to interact with the node.
+    
+        Args:
+            account_address: XRPL account address to check
+            
+        Returns:
+            bool: True if address is authorized, False otherwise
+        """
+        ...
+    
+    async def authorize_address(
+        self,
+        address: str,
+        auth_source: str,
+        auth_source_user_id: str
+    ) -> None:
+        """Authorize an address for node interaction.
+        
+        Args:
+            address: XRPL address to authorize
+            auth_source: Source of authorization (e.g. 'discord', 'twitter')
+            auth_source_user_id: User ID from the auth source
+        """
+        ...

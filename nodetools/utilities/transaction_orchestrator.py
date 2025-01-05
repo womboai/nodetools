@@ -593,7 +593,7 @@ class ResponseProcessor:
         self.last_log_time = time.time()
         self.last_activity_time = time.time()
         self.LOG_INTERVAL = 60  # Log progress every minute
-        self.IDLE_LOG_INTERVAL = 300  # Log idle status every 5 minutes
+        self.IDLE_LOG_INTERVAL = 3600  # Log idle status every 60 minutes
 
     async def run(self):
         """Process transactions from the queue until shutdown"""
@@ -608,6 +608,7 @@ class ResponseProcessor:
                 if success:
                     self.processed_count += 1
                     self.last_activity_time = time.time()
+                    self.last_idle_log_time = None  # Reset idle logging on activity
                     await self.response_manager.confirm_response_sent(tx['hash'])
 
                 self.queue.task_done()
@@ -627,13 +628,18 @@ class ResponseProcessor:
                 # Log idle status if interval elapsed
                 current_time = time.time()
                 idle_duration = current_time - self.last_activity_time
-                if idle_duration > self.IDLE_LOG_INTERVAL:
+
+                # Only log if we've been idle longer than IDLE_LOG_INTERVAL
+                # and haven't logged in the last IDLE_LOG_INTERVAL
+                if (idle_duration > self.IDLE_LOG_INTERVAL and 
+                    (self.last_idle_log_time is None or 
+                     current_time - self.last_idle_log_time > self.IDLE_LOG_INTERVAL)):
                     logger.info(
                         f"Consumer_{self.pattern_id}: "
                         f"Idle for {format_duration(idle_duration)}. "
                         f"Total processed: {self.processed_count}"
                     )
-                    self.last_activity_time = current_time  # Reset to avoid spam
+                    self.last_idle_log_time = current_time  # Reset to avoid spam
                 continue
 
             except Exception as e:
@@ -839,7 +845,7 @@ class TransactionOrchestrator:
         last_log_time = time.time()
         last_activity_time = time.time()
         LOG_INTERVAL = 60  # Log progress every minute
-        IDLE_LOG_INTERVAL = 300  # Log idle status every 5 minutes
+        IDLE_LOG_INTERVAL = 3600  # Log idle status every 60 minutes
         COUNT_LOG_INTERVAL = 500  # Log count every 500 transactions
 
         try:
@@ -901,7 +907,7 @@ class TransactionOrchestrator:
         last_log_time = time.time()
         last_activity_time = time.time()
         LOG_INTERVAL = 60  # Log progress every minute
-        IDLE_LOG_INTERVAL = 300  # Log idle status every 5 minutes
+        IDLE_LOG_INTERVAL = 3600  # Log idle status every 60 minutes
         ROUTE_LOG_INTERVAL = 100  # Log count every 100 transactions
 
         try:

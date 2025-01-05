@@ -38,3 +38,13 @@ CREATE TABLE IF NOT EXISTS pft_holders (
     last_updated TIMESTAMP NOT NULL,
     last_tx_hash VARCHAR(255)
 );
+
+CREATE TABLE IF NOT EXISTS authorized_addresses (
+    address VARCHAR(255) PRIMARY KEY,
+    authorized_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    is_authorized BOOLEAN DEFAULT TRUE,
+    deauthorized_at TIMESTAMP WITH TIME ZONE,
+    auth_source VARCHAR(50),  -- e.g., 'discord', 'twitter', etc.
+    auth_source_user_id VARCHAR(50),  -- Store external IDs as strings for flexibility
+    CONSTRAINT valid_xrp_address CHECK (address ~ '^r[1-9A-HJ-NP-Za-km-z]{25,34}$')
+);

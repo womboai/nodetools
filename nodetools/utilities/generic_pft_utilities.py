@@ -1552,10 +1552,23 @@ class GenericPFTUtilities:
                 
         logger.info(f"Completed transaction history sync. Synced {accounts_processed}/{total_accounts} accounts")
 
-    def get_pft_holders(self) -> Dict[str, Dict[str, Any]]:
-        """Get current PFT holder data from database"""
+    async def get_pft_holders_async(self) -> Dict[str, Dict[str, Any]]:
+        """Get current PFT holder data from database (async version)"""
         try:
-            return asyncio.run(self.transaction_repository.get_pft_holders())
+            return await self.transaction_repository.get_pft_holders()
+        except Exception as e:
+            logger.error(f"Error getting PFT holders: {e}")
+            return {}
+        
+    def get_pft_holders(self) -> Dict[str, Dict[str, Any]]:
+        """Get current PFT holder data from database (sync version)"""
+        try:
+            # If we're already in an event loop, use it
+            try:
+                loop = asyncio.get_running_loop()
+                return loop.run_until_complete(self.get_pft_holders_async())
+            except RuntimeError:  # No running event loop
+                return asyncio.run(self.get_pft_holders_async())
         except Exception as e:
             logger.error(f"Error getting PFT holders: {e}")
             return {}

@@ -406,3 +406,59 @@ class TransactionRepository:
             }
             for row in results
         }
+    
+    async def is_address_authorized(self, account_address: str) -> bool:
+        """Check if an address is authorized to interact with the node.
+    
+        Args:
+            account_address: XRPL account address to check
+            
+        Returns:
+            bool: True if address is authorized, False otherwise
+        """
+        result = await self._execute_query(
+            query_name='is_address_authorized',
+            query_category='xrpl',
+            params=[account_address]
+        )
+        return result[0]['is_authorized'] if result else False
+    
+    async def authorize_address(
+        self,
+        address: str,
+        auth_source: str,
+        auth_source_user_id: str
+    ) -> None:
+        """Authorize an address for node interaction.
+        
+        Args:
+            address: XRPL address to authorize
+            auth_source: Source of authorization (e.g. 'discord', 'twitter')
+            auth_source_user_id: User ID from the auth source
+        """
+        params = [address, auth_source, auth_source_user_id]
+        
+        await self._execute_mutation(
+            query_name='authorize_address',
+            query_category='xrpl',
+            params=params
+        )
+
+    async def deauthorize_addresses(
+        self,
+        auth_source: str,
+        auth_source_user_id: str
+    ) -> None:
+        """Deauthorize all addresses for a given auth source user.
+        
+        Args:
+            auth_source: Source of authorization (e.g. 'discord', 'twitter')
+            auth_source_user_id: User ID from the auth source
+        """
+        params = [auth_source, auth_source_user_id]
+        
+        await self._execute_mutation(
+            query_name='deauthorize_addresses',
+            query_category='xrpl',
+            params=params
+        )
