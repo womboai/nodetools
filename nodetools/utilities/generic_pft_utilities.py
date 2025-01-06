@@ -936,7 +936,7 @@ class GenericPFTUtilities:
 
                 for idx, chunk_memo in enumerate(chunk_memos):
                     logger.debug(f"Sending chunk {idx+1} of {len(chunk_memos)}: {chunk_memo.memo_data[:100]}...")
-                    responses.append(self._send_memo_single(wallet, destination, chunk_memo, pft_amount))
+                    responses.append(await self._send_memo_single(wallet, destination, chunk_memo, pft_amount))
 
                 return responses
             except Exception as e:
@@ -1187,7 +1187,11 @@ class GenericPFTUtilities:
                     channel_counterparty=channel_counterparty
                 )
                 if not (channel_key and counterparty_key):
-                    logger.warning(f"GenericPFTUtilities.process_memo_data: Cannot decrypt message {memo_type} - no handshake found")
+                    logger.warning(
+                        f"GenericPFTUtilities.process_memo_data: Cannot decrypt message {memo_type} - "
+                        f"no handshake found between {channel_address} and {channel_counterparty}... "
+                        f"channel_key: {channel_key}, counterparty_key: {counterparty_key}"
+                    )
                     return processed_data
                 
                 # Get the shared secret from the handshake key
@@ -1980,7 +1984,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
             bool: True if trustline exists
         """
         try:
-            pft_holders = await self.get_pft_holders()
+            pft_holders = self.get_pft_holders()
             return wallet.classic_address in pft_holders
         except Exception as e:
             logger.error(f"GenericPFTUtilities.has_trust_line: Error checking if user {wallet.classic_address} has a trust line: {e}")
