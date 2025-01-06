@@ -34,7 +34,6 @@ from loguru import logger
 import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
 from nodetools.performance.monitor import PerformanceMonitor
-from nodetools.ai.openrouter import OpenRouterTool
 from nodetools.utilities.encryption import MessageEncryption
 from nodetools.utilities.transaction_requirements import TransactionRequirementService
 from nodetools.utilities.db_manager import DBConnectionManager
@@ -43,7 +42,7 @@ from nodetools.utilities.exceptions import *
 from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
 from nodetools.utilities.transaction_orchestrator import TransactionOrchestrator
 from nodetools.utilities.transaction_repository import TransactionRepository
-from nodetools.models.models import BusinessLogicProvider
+from nodetools.configuration.configuration import NetworkConfig, NodeConfig, RuntimeConfig
 
 nest_asyncio.apply()
 
@@ -63,138 +62,41 @@ class GenericPFTUtilities:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, business_logic_provider: BusinessLogicProvider):
+    def __init__(
+            self,
+            network_config: NetworkConfig,
+            node_config: NodeConfig,
+            runtime_config: RuntimeConfig,
+            credential_manager: CredentialManager,
+            db_connection_manager: DBConnectionManager,
+            transaction_repository: TransactionRepository,
+        ):
         if not self.__class__._initialized:
             # Get network and node configurations
-            self.network_config = config.get_network_config()
-            self.node_config = config.get_node_config()
+            self.network_config = network_config
+            self.node_config = node_config
+            self.runtime_config = runtime_config
             self.pft_issuer = self.network_config.issuer_address
             self.node_address = self.node_config.node_address
-            self.transaction_requirements = TransactionRequirementService(self.network_config, self.node_config)
             self.node_name = self.node_config.node_name
+
+            # TODO: Revisit this module
+            self.transaction_requirements = TransactionRequirementService(self.network_config, self.node_config)
 
             # Determine endpoint with fallback logic
             self.https_url = (
                 self.network_config.local_rpc_url 
-                if config.RuntimeConfig.HAS_LOCAL_NODE and self.network_config.local_rpc_url is not None
+                if self.runtime_config.HAS_LOCAL_NODE and self.network_config.local_rpc_url is not None
                 else self.network_config.public_rpc_url
             )
             logger.debug(f"Using https endpoint: {self.https_url}")
 
-            # Initialize other core components
-            self.db_connection_manager = DBConnectionManager()
-            self.transaction_repository = TransactionRepository(self.db_connection_manager, self.node_name)
-            self.credential_manager = CredentialManager()
-            self.openrouter = OpenRouterTool()
-            self.monitor = PerformanceMonitor()
-            self.message_encryption = MessageEncryption(pft_utilities=self)
-
-            # Register auto-handshake addresses from node config
-            for address in self.node_config.auto_handshake_addresses:
-                self.message_encryption.register_auto_handshake_wallet(address)
-
-            # Initialize XRPL monitor
-            self.xrpl_monitor = XRPLWebSocketMonitor(
-                generic_pft_utilities=self,
-                transaction_repository=self.transaction_repository
-            )
-
-            # Initialize transaction orchestrator
-            self.business_logic_provider = business_logic_provider
-            self.transaction_orchestrator = TransactionOrchestrator(
-                business_logic_provider=self.business_logic_provider,
-                generic_pft_utilities=self, 
-                transaction_repository=self.transaction_repository,
-                credential_manager=self.credential_manager,
-                message_encryption=self.message_encryption,
-                node_config=self.node_config,
-                openrouter=self.openrouter,
-            )
-            self._transaction_orchestrator_task = None
-            self._verification_task = None  # TODO: This should be owned by the TransactionOrchestrator
+            self.db_connection_manager = db_connection_manager
+            self.transaction_repository = transaction_repository
+            self.credential_manager = credential_manager
+            self.message_encryption = None  # Requires initialization outside of this class
 
             self.__class__._initialized = True
-
-    @property
-    def running(self):
-        return self._transaction_orchestrator_task is not None
-
-    def start(self):
-        """Initialize components that require async operations"""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:  # No running event loop
-            # Create new event loop if none exists
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-        # Create task in the loop
-        self._transaction_orchestrator_task = loop.create_task(
-            self.transaction_orchestrator.start(),
-            name="TransactionOrchestratorTask"
-        )
-
-        # Start verification task
-        # TODO: This should be owned by the TransactionOrchestrator
-        self._verification_task = loop.create_task(
-            self.verify_state_loop(),
-            name="StateVerificationTask"
-        )
-
-        logger.debug("GenericPFTUtilities.initialize: Transaction orchestrator started")
-
-    def shutdown(self):
-        """Clean shutdown of async components"""
-        TIMEOUT = 5.0
-        tasks = []
-        
-        if self._transaction_orchestrator_task:
-            self.transaction_orchestrator.stop()
-            tasks.append(self._transaction_orchestrator_task)
-
-        if self.xrpl_monitor._monitor_task:
-            self.xrpl_monitor.stop()
-            tasks.append(self.xrpl_monitor._monitor_task)
-
-        # TODO: This should be owned by the TransactionOrchestrator
-        if self._verification_task:
-            self._verification_task.cancel()
-            tasks.append(self._verification_task)
-    
-        if tasks:
-            try:
-                # Get or create event loop
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                
-                # Give tasks time to cleanup (5 seconds max)
-                try:
-                    done, pending = loop.run_until_complete(asyncio.wait(
-                        tasks, 
-                        timeout=TIMEOUT
-                    ))
-
-                    if pending:
-                        pending_names = [f"{task.get_name()} ({id(task)})" for task in pending]
-                        logger.warning(f"Timeout waiting for components to shutdown gracefully: {', '.join(pending_names)}")
-                        # Cancel any tasks that didn't complete
-                        for task in pending:
-                            task.cancel()
-
-                except asyncio.TimeoutError:
-                    pending_names = [f"{task.get_name()} ({id(task)})" for task in tasks if not task.done()]
-                    logger.warning(f"Timeout waiting for components to shutdown gracefully: {', '.join(pending_names)}")
-                except asyncio.CancelledError:
-                    pass
-                
-            except Exception as e:
-                logger.error(f"GenericPFTUtilities.shutdown: Error during component shutdown: {e}")
-            finally:
-                self._transaction_orchestrator_task = None
-                logger.debug("GenericPFTUtilities.shutdown: All components stopped")
 
     @staticmethod
     def convert_ripple_timestamp_to_datetime(ripple_timestamp = 768602652):
@@ -428,8 +330,7 @@ class GenericPFTUtilities:
     # TODO: Move to MemoBuilder
     @staticmethod
     def generate_custom_id():
-        """ These are the custom IDs generated for each task that is generated
-        in a Post Fiat Node """ 
+        """ Generate a unique memo_type """
         letters = ''.join(random.choices(string.ascii_uppercase, k=2))
         numbers = ''.join(random.choices(string.digits, k=2))
         second_part = letters + numbers
@@ -572,6 +473,7 @@ class GenericPFTUtilities:
         logger.debug(f'-- Spawned wallet with address {wallet.address}')
         return wallet
     
+    # TODO: Deprecate this method and have consumers call transaction repository methods directly
     @PerformanceMonitor.measure('get_account_memo_history')
     def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
         """Synchronous version: Get transaction history with memos for an account.
@@ -583,13 +485,6 @@ class GenericPFTUtilities:
         Returns:
             DataFrame containing transaction history with memo details
         """ 
-        # # Get call stack info
-        # stack = traceback.extract_stack()
-        # caller = stack[-2]  # -2 gets the caller of this method
-        # logger.debug(
-        #     f"get_account_memo_history called for {account_address} "
-        #     f"from {caller.filename}:{caller.lineno} in {caller.name}"
-        # )
 
         try:
             loop = asyncio.get_running_loop()
@@ -681,10 +576,9 @@ class GenericPFTUtilities:
         """Get a list of registered auto-handshake addresses"""
         return self.message_encryption.get_auto_handshake_addresses()
 
-    def get_handshake_for_address(self, channel_address: str, channel_counterparty: str):
+    async def get_handshake_for_address(self, channel_address: str, channel_counterparty: str):
         """Get handshake for a specific address"""
-        memo_history = self.get_account_memo_history(account_address=channel_address, pft_only=False)
-        return self.message_encryption.get_handshake_for_address(channel_address, channel_counterparty, memo_history)
+        return await self.message_encryption.get_handshake_for_address(channel_address, channel_counterparty)
     
     def get_shared_secret(self, received_public_key: str, channel_private_key: str):
         """
@@ -902,7 +796,7 @@ class GenericPFTUtilities:
         # Handle encryption if requested
         if encrypt:
             logger.debug(f"GenericPFTUtilities.send_memo: {username} requested encryption. Checking handshake status.")
-            channel_key, counterparty_key = self.message_encryption.get_handshake_for_address(wallet.address, destination)
+            channel_key, counterparty_key = await self.message_encryption.get_handshake_for_address(wallet.address, destination)
             if not (channel_key and counterparty_key):
                 raise HandshakeRequiredException(wallet.address, destination)
             shared_secret = self.message_encryption.get_shared_secret(counterparty_key, wallet.seed)
@@ -1058,7 +952,7 @@ class GenericPFTUtilities:
             # logger.error(f"GenericPFTUtilities._reconstruct_chunked_message: Error reconstructing message {memo_type}: {e}")
             return None
 
-    def process_memo_data(
+    async def process_memo_data(
         self,
         memo_type: str,
         memo_data: str,
@@ -1182,7 +1076,7 @@ class GenericPFTUtilities:
                     return processed_data
 
                 # logger.debug(f"GenericPFTUtilities.process_memo_data: Getting handshake for {channel_address} and {channel_counterparty}")
-                channel_key, counterparty_key = self.message_encryption.get_handshake_for_address(
+                channel_key, counterparty_key = await self.message_encryption.get_handshake_for_address(
                     channel_address=channel_address,
                     channel_counterparty=channel_counterparty
                 )
@@ -1461,55 +1355,6 @@ class GenericPFTUtilities:
             formatted_transactions.append(formatted_tx)
         
         return formatted_transactions
-    
-    async def _batch_insert_transactions(self, transactions: List[Dict[str, Any]], batch_size: int = 100) -> int:
-        """Insert transaction records in batches, skipping duplicates via SQL.
-        
-        Uses PostgreSQL's ON CONFLICT DO NOTHING for duplicate handling and 
-        xmax system column to track new insertions within the transaction.
-        
-        Args:
-            transactions: List of dictionaries containing transaction records
-            batch_size: Number of records to process per batch
-            
-        Returns:
-            int: Total number of new records inserted
-        """
-        # total_records = len(transactions)
-        # logger.debug(f"GenericPFTUtilities._batch_insert_transactions: Inserting {total_records} transactions")
-        total_rows_inserted = 0
-
-        try:
-            for batch in self._get_transaction_batches(transactions, batch_size):
-                inserted = await self.transaction_repository.batch_insert_transactions(batch)
-                total_rows_inserted += inserted
-
-            return total_rows_inserted
-
-        except Exception as e:
-            logger.error(f"Error in batch insert: {e}")
-            logger.error(traceback.format_exc())
-            raise
-    
-    def _get_transaction_batches(self, transactions: List[Dict[str, Any]], batch_size: int):
-        """Generate batches of transactions from list."""
-        for start in range(0, len(transactions), batch_size):
-            yield transactions[start:start + batch_size]
-
-    def _handle_transaction_error(self, error: Exception, conn) -> None:
-        """Handle database transaction errors.
-        
-        Args:
-            error: The exception that occurred
-            conn: Database connection
-        """
-        if "current transaction is aborted" in str(error):
-            logger.warning("Transaction aborted, attempting rollback...")
-            with conn.connect() as connection:
-                connection.execute(sqlalchemy.text("ROLLBACK"))
-            logger.warning("Transaction reset completed")
-        else:
-            logger.error("Database error occurred: %s", error)
 
     async def fetch_pft_trustline_data(self, batch_size: int = 200) -> Dict[str, Dict[str, Any]]:
         """Get PFT token holder account information.
@@ -1567,151 +1412,6 @@ class GenericPFTUtilities:
                 break
 
         return all_lines
-
-    # TODO: This should be owned by the TransactionOrchestrator
-    async def verify_state_loop(self):
-        """Start the periodic transaction verification task"""
-        while True:
-            await asyncio.sleep(global_constants.VERIFY_STATE_INTERVAL)
-            try:
-                stats = await self.sync_pft_transaction_history(is_initial_sync=False)
-                if any(v > 0 for k, v in stats.items() if k != 'accounts_processed'):
-                    logger.warning(
-                        "Periodic sync found inconsistencies: "
-                        f"{stats['transactions_found']} missing transactions, "
-                        f"{stats['balance_mismatches']} balance mismatches "
-                        f"(corrected {stats['balances_corrected']})"
-                    )
-            except Exception as e:
-                logger.error(f"Error in verification task: {e}")
-                await asyncio.sleep(60)  # Wait a minute before retrying if there's an error
-    
-    @PerformanceMonitor.measure('sync_pft_transaction_history')
-    async def sync_pft_transaction_history(self, is_initial_sync: bool = True) -> Dict[str, int]:
-        # TODO: This and all of its helper methods should be owned by the TransactionOrchestrator
-        """Synchronize and verify PFT state.
-        
-        This method:
-        1. Fetches all PFT holder accounts from XRPL
-        2. Syncs missing transactions for each account
-        3. Verifies and corrects database balances against XRPL state
-        4. Queues any unprocessed transactions for review
-
-        Args:
-        is_initial_sync: If True, this is the initial sync at application startup.
-                        If False, this is a periodic verification check.
-        
-        Returns:
-            Dict containing statistics about the sync/verification process:
-            {
-                'accounts_processed': int,
-                'transactions_found': int,
-                'accounts_with_missing_data': int,
-                'balance_mismatches': int,
-                'balances_corrected': int,
-                'transactions_queued': int
-            }
-        """
-        stats = {
-            'accounts_processed': 0,
-            'transactions_found': 0,
-            'accounts_with_missing_data': 0,
-            'balance_mismatches': 0,
-            'balances_corrected': 0,
-            'transactions_queued': 0,
-            'rows_inserted': 0
-        }
-
-        log_prefix = "Initial sync" if is_initial_sync else "Periodic sync"
-        logger.info(f"{log_prefix}: Starting PFT state synchronization...")
-
-        # Get all PFT holder accounts
-        trustline_data = await self.fetch_pft_trustline_data()
-        all_accounts = list(trustline_data.keys())
-        total_accounts = len(all_accounts)
-
-        logger.info(f"Starting transaction history sync for {total_accounts} accounts")
-
-        for idx, account in enumerate(all_accounts, 1):
-            try:
-                tx_hist = await self.fetch_formatted_transaction_history(account_address=account)
-
-                if tx_hist:
-                    new_tx_count = await self._batch_insert_transactions(tx_hist)
-                    if new_tx_count > 0:
-                        stats['transactions_found'] += new_tx_count
-                        stats['accounts_with_missing_data'] += 1
-                        stats['rows_inserted'] += new_tx_count
-
-                        if not is_initial_sync:
-                            logger.warning(
-                                f"{log_prefix}: Found {new_tx_count} missing transactions "
-                                f"for account {account} - possible websocket drop"
-                            )
-                
-                # Verify balance against database
-                db_holder = await self.transaction_repository.get_pft_holder(account)
-                xrpl_balance = trustline_data[account]['pft_holdings']
-
-                # Handle missing or mismatched database records
-                if db_holder is None:
-                    if xrpl_balance != Decimal(0):
-                        if not is_initial_sync:
-                            logger.warning(
-                                f"{log_prefix}: Account {account} has XRPL balance of "
-                                f"{xrpl_balance} PFT but no database record - possible websocket drop"
-                            )
-                        stats['balance_mismatches'] += 1
-                        await self.transaction_repository.update_pft_holder(
-                            account=account,
-                            balance=xrpl_balance,
-                            last_tx_hash=None
-                        )
-                        stats['balances_corrected'] += 1
-                else:
-                    db_balance = db_holder['balance']
-                    if xrpl_balance != db_balance:
-                        if not is_initial_sync:
-                            logger.warning(
-                                f"{log_prefix}: Balance mismatch for account {account}: "
-                                f"XRPL: {xrpl_balance} PFT, Database: {db_balance} PFT - possible websocket drop"
-                            )
-                        stats['balance_mismatches'] += 1
-                        await self.transaction_repository.update_pft_holder(
-                            account=account,
-                            balance=xrpl_balance,
-                            last_tx_hash=db_holder.get('last_tx_hash')
-                        )
-                        stats['balances_corrected'] += 1
-
-                stats['accounts_processed'] += 1
-
-                # Log progress every 5 accounts
-                if idx % 5 == 0:
-                    progress = (idx / total_accounts) * 100
-                    logger.debug(
-                        f"{log_prefix}: Progress: {progress:.1f}% - "
-                        f"Synced {idx}/{total_accounts} accounts, "
-                        f"{stats['rows_inserted']} rows inserted"
-                    )
-                    
-            except Exception as e:
-                logger.error(f"{log_prefix}: Error processing account {account}: {e}")
-                logger.error(traceback.format_exc())
-                continue
-
-        # Queue any new transactions for processing
-        if stats['transactions_found'] > 0 and not is_initial_sync:
-            stats['transactions_queued'] = await self.transaction_orchestrator.queue_unprocessed_transactions()
-                
-        logger.info(
-            f"{log_prefix}: Completed. Processed {stats['accounts_processed']}/{total_accounts} "
-            f"accounts, inserted {stats['rows_inserted']} rows, "
-            f"found {stats['transactions_found']} new transactions, "
-            f"corrected {stats['balances_corrected']} balances"
-        )
-
-        return stats
 
     async def get_pft_holders_async(self) -> Dict[str, Dict[str, Any]]:
         """Get current PFT holder data from database (async version)"""

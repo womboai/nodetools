@@ -2,10 +2,19 @@
 Orchestrates the processing of both historical and real-time XRPL transactions,
 ensuring proper sequencing and consistency of transaction processing.
 """
+# Standard imports
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
+from decimal import Decimal
 import asyncio
+import traceback
+import time
+from datetime import datetime, timedelta, timezone
+
+# Third party imports
 from loguru import logger
+
+# Nodetools imports
 from nodetools.models.models import (
     ResponseRule, 
     InteractionType, 
@@ -14,20 +23,21 @@ from nodetools.models.models import (
     ResponseParameters,
     Dependencies,
     StructuralPattern,
-    MemoGroup
+    MemoGroup,
+    BusinessLogicProvider
 )
 from nodetools.models.memo_processor import MemoProcessor
-from nodetools.models.models import BusinessLogicProvider
+from nodetools.performance.monitor import PerformanceMonitor
 from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
 from nodetools.protocols.transaction_repository import TransactionRepository
 from nodetools.protocols.credentials import CredentialManager
 from nodetools.protocols.openrouter import OpenRouterTool
 from nodetools.protocols.encryption import MessageEncryption
+from nodetools.protocols.xrpl_monitor import XRPLWebSocketMonitor
+from nodetools.protocols.db_manager import DBConnectionManager
 from nodetools.utilities.compression import CompressionError
-from nodetools.configuration.configuration import NodeConfig
-import traceback
-import time
-from datetime import datetime, timedelta, timezone
+from nodetools.configuration.configuration import NodeConfig, NetworkConfig
+from nodetools.configuration.constants import VERIFY_STATE_INTERVAL
 
 def format_duration(seconds: float) -> str:
     """Format a duration in H:m:s format"""
@@ -200,7 +210,7 @@ class TransactionReviewer:
         
         # Try processing the group
         try:
-            processed_content = MemoProcessor.process_group(
+            processed_content = await MemoProcessor.process_group(
                 group,
                 credential_manager=self.dependencies.credential_manager,
                 message_encryption=self.dependencies.message_encryption,
@@ -383,8 +393,6 @@ class ResponseQueueRouter:
 
         # Track pending responses and their review queues
         self.pending_responses: Dict[str, Dict[str, Any]] = {}  # tx_hash -> original_tx
-
-        # Add pending re-reviews tracking
         self.pending_rereviews: Dict[str, Dict[str, Any]] = {}
         self.MAX_RETRY_COUNT = 10
         self.RETRY_DELAY = 5  # seconds
@@ -394,12 +402,6 @@ class ResponseQueueRouter:
         self.processing_counts: Dict[str, int] = {
             pattern_id: 0 for pattern_id in self.queue_configs.keys()
         }
-
-        # Start retry task
-        self.retry_task = asyncio.create_task(
-            self._retry_pending_reviews(),
-            name="ResponseQueueRouterRetryTask"
-        )
 
     def _initialize_queue_configs(self) -> Dict[str, asyncio.Queue]:
         """Initialize queue configurations based on response patterns in business rules"""
@@ -520,7 +522,7 @@ class ResponseQueueRouter:
             }
             logger.debug(f"Queued {request_tx_hash} for re-review with retries")
     
-    async def _retry_pending_reviews(self):
+    async def retry_pending_reviews(self):
         """Background task to retry pending re-reviews"""
         while not self._shutdown_event.is_set():
             try:
@@ -744,33 +746,79 @@ class TransactionOrchestrator:
     """
     def __init__(
             self,
+            node_config: NodeConfig,
+            network_config: NetworkConfig,
             business_logic_provider: BusinessLogicProvider,
             generic_pft_utilities: GenericPFTUtilities, 
             transaction_repository: TransactionRepository,
             credential_manager: CredentialManager,
             message_encryption: MessageEncryption,
-            node_config: NodeConfig,
-            openrouter: OpenRouterTool
+            openrouter: OpenRouterTool,
+            xrpl_monitor: XRPLWebSocketMonitor
     ):
         self.business_logic_provider = business_logic_provider
+        self.xrpl_monitor = xrpl_monitor
+
+        # Maintain a dependency object to pass around dependencies
         self.dependencies = Dependencies(
+            node_config=node_config,
+            network_config=network_config,
             generic_pft_utilities=generic_pft_utilities,
             transaction_repository=transaction_repository,
             credential_manager=credential_manager,
             message_encryption=message_encryption,
-            node_config=node_config,
             openrouter=openrouter
         )
+
+        # Also maintain direct references to the dependencies
+        self.generic_pft_utilities = generic_pft_utilities
+        self.transaction_repository = transaction_repository
+        self.credential_manager = credential_manager
+        self.message_encryption = message_encryption
+        self.node_config = node_config
+        self.openrouter = openrouter
+
+        # Initialize queues and managers
         self.review_queue = asyncio.Queue()     # Queue for transactions needing review
         self.routing_queue = asyncio.Queue()    # Queue for transactions needing responses
         self.reviewer: TransactionReviewer = None  # will be initialized in start()
         self.response_manager: ResponseQueueRouter = None  # will be initialized in start()
         self.consumer_manager: ResponseProcessorManager = None  # will be initialized in start()
+        
+        # Task management
+        self._initial_sync_complete = False
+        self._managed_tasks: List[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
+        self.SHUTDOWN_TIMEOUT = 5.0
 
-    async def start(self):
-        """Coordinate transaction processing"""
+    @property
+    def running(self):
+        """Check if the transaction orchestrator is running"""
+        return bool(self._managed_tasks) and not all(task.done() for task in self._managed_tasks)
+    
+    def start(self):
+        """Start the transaction orchestrator"""
         try:
+            # Get or create event loop
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                return loop.run_until_complete(self._start_async())
+            
+            return loop.create_task(self._start_async())
+
+        except Exception as e:
+            logger.error(f"TransactionOrchestrator: Error starting: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+    async def _start_async(self):
+        """Start the transaction orchestrator"""
+        try:
+            # Initialize components
             if not self.reviewer:
                 self.reviewer = TransactionReviewer(
                     business_logic=self.business_logic_provider,
@@ -780,7 +828,7 @@ class TransactionOrchestrator:
                 self.response_manager = ResponseQueueRouter(
                     business_logic=self.business_logic_provider,
                     review_queue=self.review_queue,
-                    transaction_repository=self.dependencies.transaction_repository,
+                    transaction_repository=self.transaction_repository,
                     shutdown_event=self._shutdown_event
                 )
             if not self.consumer_manager:
@@ -789,48 +837,165 @@ class TransactionOrchestrator:
                     dependencies=self.dependencies
                 )
 
-            # Start websocket with review queue
-            self.dependencies.generic_pft_utilities.xrpl_monitor.start(queue=self.review_queue)
+            # Start XRPL monitor
+            self.xrpl_monitor.start(queue=self.review_queue)
+            if self.xrpl_monitor.monitor_task:
+                self._managed_tasks.append(self.xrpl_monitor.monitor_task)
 
-            # Sync onchain data
-            await self.dependencies.generic_pft_utilities.sync_pft_transaction_history()
-            
-            # Queue any unprocessed transactions
-            await self.queue_unprocessed_transactions()
+            # Start core processing tasks
+            self._managed_tasks.extend([
+                asyncio.create_task(self._state_sync_loop(), name="StateSynchronizationLoop"),
+                asyncio.create_task(self._review_loop(), name="TransactionReviewLoop"),
+                asyncio.create_task(self._route_loop(), name="ResponseRoutingLoop"),
+                asyncio.create_task(self._consumer_loop(), name="ConsumerLoop"),
+                asyncio.create_task(self.response_manager.retry_pending_reviews(), name="ResponseQueueRouterRetryTask")
+            ])
 
-            # Start all processing tasks
-            logger.debug("TransactionOrchestrator: Starting review task")
-            review_task = asyncio.create_task(
-                self._review_loop(),
-                name="TransactionOrchestratorReviewLoop"
-            )
-            logger.debug("TransactionOrchestrator: Starting response routing task")
-            route_task = asyncio.create_task(
-                self._route_loop(),
-                name="TransactionOrchestratorRouteLoop"
-            )
-            logger.debug("TransactionOrchestrator: Starting consumer manager")
-            consumer_task = asyncio.create_task(
-                self._consumer_loop(),
-                name="TransactionOrchestratorConsumerLoop"
-            )
-
-            try:
-                await asyncio.gather(review_task, route_task, consumer_task)
-            except asyncio.CancelledError:
-                logger.info("TransactionOrchestrator: Received shutdown signal")
-                # Cancel child tasks
-                review_task.cancel()
-                route_task.cancel()
-                consumer_task.cancel()
-                # Wait for tasks to complete
-                await asyncio.gather(review_task, route_task, consumer_task, return_exceptions=True)
-                logger.info("TransactionOrchestrator: Shutdown complete")
+            logger.debug("TransactionOrchestrator: Started all tasks")
 
         except Exception as e:
-            logger.error(f"TransactionOrchestrator: Error in transaction processing: {e}")
+            logger.error(f"TransactionOrchestrator: Error starting: {e}")
             logger.error(traceback.format_exc())
             raise
+    
+    def _get_transaction_batches(self, transactions: List[Dict[str, Any]], batch_size: int):
+        """Generate batches of transactions from list."""
+        for start in range(0, len(transactions), batch_size):
+            yield transactions[start:start + batch_size]
+
+    @PerformanceMonitor.measure('sync_pft_transaction_history')
+    async def sync_pft_transaction_history(self, is_initial_sync: bool = True) -> Dict[str, int]:
+        """Synchronize and verify PFT state.
+        
+        This method:
+        1. Fetches all PFT holder accounts from XRPL
+        2. Syncs missing transactions for each account
+        3. Verifies and corrects database balances against XRPL state
+        4. Queues any unprocessed transactions for review
+
+        Args:
+        is_initial_sync: If True, this is the initial sync at application startup.
+                        If False, this is a periodic verification check.
+        
+        Returns:
+            Dict containing statistics about the sync/verification process:
+            {
+                'accounts_processed': int,
+                'transactions_found': int,
+                'accounts_with_missing_data': int,
+                'balance_mismatches': int,
+                'balances_corrected': int,
+                'transactions_queued': int
+            }
+        """
+        BATCH_SIZE = 100
+        stats = {
+            'accounts_processed': 0,
+            'transactions_found': 0,
+            'accounts_with_missing_data': 0,
+            'balance_mismatches': 0,
+            'balances_corrected': 0,
+            'transactions_queued': 0,
+            'rows_inserted': 0
+        }
+
+        log_prefix = "Initial sync" if is_initial_sync else "Periodic sync"
+        logger.info(f"{log_prefix}: Starting PFT state synchronization...")
+
+        # Get all PFT holder accounts
+        trustline_data = await self.generic_pft_utilities.fetch_pft_trustline_data()
+        all_accounts = list(trustline_data.keys())
+        total_accounts = len(all_accounts)
+
+        logger.info(f"Starting transaction history sync for {total_accounts} accounts")
+
+        for idx, account in enumerate(all_accounts, 1):
+            try:
+                tx_hist = await self.generic_pft_utilities.fetch_formatted_transaction_history(account_address=account)
+
+                if tx_hist:
+                    # Process transactions in batches of BATCH_SIZE
+                    total_rows_inserted = 0
+                    try:
+                        for batch in self._get_transaction_batches(tx_hist, batch_size=BATCH_SIZE):
+                            inserted = await self.transaction_repository.batch_insert_transactions(batch)
+                            total_rows_inserted += inserted
+
+                        if total_rows_inserted > 0:
+                            stats['transactions_found'] += total_rows_inserted
+                            stats['accounts_with_missing_data'] += 1
+                            stats['rows_inserted'] += total_rows_inserted
+
+                            if not is_initial_sync:
+                                logger.warning(
+                                    f"{log_prefix}: Found {total_rows_inserted} missing transactions "
+                                    f"for account {account} - possible websocket drop"
+                                )
+
+                    except Exception as e:
+                        logger.error(f"Error in batch insert for account {account}: {e}")
+                        logger.error(traceback.format_exc())
+                        continue
+                
+                # Verify balance against database
+                db_holder = await self.transaction_repository.get_pft_holder(account)
+                xrpl_balance = trustline_data[account]['pft_holdings']
+
+                # Handle missing or mismatched database records
+                if db_holder is None:
+                    if xrpl_balance != Decimal(0):
+                        if not is_initial_sync:
+                            logger.warning(
+                                f"{log_prefix}: Account {account} has XRPL balance of "
+                                f"{xrpl_balance} PFT but no database record - possible websocket drop"
+                            )
+                        stats['balance_mismatches'] += 1
+                        await self.transaction_repository.update_pft_holder(
+                            account=account,
+                            balance=xrpl_balance,
+                            last_tx_hash=None
+                        )
+                        stats['balances_corrected'] += 1
+                else:
+                    db_balance = db_holder['balance']
+                    if xrpl_balance != db_balance:
+                        if not is_initial_sync:
+                            logger.warning(
+                                f"{log_prefix}: Balance mismatch for account {account}: "
+                                f"XRPL: {xrpl_balance} PFT, Database: {db_balance} PFT - possible websocket drop"
+                            )
+                        stats['balance_mismatches'] += 1
+                        await self.transaction_repository.update_pft_holder(
+                            account=account,
+                            balance=xrpl_balance,
+                            last_tx_hash=db_holder.get('last_tx_hash')
+                        )
+                        stats['balances_corrected'] += 1
+
+                stats['accounts_processed'] += 1
+
+                # Log progress every 5 accounts
+                if idx % 5 == 0:
+                    progress = (idx / total_accounts) * 100
+                    logger.debug(
+                        f"{log_prefix}: Progress: {progress:.1f}% - "
+                        f"Synced {idx}/{total_accounts} accounts, "
+                        f"{stats['rows_inserted']} rows inserted"
+                    )
+                    
+            except Exception as e:
+                logger.error(f"{log_prefix}: Error processing account {account}: {e}")
+                logger.error(traceback.format_exc())
+                continue
+                
+        logger.info(
+            f"{log_prefix}: Completed. Processed {stats['accounts_processed']}/{total_accounts} "
+            f"accounts, inserted {stats['rows_inserted']} rows, "
+            f"found {stats['transactions_found']} new transactions, "
+            f"corrected {stats['balances_corrected']} balances"
+        )
+
+        return stats
 
     async def queue_unprocessed_transactions(self):
         """Queue any unprocessed transactions for review.
@@ -839,7 +1004,7 @@ class TransactionOrchestrator:
             int: Number of transactions queued
         """
         logger.debug("TransactionOrchestrator: Getting unprocessed transactions")
-        unprocessed_txs = await self.dependencies.transaction_repository.get_unprocessed_transactions(
+        unprocessed_txs = await self.transaction_repository.get_unprocessed_transactions(
             order_by="close_time_iso ASC",
             include_processed=False   # Set to True for debugging only
         )
@@ -847,6 +1012,49 @@ class TransactionOrchestrator:
 
         for tx in unprocessed_txs:
             await self.review_queue.put(tx)
+
+    async def _state_sync_loop(self):
+        """Handles initial and periodic state synchronization between XRPL and local database"""
+        try:
+            while not self._shutdown_event.is_set():
+                try:
+                    is_initial_sync = not self._initial_sync_complete
+
+                    # Run state verification
+                    stats = await self.sync_pft_transaction_history(
+                        is_initial_sync=is_initial_sync
+                    )
+
+                    # Mark initial sync complete after first run
+                    if is_initial_sync:
+                        self._initial_sync_complete = True
+                    else:
+                        if any(v > 0 for k, v in stats.items() if k != 'accounts_processed'):
+                            logger.warning(
+                                "Periodic sync found inconsistencies: "
+                                f"{stats['transactions_found']} missing transactions, "
+                                f"{stats['balance_mismatches']} balance mismatches "
+                                f"(corrected {stats['balances_corrected']})"
+                            )
+
+                    # Queue any unprocessed transactions if new ones are found
+                    if stats['transactions_found'] > 0:
+                        await self.queue_unprocessed_transactions()
+
+                except Exception as e:
+                    logger.error(f"Error in state sync loop: {e}")
+                    logger.error(traceback.format_exc())
+                    await asyncio.sleep(60)  # Wait a minute before retrying if there's an error
+
+                await asyncio.sleep(VERIFY_STATE_INTERVAL)
+
+        except asyncio.CancelledError:
+            logger.info("State sync loop shutdown requested")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error in state sync loop: {e}")
+            logger.error(traceback.format_exc())
+            raise
 
     async def _review_loop(self):
         """Continuously review transactions from the review queue"""
@@ -869,7 +1077,7 @@ class TransactionOrchestrator:
                     
                     # Review transaction. Result includes the transaction post-processing (result.tx)
                     result = await self.reviewer.review_transaction(tx)
-                    await self.dependencies.transaction_repository.store_reviewing_result(result)
+                    await self.transaction_repository.store_reviewing_result(result)
                     reviewed_count += 1
                     last_activity_time = time.time()
 
@@ -962,7 +1170,61 @@ class TransactionOrchestrator:
             logger.debug("TransactionOrchestrator: Consumer loop shutdown complete")
 
     def stop(self):
-        """Stop all transaction processing tasks"""
-        logger.debug("TransactionOrchestrator: Stopping all transaction processing tasks")
+        """Synchronous method to stop the orchestrator"""
+        try:
+            # Get or create event loop
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(self._stop_async())
+            
+            # If we already had a running loop, create a task
+            return loop.create_task(self._stop_async())
+
+        except Exception as e:
+            logger.error(f"TransactionOrchestrator: Error during synchronous stop: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+    async def _stop_async(self):
+        """Gracefully stop all transaction processing tasks"""
+        logger.debug("TransactionOrchestrator: Initiating shutdown")
         self._shutdown_event.set()
 
+        if not self._managed_tasks:
+            return
+        
+        try:
+            # Stop XRPL monitor
+            self.xrpl_monitor.stop()
+
+            # First, stop managed tasks
+            if self._managed_tasks:
+                done, pending = await asyncio.wait(
+                    self._managed_tasks, 
+                    timeout=self.SHUTDOWN_TIMEOUT
+                )
+
+                if pending:
+                    pending_names = [f"{task.get_name()} ({id(task)})" for task in pending]
+                    logger.warning(
+                        f"Timeout waiting for managed tasks to shutdown gracefully: "
+                        f"{', '.join(pending_names)}"
+                    )
+                    for task in pending:
+                        task.cancel()
+
+                    # Give cancelled tasks a moment to clean up
+                    try:
+                        await asyncio.wait(pending, timeout=self.SHUTDOWN_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        logger.error("Some tasks could not be cancelled")
+
+        except Exception as e:
+            logger.error(f"TransactionOrchestrator: Error during shutdown: {e}")
+            logger.error(traceback.format_exc())
+        finally:
+            self._managed_tasks.clear()
+            logger.info("TransactionOrchestrator: Shutdown complete")

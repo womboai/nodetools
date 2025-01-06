@@ -85,9 +85,10 @@ def get_node_config() -> NodeConfig:
     config_file = config_dir / f"pft_node_{network}_config.json"
     
     if not config_file.exists():
-        # Fall back to default configs temporarily
-        logger.warning(f"No configuration file found at {config_file}, using default configuration")
-        return global_constants.TESTNET_NODE if RuntimeConfig.USE_TESTNET else global_constants.MAINNET_NODE
+        raise FileNotFoundError(
+            f"No configuration file found at {config_file}. "
+            f"Run 'nodetools setup-node' to create a new configuration file."
+        )
     
     return load_node_config(config_file)
 

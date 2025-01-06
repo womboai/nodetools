@@ -1,5 +1,4 @@
 from typing import Protocol, Optional
-import pandas as pd
 
 class MessageEncryption(Protocol):
     """Handles encryption/decryption of messages using ECDH-derived shared secrets"""
@@ -11,15 +10,13 @@ class MessageEncryption(Protocol):
     def get_handshake_for_address(
             self, 
             channel_address: str, 
-            channel_counterparty: str, 
-            memo_history: Optional[pd.DataFrame] = None
+            channel_counterparty: str
         ) -> tuple[Optional[str], Optional[str]]:
         """Get handshake public keys between two addresses.
         
         Args:
             channel_address: One end of the encryption channel
             channel_counterparty: The other end of the encryption channel
-            memo_history: Optional pre-filtered memo history. If None, will be fetched.
             
         Returns:
             Tuple of (channel_address's ECDH public key, channel_counterparty's ECDH public key)

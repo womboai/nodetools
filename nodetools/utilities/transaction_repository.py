@@ -528,3 +528,23 @@ class TransactionRepository:
             query_category='xrpl',
             params=params
         )
+
+    async def get_address_handshakes(
+        self,
+        channel_address: str,
+        channel_counterparty: str
+    ) -> List[Dict[str, Any]]:
+        """Get handshake messages between two addresses.
+        
+        Args:
+            channel_address: One end of the encryption channel
+            channel_counterparty: The other end of the encryption channel
+            
+        Returns:
+            List of dictionaries containing handshake details ordered by datetime descending
+        """
+        return await self._execute_query(
+            query_name='get_address_handshakes',
+            query_category='xrpl',
+            params=[channel_address, channel_counterparty]
+        )

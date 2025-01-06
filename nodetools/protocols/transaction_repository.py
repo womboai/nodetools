@@ -1,4 +1,5 @@
 from typing import Protocol, TYPE_CHECKING, List, Dict, Any, Optional
+from decimal import Decimal
 
 if TYPE_CHECKING:
     from nodetools.utilities.transaction_orchestrator import ReviewingResult
@@ -112,5 +113,66 @@ class TransactionRepository(Protocol):
             address: XRPL address to authorize
             auth_source: Source of authorization (e.g. 'discord', 'twitter')
             auth_source_user_id: User ID from the auth source
+        """
+        ...
+
+    async def get_address_handshakes(
+        self,
+        channel_address: str,
+        channel_counterparty: str
+    ) -> List[Dict[str, Any]]:
+        """Get handshake messages between two addresses.
+        
+        Args:
+            channel_address: One end of the encryption channel
+            channel_counterparty: The other end of the encryption channel
+            
+        Returns:
+            List of dictionaries containing handshake details ordered by datetime descending
+        """
+        ...
+
+    async def get_pft_holders(self) -> Dict[str, Dict[str, Any]]:
+        """Get current PFT holder data from database.
+        
+        Returns:
+            Dict mapping account addresses to their PFT holding details
+        """
+        ...
+
+    async def get_pft_holder(self, account: str) -> Optional[Dict[str, Any]]:
+        """Get PFT holder data for a specific account from database.
+        
+        Args:
+            account: XRPL account address
+            
+        Returns:
+            Dictionary containing holder details or None if not found
+        """
+        ...
+
+    async def update_pft_holder(
+        self,
+        account: str,
+        balance: Decimal,
+        last_tx_hash: Optional[str]
+    ) -> None:
+        """Update or create a PFT holder record with the specified balance.
+        
+        Args:
+            account: XRPL account address
+            balance: Current PFT balance
+            last_tx_hash: Hash of the last known transaction, or None for new records
+        """
+        ...
+
+    async def batch_insert_transactions(self, tx_list: List[Dict[str, Any]]) -> int:
+        """Batch insert transactions into postfiat_tx_cache.
+        
+        Args:
+            tx_list: List of transaction dictionaries
+            
+        Returns:
+            int: Number of transactions successfully inserted
         """
         ...

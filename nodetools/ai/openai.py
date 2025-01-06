@@ -4,8 +4,8 @@ from openai import OpenAI, AsyncOpenAI
 import json
 import asyncio
 import nest_asyncio
-from nodetools.utilities.db_manager import DBConnectionManager
-from nodetools.utilities.credentials import CredentialManager
+from nodetools.protocols.db_manager import DBConnectionManager
+from nodetools.protocols.credentials import CredentialManager
 import uuid
 import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
@@ -21,23 +21,27 @@ class OpenAIRequestTool:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self):
+    def __init__(
+            self,
+            credential_manager: CredentialManager,
+            db_connection_manager: DBConnectionManager
+        ):
         if not self.__class__._initialized:
-            cred_manager = CredentialManager()
+            self.credential_manager = credential_manager
 
             # Check for OpenRouter credentials first
-            openrouter_key = cred_manager.get_credential('openrouter')
+            openrouter_key = self.credential_manager.get_credential('openrouter')
             self.using_openrouter = openrouter_key is not None
             if openrouter_key:
                 base_url = global_constants.OPENROUTER_BASE_URL
                 self.api_key = openrouter_key
             else:
                 base_url = None  # Use default OpenAI URL
-                self.api_key = cred_manager.get_credential('openai')
+                self.api_key = self.credential_manager.get_credential('openai')
             
             self.client = OpenAI(base_url=base_url, api_key=self.api_key)
             self.async_client = AsyncOpenAI(base_url=base_url, api_key=self.api_key)
-            self.db_connection_manager = DBConnectionManager()
+            self.db_connection_manager = db_connection_manager
             self.__class__._initialized = True
 
     def _prepare_api_args(self, api_args: dict) -> dict:

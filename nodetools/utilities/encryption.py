@@ -4,6 +4,7 @@ import hashlib
 from cryptography.fernet import Fernet
 import pandas as pd
 from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
+from nodetools.protocols.transaction_repository import TransactionRepository
 import nodetools.configuration.configuration as config
 import nodetools.configuration.constants as global_constants
 from nodetools.utilities.ecdh import ECDHUtils
@@ -22,12 +23,22 @@ class MessageEncryption:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, pft_utilities: GenericPFTUtilities):
+    def __init__(
+            self, 
+            node_config: config.NodeConfig,
+            pft_utilities: GenericPFTUtilities,
+            transaction_repository: TransactionRepository,
+        ):
         if not self.__class__._initialized:
+            self.node_config = node_config
             self.pft_utilities = pft_utilities
+            self.transaction_repository = transaction_repository
             self._auto_handshake_wallets = set()  # Store addresses that should auto-respond to handshakes
-            self._handshake_cache = {}  # Cache of addresses to public keys
             self.__class__._initialized = True
+
+    def __post_init__(self):
+        for address in self.node_config.auto_handshake_addresses:
+            self.register_auto_handshake_wallet(address)
     
     def get_auto_handshake_addresses(self) -> set[str]:
         """Returns a set of registered auto-handshake addresses"""
@@ -182,84 +193,53 @@ class MessageEncryption:
         self._auto_handshake_wallets.add(wallet_address)
         logger.debug(f"MessageEncryption.register_auto_handshake_wallet: Registered {wallet_address} for automatic handshake responses")
     
-    def get_handshake_for_address(
+    async def get_handshake_for_address(
             self, 
             channel_address: str, 
-            channel_counterparty: str, 
-            memo_history: Optional[pd.DataFrame] = None
+            channel_counterparty: str
         ) -> tuple[Optional[str], Optional[str]]:
         """Get handshake public keys between two addresses.
         
         Args:
             channel_address: One end of the encryption channel
             channel_counterparty: The other end of the encryption channel
-            memo_history: Optional pre-filtered memo history. If None, will be fetched.
             
         Returns:
             Tuple of (channel_address's ECDH public key, channel_counterparty's ECDH public key)
         """
-        try:
-            # Check the cache first
-            cache_key = (channel_address, channel_counterparty)
-            # Check if both keys are cached and neither key is None
-            if self._handshake_cache.get(cache_key) and None not in self._handshake_cache[cache_key]:
-                return self._handshake_cache[cache_key]
-
-            if not self.pft_utilities:
-                raise ValueError("PFT utilities not initialized")
-            
+        try:            
             # Validate addresses
             if not (channel_address.startswith('r') and channel_counterparty.startswith('r')):
                 logger.error(f"MessageEncryption.get_handshake_for_address: Invalid XRPL addresses provided: {channel_address}, {channel_counterparty}")
                 raise ValueError("Invalid XRPL addresses provided")
-            
-            # Get memo history if not provided
-            if memo_history is None:
-                memo_history = self.pft_utilities.get_account_memo_history(
-                    account_address=channel_address,
-                    pft_only=False
-                )
 
-            # Filter for handshakes
-            handshakes = memo_history[
-                memo_history['memo_type'] == global_constants.SystemMemoType.HANDSHAKE.value
-            ]
+            # Query handshakes from database
+            handshakes = await self.transaction_repository.get_address_handshakes(
+                channel_address=channel_address,
+                channel_counterparty=channel_counterparty
+            )
 
-            if handshakes.empty:
+            if not handshakes:
                 return None, None
             
-            # Function to clean chunk prefixes
-            # TODO: move this to a more general transaction-processing utility
-            def clean_chunk_prefix(memo_data: str) -> str:
-                return re.sub(r'^chunk_\d+__', '', memo_data)
-            
-            # Check for sent handshake
-            sent_handshakes = handshakes[
-                (handshakes['user_account'] == channel_counterparty) & 
-                (handshakes['direction'] == 'OUTGOING')
-            ]
+            # Process handshakes
             sent_key = None
-            if not sent_handshakes.empty:
-                latest_sent = sent_handshakes.sort_values('datetime').iloc[-1]
-                sent_key = clean_chunk_prefix(latest_sent['memo_data'])
-
-            # Check for received handshake and get latest public key
-            received_handshakes = handshakes[
-                (handshakes['user_account'] == channel_counterparty) &
-                (handshakes['direction'] == 'INCOMING')
-            ]
             received_key = None
-            if not received_handshakes.empty:
-                latest_received = received_handshakes.sort_values('datetime').iloc[-1]
-                received_key = clean_chunk_prefix(latest_received['memo_data'])
 
-            # Cache the result and return
-            result = (sent_key, received_key)
-            self._handshake_cache[cache_key] = result
-            return result
+            for handshake in handshakes:
+                if handshake['direction'] == 'OUTGOING' and sent_key is None:
+                    sent_key = handshake['memo_data']
+                elif handshake['direction'] == 'INCOMING' and received_key is None:
+                    received_key = handshake['memo_data']
+                
+                # Break early if we have both keys
+                if sent_key and received_key:
+                    break
+
+            return sent_key, received_key
         
         except Exception as e:
-            logger.error(f"MessageEncryption.get_handshake_for_address: Error checking handshake status: {e}")
+            logger.error(f"Error checking handshake status: {e}")
             raise ValueError(f"Failed to get handshake status: {e}") from e
 
     async def send_handshake(self, channel_private_key: str, channel_counterparty: str, username: str = None) -> bool:

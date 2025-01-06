@@ -1,4 +1,4 @@
-from typing import Protocol, Union, Optional
+from typing import Protocol, Union, Optional, Dict, Any, List
 import pandas as pd
 from xrpl.wallet import Wallet
 from xrpl.models import Memo
@@ -36,11 +36,11 @@ class GenericPFTUtilities(Protocol):
         """Get the transaction repository"""
         ...
 
-    async def sync_pft_transaction_history(self):
-        """Sync transaction history for all PFT holders"""
+    def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
+        """Get memo history for a given account"""
         ...
 
-    def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
+    async def get_account_memo_history_async(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
         """Get memo history for a given account"""
         ...
 
@@ -179,5 +179,51 @@ class GenericPFTUtilities(Protocol):
         
         Returns:
         dict: A dictionary containing extracted transaction information.
+        """
+        ...
+
+    @staticmethod
+    def generate_custom_id():
+        """ Generate a unique memo_type """
+        ...
+
+    async def fetch_pft_trustline_data(self, batch_size: int = 200) -> Dict[str, Dict[str, Any]]:
+        """Get PFT token holder account information.
+        
+        Queries the XRPL for all accounts that have trustlines with the PFT issuer account.
+        The balances are from the issuer's perspective, so they are negated to show actual
+        holder balances (e.g., if issuer shows -100, holder has +100).
+
+        Args:
+            batch_size: Number of records to fetch per request (max 400)
+
+        Returns:
+            Dict of dictionaries with keys:
+                - account (str): XRPL account address of the token holder
+            and values:
+                - balance (str): Raw balance string from XRPL
+                - currency (str): Currency code (should be 'PFT')
+                - limit_peer (str): Trustline limit
+                - pft_holdings (float): Actual token balance (negated from issuer view)
+        """
+        ...
+
+    async def fetch_formatted_transaction_history(
+            self, 
+            account_address: str,
+            fetch_new_only: bool = True
+        ) -> List[Dict[str, Any]]:
+        """Fetch and format transaction history for an account.
+        
+        Retrieves transactions from XRPL and transforms them into a standardized
+        format suitable for database storage.
+        
+        Args:
+            account_address: XRPL account address to fetch transactions for
+            fetch_new_only: If True, only fetch transactions after the last known ledger index.
+                            If False, fetch entire transaction history.
+                
+        Returns:
+            List of dictionaries containing processed transaction data with standardized fields
         """
         ...

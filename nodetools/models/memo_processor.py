@@ -27,7 +27,7 @@ class LegacyMemoProcessor:
             raise ValueError(f"No SecretType found for address: {address}")
 
     @staticmethod
-    def process_group(
+    async def process_group(
         group: MemoGroup, 
         credential_manager: Optional[CredentialManager] = None,
         message_encryption: Optional[MessageEncryption] = None,
@@ -103,7 +103,7 @@ class LegacyMemoProcessor:
                 secret_type = LegacyMemoProcessor._determine_secret_type(channel_address, node_config)
             
                 # Get handshake keys
-                channel_key, counterparty_key = message_encryption.get_handshake_for_address(
+                channel_key, counterparty_key = await message_encryption.get_handshake_for_address(
                     channel_address=channel_address,
                     channel_counterparty=channel_counterparty
                 )
@@ -146,7 +146,7 @@ class StandardizedMemoProcessor:
             raise ValueError(f"No SecretType found for address: {address}")
     
     @staticmethod
-    def process_group(
+    async def process_group(
         group: MemoGroup,
         credential_manager: Optional[CredentialManager] = None,
         message_encryption: Optional[MessageEncryption] = None,
@@ -240,7 +240,7 @@ class StandardizedMemoProcessor:
                 secret_type = StandardizedMemoProcessor._determine_secret_type(channel_address, node_config)
             
                 # Get handshake keys
-                channel_key, counterparty_key = message_encryption.get_handshake_for_address(
+                channel_key, counterparty_key = await message_encryption.get_handshake_for_address(
                     channel_address=channel_address,
                     channel_counterparty=channel_counterparty
                 )
@@ -293,7 +293,7 @@ class MemoProcessor:
     """Entry point for memo processing"""
     
     @staticmethod
-    def process_group(
+    async def process_group(
         group: MemoGroup,
         credential_manager: Optional[CredentialManager] = None,
         message_encryption: Optional[MessageEncryption] = None,

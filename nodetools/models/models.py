@@ -13,7 +13,8 @@ if TYPE_CHECKING:
     from nodetools.protocols.openrouter import OpenRouterTool
     from nodetools.protocols.transaction_repository import TransactionRepository
     from nodetools.protocols.encryption import MessageEncryption
-    from nodetools.configuration.configuration import NodeConfig
+    from nodetools.protocols.db_manager import DBConnectionManager
+    from nodetools.configuration.configuration import NodeConfig, NetworkConfig
 
 class InteractionType(Enum):
     REQUEST = "request"
@@ -29,6 +30,7 @@ class MemoDataStructureType(Enum):
 @dataclass
 class Dependencies:
     """Container for core dependencies that can be provided by NodeTools"""
+    network_config: 'NetworkConfig'
     node_config: 'NodeConfig'
     credential_manager: 'CredentialManager'
     generic_pft_utilities: 'GenericPFTUtilities'
@@ -467,7 +469,7 @@ class ResponseParameters:
     pft_amount: Optional[Decimal] = None  # Optional PFT amount for the transaction
 
 class ResponseGenerator(ABC):
-    """Protocol defining how to generate a response"""
+    """Abstract base class defining how to generate a response"""
     @abstractmethod
     async def evaluate_request(self, request_tx: Dict[str, Any]) -> Dict[str, Any]:
         """Evaluate the request and return response parameters"""

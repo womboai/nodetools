@@ -7,7 +7,7 @@ import nest_asyncio
 import json
 import time
 from asyncio import Semaphore
-from nodetools.utilities.credentials import CredentialManager
+from nodetools.protocols.credentials import CredentialManager
 from loguru import logger
 from typing import Dict, Any
 import traceback
@@ -24,15 +24,20 @@ class OpenRouterTool:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, max_concurrent_requests=10, requests_per_minute=30, http_referer="postfiat.org"):
+    def __init__(
+            self, 
+            credential_manager: CredentialManager,
+            max_concurrent_requests=10, 
+            requests_per_minute=30, 
+            http_referer="postfiat.org"
+        ):
         if not self.__class__._initialized:
             self.http_referer = http_referer
-            cred_manager = CredentialManager()
             
             # Try both with and without variable___ prefix
-            api_key = cred_manager.get_credential('variable___openrouter')
+            api_key = credential_manager.get_credential('variable___openrouter')
             if api_key is None:
-                api_key = cred_manager.get_credential('openrouter')
+                api_key = credential_manager.get_credential('openrouter')
             
             if api_key is None:
                 raise ValueError("OpenRouter API key not found in credentials")

@@ -32,7 +32,7 @@ class XRPLWebSocketMonitor:
         # Client and queue
         self.client = None
         self.review_queue = None
-        self._monitor_task = None
+        self.monitor_task = None
         self._shutdown = False
 
         # Error handling parameters
@@ -52,11 +52,11 @@ class XRPLWebSocketMonitor:
         """Start the monitor as an asyncio task"""
         self.review_queue = queue
         self._shutdown = False
-        self._monitor_task = asyncio.create_task(
+        self.monitor_task = asyncio.create_task(
             self.monitor(),
             name="XRPLWebSocketMonitor"
         )
-        return self._monitor_task
+        return self.monitor_task
 
     def stop(self):
         """Signal the monitor to stop and wait for it to complete"""

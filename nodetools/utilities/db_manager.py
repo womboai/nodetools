@@ -15,9 +15,9 @@ class DBConnectionManager:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self):
+    def __init__(self, credential_manager: CredentialManager):
         if not self.__class__._initialized:
-            self.credential_manager = CredentialManager()
+            self.credential_manager = credential_manager
             self.__class__._initialized = True
 
     def spawn_sqlalchemy_db_connection_for_user(self, username):
