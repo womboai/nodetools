@@ -30,10 +30,12 @@ setup(
     },
     author='Alex Good',
     author_email='alex@agti.net',
-    description='Post Fiat task completion node',
+    maintainer='Skelectric',
+    maintainer_email='skelectric@postfiat.org',
+    description='Post Fiat NodeTools',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
-    url='https://github.com/postfiatorg/nodetools',  # Replace with your actual GitHub repo URL
+    url='https://github.com/postfiatorg/nodetools',
     classifiers=[
         'Programming Language :: Python :: 3',
         'License :: OSI Approved :: MIT License',

@@ -354,6 +354,7 @@ class InteractionPattern:
     memo_pattern: MemoPattern
     transaction_type: InteractionType
     valid_responses: Set[MemoPattern]
+    notify: bool = False
 
     def __post_init__(self):
         # Validate that RESPONSE types don't have valid_responses
@@ -373,17 +374,26 @@ class InteractionGraph:
             pattern_id: str,
             memo_pattern: MemoPattern,
             transaction_type: InteractionType,
-            valid_responses: Optional[Set[MemoPattern]] = None
+            valid_responses: Optional[Set[MemoPattern]] = None,
+            notify: bool = False
     ) -> None:
         """
         Add a new pattern to the graph.
         For RESPONSE and STANDALONE types, valid_responses should be None or empty.
         For REQUEST types, valid_responses must be provided.
+
+        Args:
+            pattern_id: Unique identifier for the pattern
+            memo_pattern: The memo pattern to match
+            transaction_type: Type of interaction (REQUEST/RESPONSE/STANDALONE)
+            valid_responses: Set of valid response patterns (required for REQUEST type)
+            notify: Whether transactions matching this pattern should trigger notifications
         """
         self.patterns[pattern_id] = InteractionPattern(
             memo_pattern=memo_pattern, 
             transaction_type=transaction_type, 
-            valid_responses=valid_responses, 
+            valid_responses=valid_responses,
+            notify=notify
         )
         # Update the reverse lookup
         self.memo_pattern_to_id[memo_pattern] = pattern_id

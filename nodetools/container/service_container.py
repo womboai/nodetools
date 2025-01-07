@@ -5,6 +5,7 @@ from pathlib import Path
 import traceback
 import getpass
 import sys
+import asyncio
 
 # Third Party
 from loguru import logger
@@ -40,7 +41,8 @@ class ServiceContainer:
         cls,
         business_logic: BusinessLogicProvider,
         password_prompt: Optional[Callable[[], str]] = None,
-        performance_monitor: Optional[PerformanceMonitor] = None
+        performance_monitor: Optional[PerformanceMonitor] = None,
+        notifications: bool = False
     ) -> 'ServiceContainer':
         """
         Initialize all NodeTools services with credential management
@@ -125,7 +127,8 @@ class ServiceContainer:
                 credential_manager=credential_manager,
                 message_encryption=message_encryption,
                 openrouter=openrouter,
-                xrpl_monitor=xrpl_monitor
+                xrpl_monitor=xrpl_monitor,
+                notifications=notifications
             )
 
             # Create core dependencies container
@@ -207,6 +210,11 @@ class ServiceContainer:
     def network_config(self):
         """Get the network configuration"""
         return self.dependencies.network_config
+
+    @property
+    def notification_queue(self) -> asyncio.Queue:
+        """Access the transaction orchestrator's notification queue"""
+        return self.transaction_orchestrator.notification_queue
 
     def start(self):
         """Start the transaction orchestrator"""

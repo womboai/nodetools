@@ -94,7 +94,7 @@ class GenericPFTUtilities:
             self.db_connection_manager = db_connection_manager
             self.transaction_repository = transaction_repository
             self.credential_manager = credential_manager
-            self.message_encryption = None  # Requires initialization outside of this class
+            self.message_encryption: Optional[MessageEncryption] = None  # Requires initialization outside of this class
 
             self.__class__._initialized = True
 
@@ -473,28 +473,8 @@ class GenericPFTUtilities:
         logger.debug(f'-- Spawned wallet with address {wallet.address}')
         return wallet
     
-    # TODO: Deprecate this method and have consumers call transaction repository methods directly
     @PerformanceMonitor.measure('get_account_memo_history')
-    def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
-        """Synchronous version: Get transaction history with memos for an account.
-        
-        Args:
-            account_address: XRPL account address to get history for
-            pft_only: If True, only return PFT transactions. Defaults to True.
-            
-        Returns:
-            DataFrame containing transaction history with memo details
-        """ 
-
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:  # No running event loop
-            return asyncio.run(self.get_account_memo_history_async(account_address, pft_only))
-        else:
-            # If we're already in an event loop
-            return loop.run_until_complete(self.get_account_memo_history_async(account_address, pft_only))
-    
-    async def get_account_memo_history_async(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
+    async def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
         """Get transaction history with memos for an account.
         
         Args:
@@ -1113,19 +1093,19 @@ class GenericPFTUtilities:
             logger.warning(f"GenericPFTUtilities.process_memo_data: Error processing memo {memo_type}: {e}")
             return processed_data
         
-    def get_all_account_compressed_messages_for_remembrancer(
+    async def get_all_account_compressed_messages_for_remembrancer(
         self,
         account_address: str,
     ) -> pd.DataFrame:
         """Convenience method for getting all messages for a user from the remembrancer's perspective"""
-        return self.get_all_account_compressed_messages(
+        return await self.get_all_account_compressed_messages(
             account_address=account_address,
             channel_private_key=self.credential_manager.get_credential(
                 f"{self.node_config.remembrancer_name}__v1xrpsecret"
             )
         )
 
-    def get_all_account_compressed_messages(
+    async def get_all_account_compressed_messages(
         self,
         account_address: str,
         channel_private_key: Optional[Union[str, xrpl.wallet.Wallet]] = None,
@@ -1171,7 +1151,7 @@ class GenericPFTUtilities:
         """
         try:
             # Get transaction history
-            memo_history = self.get_account_memo_history(account_address=account_address, pft_only=True)
+            memo_history = await self.get_account_memo_history(account_address=account_address, pft_only=True)
 
             if memo_history.empty:
                 return pd.DataFrame()
@@ -1211,7 +1191,7 @@ class GenericPFTUtilities:
 
                 try:
                     # Process the message (handles chunking, decompression, and decryption)
-                    processed_message = self.process_memo_data(
+                    processed_message = await self.process_memo_data(
                         memo_type=msg_id,
                         memo_data=first_txn['memo_data'],
                         full_unchunk=True,
@@ -1463,7 +1443,7 @@ class GenericPFTUtilities:
         holder = self.get_pft_holder(account_address)
         return holder['balance'] if holder else Decimal(0)
 
-    def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
+    async def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
         """Get the most recent messages from a user's memo history.
         
         Args:
@@ -1479,7 +1459,7 @@ class GenericPFTUtilities:
         """
         try:
             # Get all messages and select relevant columns
-            df = self.get_all_account_compressed_messages(
+            df = await self.get_all_account_compressed_messages(
                 account_address=account_address,
                 channel_private_key=self.credential_manager.get_credential(
                     f"{self.node_config.remembrancer_name}__v1xrpsecret"
@@ -1740,12 +1720,13 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
             raise Exception(f"Trust line creation failed: {response}")
         return response
 
-    def get_recent_messages(self, wallet_address): 
+    async def get_recent_messages(self, wallet_address): 
         incoming_messages = None
         outgoing_messages = None
         try:
 
-            memo_history = self.get_account_memo_history(wallet_address).copy().sort_values('datetime')
+            memo_history = await self.get_account_memo_history(wallet_address)
+            memo_history = memo_history.sort_values('datetime')
 
             def format_transaction_message(transaction):
                 """
@@ -1774,7 +1755,8 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
                 outgoing_messages = format_transaction_message(outgoing_df.tail(1).iloc[0])
 
         except Exception as e:
-            logger.error(f"GenericPFTUtilities.get_recent_messages_for_account_address: Error getting recent messages for {wallet_address}: {e}")
+            logger.error(f"GenericPFTUtilities.get_recent_messages: Error getting recent messages for {wallet_address}: {e}")
+            logger.error(traceback.format_exc())
         
         return incoming_messages, outgoing_messages
     

@@ -36,11 +36,7 @@ class GenericPFTUtilities(Protocol):
         """Get the transaction repository"""
         ...
 
-    def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
-        """Get memo history for a given account"""
-        ...
-
-    async def get_account_memo_history_async(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
+    async def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
         """Get memo history for a given account"""
         ...
 
@@ -62,7 +58,7 @@ class GenericPFTUtilities(Protocol):
         """Verify a transaction response"""
         ...
 
-    def get_all_account_compressed_messages(self, account_address: str) -> pd.DataFrame:
+    async def get_all_account_compressed_messages(self, account_address: str) -> pd.DataFrame:
         """Get all compressed messages for a given account"""
         ...
 
@@ -78,11 +74,11 @@ class GenericPFTUtilities(Protocol):
         """Spawn a wallet from a seed"""
         ...
 
-    def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
+    async def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
         """Get the most recent messages from a user's memo history"""
         ...
 
-    def get_all_account_compressed_messages_for_remembrancer(self, account_address: str) -> pd.DataFrame:
+    async def get_all_account_compressed_messages_for_remembrancer(self, account_address: str) -> pd.DataFrame:
         """Convenience method for getting all messages for a user from the remembrancer's perspective"""
         ...
 
@@ -108,7 +104,7 @@ class GenericPFTUtilities(Protocol):
         """Get PFT balance for an account from the database"""
         ...
 
-    def process_memo_data(
+    async def process_memo_data(
         self,
         memo_type: str,
         memo_data: str,
@@ -226,4 +222,12 @@ class GenericPFTUtilities(Protocol):
         Returns:
             List of dictionaries containing processed transaction data with standardized fields
         """
+        ...
+
+    async def get_handshake_for_address(self, channel_address: str, channel_counterparty: str):
+        """Get handshake for a specific address"""
+        ...
+
+    async def get_recent_messages(self, wallet_address: str):
+        """Get recent messages for a given wallet address"""
         ...

@@ -318,8 +318,9 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
                     connection.execute(text("DROP TABLE IF EXISTS transaction_processing_results CASCADE;"))
                     connection.execute(text("DROP TABLE IF EXISTS transaction_memos CASCADE;"))
                     connection.execute(text("DROP TABLE IF EXISTS postfiat_tx_cache CASCADE;"))
-                    # Drop module tables
-                    connection.execute(text("DROP TABLE IF EXISTS foundation_discord CASCADE;"))
+                    connection.execute(text("DROP TABLE IF EXISTS pft_holders CASCADE;"))
+                    connection.execute(text("DROP TABLE IF EXISTS authorized_addresses CASCADE;"))
+
                     connection.commit()
                     print("Dropped existing tables.")
 
@@ -332,7 +333,7 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
 
                     # Grant privileges for core tables
                     print("\nGranting privileges for core tables...")
-                    core_tables = ["postfiat_tx_cache", "transaction_processing_results", "transaction_memos"]
+                    core_tables = ["postfiat_tx_cache", "transaction_processing_results", "transaction_memos", "pft_holders", "authorized_addresses"]
                     for table in core_tables:
                         connection.execute(text(f"GRANT ALL PRIVILEGES ON TABLE {table} to postfiat;"))
 
@@ -364,27 +365,20 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
                     result = connection.execute(text("""
                         SELECT 
                             (SELECT COUNT(*) FROM postfiat_tx_cache) as total_transactions,
-                            (SELECT COUNT(*) FROM transaction_memos) as total_memos
+                            (SELECT COUNT(*) FROM transaction_memos) as total_memos,
+                            (SELECT COUNT(*) FROM transaction_processing_results) as total_processing_results,
+                            (SELECT COUNT(*) FROM pft_holders) as total_pft_holders,
+                            (SELECT COUNT(*) FROM authorized_addresses) as total_authorized_addresses
                     """))
                     counts = result.fetchone()
                     print(f"\nBackfill results:")
                     print(f"- Total transactions: {counts[0]}")
-                    print(f"- Processed memos: {counts[1]}\n")
+                    print(f"- Processed memos: {counts[1]}")
+                    print(f"- Processed results: {counts[2]}")
+                    print(f"- PFT holders: {counts[3]}")
+                    print(f"- Authorized addresses: {counts[4]}\n")
 
-                    # Initialize Discord module (if requested)
-                    if input("\nWould you like to initialize the Discord module? (y/n): ").lower() != 'n':
-                        print("Initializing Discord module...")
-                        query = sql_manager.load_query('discord', 'create_tables')
-                        connection.execute(text(query))
-                        connection.execute(text("GRANT ALL PRIVILEGES ON TABLE discord_notifications TO postfiat;"))
-                        connection.commit()
-                        print("Discord module initialized successfully!")
-
-                    # Print table info
-                    print("\nVerifying table structures:")
-                    tables_to_verify = core_tables + (["discord_notifications"] if "discord_notifications" in connection.execute(
-                        text("SELECT tablename FROM pg_tables WHERE schemaname = 'public';")
-                    ).scalars().all() else [])
+                    tables_to_verify = core_tables  # Add more tables here if needed
 
                     for table in tables_to_verify:
                         result = connection.execute(text(f"""
