@@ -4,9 +4,6 @@ from pathlib import Path
 
 CONFIG_DIR = Path.home().joinpath("postfiatcreds")
 
-# Super Users
-DISCORD_SUPER_USER_IDS = [402536023483088896, 471510026696261632]
-
 # AI MODELS
 DEFAULT_OPENROUTER_MODEL = 'anthropic/claude-3.5-sonnet:beta'
 DEFAULT_OPEN_AI_MODEL = 'chatgpt-4o-latest'

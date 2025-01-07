@@ -5,6 +5,7 @@ import traceback
 # Third party imports
 import xrpl
 from loguru import logger
+from cryptography.fernet import InvalidToken
 # Local imports
 from nodetools.models.models import MemoGroup, MemoStructure, MemoDataStructureType
 from nodetools.utilities.compression import compress_data, decompress_data, CompressionError
@@ -121,9 +122,13 @@ class LegacyMemoProcessor:
                     shared_secret
                 )
 
+            except InvalidToken:
+                # This will happen often with legacy memos since they're processed asynchronously and system may not have all chunks yet
+                raise
+
             except Exception as e:
                 message = (
-                    f"LegacyMemoProcessor.process_group: Error decrypting message "
+                    f"LegacyMemoProcessor.process_group: Error decrypting message {group.group_id} "
                     f"between address {channel_address} and counterparty {channel_counterparty}: {processed_data}"
                 )
                 logger.error(message)
@@ -258,7 +263,10 @@ class StandardizedMemoProcessor:
                     shared_secret
                 )
             except Exception as e:
-                logger.error(f"Error decrypting message: {e}")
+                logger.error(
+                    f"StandardizedMemoProcessor.process_group: Error decrypting message {group.group_id} "
+                    f"between address {channel_address} and counterparty {channel_counterparty}: {e}"
+                )
                 logger.error(traceback.format_exc())
                 return f"[Decryption Failed] {processed_data}"
             
@@ -308,7 +316,7 @@ class MemoProcessor:
 
         if structure.is_standardized_format:
             if StandardizedMemoProcessor.validate_group(group):
-                return StandardizedMemoProcessor.process_group(
+                return await StandardizedMemoProcessor.process_group(
                     group,
                     credential_manager=credential_manager,
                     message_encryption=message_encryption,
@@ -318,7 +326,7 @@ class MemoProcessor:
                 logger.warning("Invalid standardized format group")
                 return None
         else:
-            return LegacyMemoProcessor.process_group(
+            return await LegacyMemoProcessor.process_group(
                 group,
                 credential_manager=credential_manager,
                 message_encryption=message_encryption,

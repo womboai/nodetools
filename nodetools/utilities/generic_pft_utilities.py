@@ -1,10 +1,9 @@
 # Standard library imports
 from decimal import Decimal
-from typing import Optional, Union, Any, Dict, List, Any
+from typing import Optional, Union, Any, Dict, List, Any, Tuple
 import binascii
 import datetime 
 import random
-import time
 import string
 import base64
 import brotli
@@ -19,12 +18,12 @@ import math
 # Third party imports
 import nest_asyncio
 import pandas as pd
-import numpy as np
 import requests
-import sqlalchemy
 import xrpl
-from xrpl.models.transactions import Memo
 from xrpl.wallet import Wallet
+from xrpl.models.transactions import Memo
+from xrpl.models.response import Response
+from xrpl.asyncio.transaction import submit_and_wait
 from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.models.requests import AccountInfo, AccountLines, AccountTx
 from xrpl.utils import str_to_hex
@@ -239,7 +238,7 @@ class GenericPFTUtilities:
         return ret
     
     @staticmethod
-    def verify_transaction_response(response: Union[dict, list[dict]] ) -> bool:
+    def verify_transaction_response(response: Union[Response, list[Response]] ) -> bool:
         """
         Verify that a transaction response or list of responses indicates success.
 
@@ -247,7 +246,7 @@ class GenericPFTUtilities:
             response: Transaction response from submit_and_wait
 
         Returns:
-            bool: True if the transaction was successful, False otherwise
+            Tuple[bool, Response]: True if the transaction was successful, False otherwise
         """
         try:
             # Handle list of responses
@@ -270,60 +269,6 @@ class GenericPFTUtilities:
             )
         except Exception as e:
             logger.error(f"Error verifying transaction response: {e}")
-            logger.error(traceback.format_exc())
-            return False
-
-
-    def verify_transaction_hash(self, tx_hash: str) -> bool:
-        """
-        Verify that a transaction was successfully confirmed on-chain.
-
-        Args:
-            tx_hash: A transaction hash to verify
-
-        Returns:
-            bool: True if the transaction was successful, False otherwise
-        """
-        client = xrpl.clients.JsonRpcClient(self.https_url)
-        try:
-            tx_request = xrpl.models.requests.Tx(
-                transaction=tx_hash,
-                binary=False
-            )
-
-            tx_result = client.request(tx_request)
-
-            return self.verify_transaction_response(tx_result)
-        
-        except Exception as e:
-            logger.error(f"Error verifying transaction hash {tx_hash}: {e}")
-            logger.error(traceback.format_exc())
-            return False
-    
-    
-    def verify_transaction_hash(self, tx_hash: str) -> bool:
-        """
-        Verify that a transaction was successfully confirmed on-chain.
-
-        Args:
-            tx_hash: A transaction hash to verify
-
-        Returns:
-            bool: True if the transaction was successful, False otherwise
-        """
-        client = xrpl.clients.JsonRpcClient(self.https_url)
-        try:
-            tx_request = xrpl.models.requests.Tx(
-                transaction=tx_hash,
-                binary=False
-            )
-
-            tx_result = client.request(tx_request)
-
-            return self.verify_transaction_response(tx_result)
-        
-        except Exception as e:
-            logger.error(f"Error verifying transaction hash {tx_hash}: {e}")
             logger.error(traceback.format_exc())
             return False
     
@@ -447,7 +392,7 @@ class GenericPFTUtilities:
         elif isinstance(wallet_seed_or_wallet, xrpl.wallet.Wallet):
             wallet = wallet_seed_or_wallet
         else:
-            logger.error("GenericPFTUtilities.send_memo: Invalid wallet input, raising ValueError")
+            logger.error("GenericPFTUtilities.send_xrp: Invalid wallet input, raising ValueError")
             raise ValueError("Invalid wallet input")
 
         client = AsyncJsonRpcClient(self.https_url)
@@ -460,11 +405,16 @@ class GenericPFTUtilities:
             destination_tag=destination_tag
         )
         try:    
-            response = await xrpl.asyncio.transaction.submit_and_wait(payment, client, wallet)    
+            response = await submit_and_wait(payment, client, wallet)
+            return response    
         except xrpl.transaction.XRPLReliableSubmissionException as e:    
-            response = f"Submit failed: {e}"
-    
-        return response
+            logger.error(f"GenericPFTUtilities.send_xrp: Transaction submission failed: {e}")
+            logger.error(traceback.format_exc())
+            raise
+        except Exception as e:
+            logger.error(f"GenericPFTUtilities.send_xrp: Unexpected error: {e}")
+            logger.error(traceback.format_exc())
+            raise
 
     @staticmethod
     def spawn_wallet_from_seed(seed):
@@ -494,51 +444,6 @@ class GenericPFTUtilities:
         # Convert datetime column to datetime after DataFrame creation
         df['datetime'] = pd.to_datetime(df['datetime'])
         return df
-    
-    async def process_queue_transaction(
-            self,
-            wallet: Wallet,
-            memo: Union[str, Memo],
-            destination: str,
-            pft_amount: Optional[Union[int, float, Decimal]] = None
-        ) -> bool:
-        """Send a node-initiated transaction for queue processing.
-        
-        This method is specifically designed for node-initiated operations (like rewards and handshake responses).
-        It should NOT be used for user-initiated transactions.
-        
-        Args:
-            wallet: XRPL wallet instance for the node
-            memo: Formatted memo object for the transaction
-            destination: Destination address for transaction
-            pft_amount: Optional PFT amount to send (will be converted to Decimal)
-            
-        Returns:
-            bool: True if transaction was sent and verified successfully
-            
-        Note:
-            This method is intended for internal node operations only. For user-initiated
-            transactions, use send_memo() instead.
-        """
-        try:
-            # Convert amount to Decimal if provided
-            pft_amount = Decimal(pft_amount) if pft_amount is not None else None
-
-            # Send transaction
-            response = await self.send_memo(
-                wallet_seed_or_wallet=wallet,
-                destination=destination,
-                memo=memo,
-                pft_amount=pft_amount,
-                compress=False
-            )
-
-            return self.verify_transaction_response(response)
-        
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities._send_and_track_transactions: Error sending transaction to {destination}: {e}")
-            logger.error(traceback.format_exc())
-            return False
     
     def is_encrypted(self, memo: str):
         """Check if a memo is encrypted"""
@@ -709,7 +614,7 @@ class GenericPFTUtilities:
             encrypt: bool = False,
             pft_amount: Optional[Decimal] = None,
             disable_pft_check: bool = False
-        ) -> Union[dict, list[dict]]:
+        ) -> Union[Response, list[Response]]:
         """Primary method for sending memos on the XRPL with PFT requirements.
         
         This method handles all aspects of memo sending including:
@@ -820,7 +725,7 @@ class GenericPFTUtilities:
         else:
             return await self._send_memo_single(wallet, destination, memo, pft_amount)
 
-    async def _send_memo_single(self, wallet: Wallet, destination: str, memo: Memo, pft_amount: Decimal):
+    async def _send_memo_single(self, wallet: Wallet, destination: str, memo: Memo, pft_amount: Decimal) -> Response:
         """ Sends a single memo to a destination """
         client = AsyncJsonRpcClient(self.https_url)
 
@@ -844,15 +749,16 @@ class GenericPFTUtilities:
 
         try:
             logger.debug(f"GenericPFTUtilities._send_memo_single: Submitting transaction to send memo from {wallet.address} to {destination}")
-            response = await xrpl.asyncio.transaction.submit_and_wait(payment, client, wallet)
+            response = await submit_and_wait(payment, client, wallet)
+            return response
         except xrpl.transaction.XRPLReliableSubmissionException as e:
-            response = f"GenericPFTUtilities._send_memo_single: Transaction submission failed: {e}"
-            logger.error(response)
+            logger.error(f"GenericPFTUtilities._send_memo_single: Transaction submission failed: {e}")
+            logger.error(traceback.format_exc())
+            raise
         except Exception as e:
-            response = f"GenericPFTUtilities._send_memo_single: Unexpected error: {e}"
-            logger.error(response)
-
-        return response
+            logger.error(f"GenericPFTUtilities._send_memo_single: Unexpected error: {e}")
+            logger.error(traceback.format_exc())
+            raise
     
     def _reconstruct_chunked_message(
         self,
@@ -1690,7 +1596,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         else:
             logger.debug(f"GenericPFTUtilities.handle_trust_line: Trust line already exists for {wallet.classic_address}")
 
-    async def generate_trust_line_to_pft_token(self, wallet: xrpl.wallet.Wallet):
+    async def generate_trust_line_to_pft_token(self, wallet: xrpl.wallet.Wallet) -> Response:
         """
         Generate a trust line to the PFT token.
         
@@ -1706,7 +1612,7 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         client = AsyncJsonRpcClient(self.https_url)
         trust_set_tx = xrpl.models.transactions.TrustSet(
             account=wallet.classic_address,
-            limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
+            limit_amount=xrpl.models.amounts.IssuedCurrencyAmount(
                 currency="PFT",
                 issuer=self.pft_issuer,
                 value="100000000",
@@ -1714,11 +1620,16 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         )
         logger.debug(f"GenericPFTUtilities.generate_trust_line_to_pft_token: Establishing trust line transaction from {wallet.classic_address} to issuer {self.pft_issuer}...")
         try:
-            response = await xrpl.asyncio.transaction.submit_and_wait(trust_set_tx, client, wallet)
+            response = await submit_and_wait(trust_set_tx, client, wallet)
+            return response
         except xrpl.transaction.XRPLReliableSubmissionException as e:
-            response = f"Submit failed: {e}"
-            raise Exception(f"Trust line creation failed: {response}")
-        return response
+            logger.error(f"GenericPFTUtilities.generate_trust_line_to_pft_token: Transaction submission failed: {e}")
+            logger.error(traceback.format_exc())
+            raise
+        except Exception as e:
+            logger.error(f"GenericPFTUtilities.generate_trust_line_to_pft_token: Unexpected error: {e}")
+            logger.error(traceback.format_exc())
+            raise
 
     async def get_recent_messages(self, wallet_address): 
         incoming_messages = None

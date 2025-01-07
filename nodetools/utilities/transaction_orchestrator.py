@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 
 # Third party imports
 from loguru import logger
+from xrpl.models import Response
+from cryptography.fernet import InvalidToken
 
 # Nodetools imports
 from nodetools.models.models import (
@@ -206,12 +208,11 @@ class TransactionReviewer:
             self.pending_groups.pop(group_id)
             return await self._review_direct_match(complete_tx)
         
-        except CompressionError as e:
+        except (CompressionError, InvalidToken) as e:
             # For legacy groups, we lack the metadata to explicitly know if we've received all chunks
             # So we'll keep the group in pending and try again later if we receive more chunks
+            # Groups in pending are subject to a timeout and will be cleaned up if they're not updated
             if not is_standardized:
-                # chunk_indices = group.chunk_indices
-                # logger.warning(f"Failed to process group {group_id} (legacy). May be due to missing chunks. Received indices: {chunk_indices}")
                 return ReviewingResult(
                     tx=tx,
                     processed=True,
@@ -239,8 +240,6 @@ class TransactionReviewer:
         """Handle review of transactions that can be matched directly"""
         # First find matching pattern
         pattern_id = self.graph.find_matching_pattern(tx)
-
-        # logger.debug(f"Found matching pattern_id: {pattern_id}")
 
         if not pattern_id:
             return ReviewingResult(
@@ -271,8 +270,14 @@ class TransactionReviewer:
                 match pattern.transaction_type:
                     # Response or standalone transactions don't need responses
                     case InteractionType.RESPONSE | InteractionType.STANDALONE:
-                        # These tranasctions don't need processing but might need notification
-                        if pattern.notify and self.notification_queue:
+
+                        # These transactions don't need processing but might need notification, but only if they're recent.
+                        # Normalize the datetime to UTC to check if it's recent
+                        tx_datetime = tx['datetime']
+                        if isinstance(tx_datetime, datetime) and tx_datetime.tzinfo is None:
+                            tx_datetime = tx_datetime.replace(tzinfo=timezone.utc)
+
+                        if pattern.notify and self.notification_queue and tx_datetime > (datetime.now(timezone.utc) - timedelta(minutes=1)):
                             await self.notification_queue.put(tx)
                             logger.debug(f"TransactionReviewer: Queued notification for transaction {tx['hash']}")
 
@@ -559,6 +564,7 @@ class ResponseProcessor:
         self._shutdown_event = shutdown_event
         self.pattern_id = pattern_id
         self.processed_count = 0
+        self.fail_count = 0
         self.last_log_time = time.time()
         self.last_activity_time = time.time()
         self.IDLE_LOG_INTERVAL = 3600  # Log idle status every 60 minutes
@@ -573,7 +579,13 @@ class ResponseProcessor:
                 logger.debug(f"ResponseProcessor_{self.pattern_id}: Got transaction {tx['hash']} from queue")
 
                 # Process the transaction
-                success = await self._process_transaction(tx)
+                response = await self._process_transaction(tx)
+
+                success = self.dependencies.generic_pft_utilities.verify_transaction_response(response)
+
+                if not success:
+                    self.fail_count += 1
+                    raise Exception(f"ResponseProcessor_{self.pattern_id}: Failed to verify response for transaction {tx['hash']}")
 
                 if success:
                     self.processed_count += 1
@@ -587,13 +599,15 @@ class ResponseProcessor:
                 if queue_size == 0:
                     logger.info(
                         f"ResponseProcessor_{self.pattern_id}: "
-                        f"Queue empty. Total processed: {self.processed_count}"
+                        f"Queue empty. Total processed: {self.processed_count} "
+                        f"Total transactions failed: {self.fail_count}"
                     )
                 elif self.processed_count % self.COUNT_LOG_INTERVAL == 0:
                     logger.debug(
                         f"ResponseProcessor_{self.pattern_id}: "
                         f"Progress: {self.processed_count} transactions processed. "
                         f"Current queue size: {queue_size}"
+                        f"Transactions failed: {self.fail_count}"
                     )
 
                 self.queue.task_done()
@@ -611,7 +625,8 @@ class ResponseProcessor:
                     logger.info(
                         f"Consumer_{self.pattern_id}: "
                         f"Idle for {format_duration(idle_duration)}. "
-                        f"Total processed: {self.processed_count}"
+                        f"Total processed: {self.processed_count} "
+                        f"Total transactions failed: {self.fail_count}"
                     )
                     self.last_idle_log_time = current_time  # Reset to avoid spam
                 continue
@@ -620,7 +635,7 @@ class ResponseProcessor:
                 logger.error(f"BaseConsumer.run: Error processing transaction: {e}")
                 logger.error(traceback.format_exc())
 
-    async def _process_transaction(self, tx: Dict[str, Any]) -> bool:
+    async def _process_transaction(self, tx: Dict[str, Any]) -> Response:
         """Process a single transaction using the generator"""
         try:
             # Evaluate the request
@@ -638,8 +653,8 @@ class ResponseProcessor:
 
             # Send response transaction
             logger.debug(f"ResponseProcessor_{self.pattern_id}: Sending response transaction")
-            return await self.dependencies.generic_pft_utilities.process_queue_transaction(
-                wallet=node_wallet,
+            return await self.dependencies.generic_pft_utilities.send_memo(
+                wallet_seed_or_wallet=node_wallet,
                 memo=response_params.memo,
                 destination=response_params.destination,
                 pft_amount=response_params.pft_amount
@@ -719,17 +734,6 @@ class StateSyncStats:
     balances_corrected: int = 0
     transactions_queued: int = 0
     rows_inserted: int = 0
-
-    def __dict__(self):
-        return {
-            'accounts_processed': self.accounts_processed,
-            'transactions_found': self.transactions_found,
-            'accounts_with_missing_data': self.accounts_with_missing_data,
-            'balance_mismatches': self.balance_mismatches,
-            'balances_corrected': self.balances_corrected,
-            'transactions_queued': self.transactions_queued,
-            'rows_inserted': self.rows_inserted
-        }
 
 class TransactionOrchestrator:
     """
@@ -1019,7 +1023,7 @@ class TransactionOrchestrator:
                     if is_initial_sync:
                         self._initial_sync_complete = True
                     else:
-                        if any(v > 0 for k, v in state_sync_stats.__dict__.items() if k != 'accounts_processed'):
+                        if any(v > 0 for k, v in vars(state_sync_stats).items() if k != 'accounts_processed'):
                             logger.warning(
                                 "Periodic sync found inconsistencies: "
                                 f"{state_sync_stats.transactions_found} missing transactions, "

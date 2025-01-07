@@ -28,10 +28,8 @@ setup(
             'sql/*.sql',        # Include .sql files directly in sql/
         ],
     },
-    author='Alex Good',
-    author_email='alex@agti.net',
-    maintainer='Skelectric',
-    maintainer_email='skelectric@postfiat.org',
+    author='Alex Good, Skelectric',
+    author_email='alex@agti.net, skelectric@postfiat.org',
     description='Post Fiat NodeTools',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',

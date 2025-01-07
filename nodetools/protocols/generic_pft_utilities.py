@@ -1,7 +1,7 @@
-from typing import Protocol, Union, Optional, Dict, Any, List
+from typing import Protocol, Union, Optional, Dict, Any, List, Tuple
 import pandas as pd
 from xrpl.wallet import Wallet
-from xrpl.models import Memo
+from xrpl.models import Memo, Response
 from decimal import Decimal
 from nodetools.configuration.configuration import NetworkConfig, NodeConfig
 from nodetools.utilities.db_manager import DBConnectionManager
@@ -50,11 +50,11 @@ class GenericPFTUtilities(Protocol):
             compress: bool = False, 
             encrypt: bool = False,
             pft_amount: Optional[Decimal] = None
-        ) -> Union[dict, list[dict]]:
+        ) -> Union[Response, list[Response]]:
         """Send a memo to a given account"""
         ...
     
-    def verify_transaction_response(self, response: str) -> bool:
+    def verify_transaction_response(self, response: Union[Response, list[Response]]) -> bool:
         """Verify a transaction response"""
         ...
 
@@ -80,16 +80,6 @@ class GenericPFTUtilities(Protocol):
 
     async def get_all_account_compressed_messages_for_remembrancer(self, account_address: str) -> pd.DataFrame:
         """Convenience method for getting all messages for a user from the remembrancer's perspective"""
-        ...
-
-    async def process_queue_transaction(
-            self,
-            wallet: Wallet,
-            memo: str,
-            destination: str,
-            pft_amount: Optional[Union[int, float, Decimal]] = None
-        ) -> bool:
-        """Send and track a node-initiated transaction for queue processing"""
         ...
 
     async def fetch_pft_balance(self, address: str) -> Decimal:

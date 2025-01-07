@@ -410,24 +410,10 @@ class InteractionGraph:
 
     def find_matching_pattern(self, tx: Dict[str, Any]) -> Optional[str]:
         """Find the first pattern ID whose pattern matches the transaction"""
-
-        # DEBUGGING
-        # logger.debug(f"Finding pattern for transaction {tx.get('hash')}")
-
         for pattern_id, pattern in self.patterns.items():
-
-            # DEBUGGING
-            # logger.debug(f"Testing pattern '{pattern_id}' with memo_type: {pattern.memo_pattern.memo_type}")
-
             if pattern.memo_pattern.matches(tx):
-                # logger.debug(f"Found matching pattern: {pattern_id}")
                 return pattern_id
-            
-            # logger.debug(f"Pattern '{pattern_id}' did not match")
             continue
-
-            if pattern.memo_pattern.matches(tx):
-                return pattern_id
         return None
     
     def get_pattern_id_by_memo_pattern(self, memo_pattern: MemoPattern) -> Optional[str]:
