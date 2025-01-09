@@ -32,6 +32,7 @@ from loguru import logger
 # NodeTools imports
 import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
+from nodetools.models.models import MemoGroup
 from nodetools.performance.monitor import PerformanceMonitor
 from nodetools.utilities.encryption import MessageEncryption
 from nodetools.utilities.transaction_requirements import TransactionRequirementService
@@ -602,19 +603,42 @@ class GenericPFTUtilities:
             chunked_memos.append(chunk_memo)
 
         return chunked_memos
+    
+    async def send_memo_group(
+        self,
+        wallet_seed_or_wallet: Union[str, Wallet],
+        destination: str,
+        memo_group: MemoGroup,
+        pft_amount: Optional[Decimal] = None,
+    ) -> list[Response]:
+        """Send a memo group to a destination"""
+        # Handle wallet input
+        if isinstance(wallet_seed_or_wallet, str):
+            wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
+        elif isinstance(wallet_seed_or_wallet, Wallet):
+            wallet = wallet_seed_or_wallet
+        else:
+            logger.error("GenericPFTUtilities.send_memo: Invalid wallet input, raising ValueError")
+            raise ValueError("Invalid wallet input")
+        
+        responses = []
+        for memo in memo_group.memos:
+            responses.append(await self._send_memo_single(wallet, destination, memo, pft_amount))
+
+        return responses
 
     async def send_memo(self, 
-            wallet_seed_or_wallet: Union[str, xrpl.wallet.Wallet], 
-            destination: str, 
-            memo: Union[str, Memo], 
-            username: str = None,
-            message_id: str = None,
-            chunk: bool = False,
-            compress: bool = False, 
-            encrypt: bool = False,
-            pft_amount: Optional[Decimal] = None,
-            disable_pft_check: bool = False
-        ) -> Union[Response, list[Response]]:
+        wallet_seed_or_wallet: Union[str, Wallet], 
+        destination: str, 
+        memo: Union[str, Memo], 
+        username: str = None,
+        message_id: str = None,
+        chunk: bool = False,
+        compress: bool = False, 
+        encrypt: bool = False,
+        pft_amount: Optional[Decimal] = None,
+        disable_pft_check: bool = False
+    ) -> Union[Response, list[Response]]:
         """Primary method for sending memos on the XRPL with PFT requirements.
         
         This method handles all aspects of memo sending including:
@@ -648,7 +672,7 @@ class GenericPFTUtilities:
             wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
             logged_user = f"{username} ({wallet.address})" if username else wallet.address
             logger.debug(f"GenericPFTUtilities.send_memo: Spawned wallet for {logged_user} to send memo to {destination}...")
-        elif isinstance(wallet_seed_or_wallet, xrpl.wallet.Wallet):
+        elif isinstance(wallet_seed_or_wallet, Wallet):
             wallet = wallet_seed_or_wallet
         else:
             logger.error("GenericPFTUtilities.send_memo: Invalid wallet input, raising ValueError")
@@ -760,6 +784,7 @@ class GenericPFTUtilities:
             logger.error(traceback.format_exc())
             raise
     
+    # TODO: Deprecate this method, move its functionality to memo_processor.py
     def _reconstruct_chunked_message(
         self,
         memo_type: str,
@@ -838,6 +863,7 @@ class GenericPFTUtilities:
             # logger.error(f"GenericPFTUtilities._reconstruct_chunked_message: Error reconstructing message {memo_type}: {e}")
             return None
 
+    # TODO: Deprecate this method, move its functionality to memo_processor.py
     async def process_memo_data(
         self,
         memo_type: str,

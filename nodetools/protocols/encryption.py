@@ -40,3 +40,8 @@ class MessageEncryption(Protocol):
             ValueError: If the message fails decryption
         """
         ...
+
+    @staticmethod
+    def encrypt_memo(memo: str, shared_secret: str) -> str:
+        """ Encrypts a memo using a shared secret """
+        ...

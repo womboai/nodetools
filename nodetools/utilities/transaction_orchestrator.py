@@ -36,7 +36,6 @@ from nodetools.protocols.credentials import CredentialManager
 from nodetools.protocols.openrouter import OpenRouterTool
 from nodetools.protocols.encryption import MessageEncryption
 from nodetools.protocols.xrpl_monitor import XRPLWebSocketMonitor
-from nodetools.protocols.db_manager import DBConnectionManager
 from nodetools.utilities.compression import CompressionError
 from nodetools.configuration.configuration import NodeConfig, NetworkConfig
 from nodetools.configuration.constants import VERIFY_STATE_INTERVAL
@@ -195,7 +194,7 @@ class TransactionReviewer:
         
         # Try processing the group
         try:
-            processed_content = await MemoProcessor.process_group(
+            processed_content = await MemoProcessor.parse_group(
                 group,
                 credential_manager=self.dependencies.credential_manager,
                 message_encryption=self.dependencies.message_encryption,
@@ -646,6 +645,14 @@ class ResponseProcessor:
             logger.debug(f"ResponseProcessor_{self.pattern_id}: Constructing response")
             response_params: ResponseParameters = await self.generator.construct_response(tx, evaluation)
 
+            # Construct memo group based on response parameters
+            memo_group = await MemoProcessor.construct_group(
+                response_params=response_params,
+                credential_manager=self.dependencies.credential_manager,
+                message_encryption=self.dependencies.message_encryption,
+                node_config=self.dependencies.node_config
+            )
+
             # Get appropriate wallet based on source
             node_wallet = self.dependencies.generic_pft_utilities.spawn_wallet_from_seed(
                 self.dependencies.credential_manager.get_credential(f'{response_params.source}__v1xrpsecret')
@@ -653,9 +660,9 @@ class ResponseProcessor:
 
             # Send response transaction
             logger.debug(f"ResponseProcessor_{self.pattern_id}: Sending response transaction")
-            return await self.dependencies.generic_pft_utilities.send_memo(
+            return await self.dependencies.generic_pft_utilities.send_memo_group(
                 wallet_seed_or_wallet=node_wallet,
-                memo=response_params.memo,
+                memo_group=memo_group,
                 destination=response_params.destination,
                 pft_amount=response_params.pft_amount
             )

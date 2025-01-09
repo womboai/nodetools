@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Set, Optional, Dict, Any, Pattern, TYPE_CHECKING, List
+from typing import Set, Optional, Dict, Any, Pattern, TYPE_CHECKING, List, Union
 from enum import Enum
 from loguru import logger
 from decimal import Decimal
@@ -13,7 +13,6 @@ if TYPE_CHECKING:
     from nodetools.protocols.openrouter import OpenRouterTool
     from nodetools.protocols.transaction_repository import TransactionRepository
     from nodetools.protocols.encryption import MessageEncryption
-    from nodetools.protocols.db_manager import DBConnectionManager
     from nodetools.configuration.configuration import NodeConfig, NetworkConfig
 
 class InteractionType(Enum):
@@ -21,7 +20,13 @@ class InteractionType(Enum):
     RESPONSE = "response"
     STANDALONE = "standalone"
 
+class MemoVersion(Enum):
+    """Versions of the standardized memo format"""
+    V1 = "1"  # Initial version with e.b.c format
+
 class MemoDataStructureType(Enum):
+    """Components of the standardized memo format"""
+    VERSION = "v"   # Version prefix
     ECDH = "e"      # Encryption
     BROTLI = "b"    # Compression
     CHUNK = "c"     # Chunking
@@ -40,13 +45,17 @@ class Dependencies:
 
 @dataclass
 class MemoStructure:
-    """Describes how a memo is structured across transactions"""
+    """
+    Describes how a memo is structured across transactions.
+    This is designed to be used for parsing memos from transactions, but not for constructing memo groups.
+    """
     is_chunked: bool
     chunk_index: Optional[int] = None
     total_chunks: Optional[int] = None
     group_id: Optional[str] = None
     compression_type: Optional[MemoDataStructureType] = None  # Might be unknown until processing
     encryption_type: Optional[MemoDataStructureType] = None   # Might be unknown until processing
+    version: Optional[MemoVersion] = None
     is_standardized_format: bool = False  
 
     @property
@@ -59,28 +68,35 @@ class MemoStructure:
         """
         Check if memo_format follows the standardized format.
         Examples:
-            "e.b.c1/4"  # encrypted, compressed, chunk 1 of 4
-            "-.b.c2/4"  # not encrypted, compressed, chunk 2 of 4
-            "-.-.-"     # no special processing
+            "v1.e.b.c1/4"  # version 1, encrypted, compressed, chunk 1 of 4
+            "v1.-.b.c2/4"  # version 1, not encrypted, compressed, chunk 2 of 4
+            "v1.-.-.-"     # version 1, no special processing
         """
         if not memo_format:
             return False
         
         parts = memo_format.split(".")
-        if len(parts) != 3:
+        if len(parts) != 4:
             return False
         
-        encryption, compression, chunking = parts
+        version, encryption, compression, chunking = parts
 
-        # Validate encryption part
+        # Validate version
+        if not version.startswith(MemoDataStructureType.VERSION.value):
+            return False
+        version_num = version[1:]  # Remove 'v' prefix
+        if version_num not in {v.value for v in MemoVersion}:
+            return False
+
+        # Validate encryption
         if encryption not in {MemoDataStructureType.ECDH.value, MemoDataStructureType.NONE.value}:
             return False
             
-        # Validate compression part
+        # Validate compression
         if compression not in {MemoDataStructureType.BROTLI.value, MemoDataStructureType.NONE.value}:
             return False
             
-        # Validate chunking part
+        # Validate chunking
         if chunking != MemoDataStructureType.NONE.value:
             chunk_match = re.match(fr'{MemoDataStructureType.CHUNK.value}\d+/\d+', chunking)
             if not chunk_match:
@@ -91,7 +107,10 @@ class MemoStructure:
     @classmethod
     def parse_standardized_format(cls, memo_format: str) -> 'MemoStructure':
         """Parse a validated standardized memo_format string."""
-        encryption, compression, chunking = memo_format.split(".")
+        version, encryption, compression, chunking = memo_format.split(".")
+
+        # Parse version
+        version_type = MemoVersion(version[1:])  # Remove 'v' prefix and convert to enum
 
         # Parse encryption
         encryption_type = (
@@ -121,6 +140,7 @@ class MemoStructure:
             group_id=None,  # Will be set from tx
             compression_type=compression_type,
             encryption_type=encryption_type,
+            version=version_type,
             is_standardized_format=True
         )
     
@@ -187,7 +207,7 @@ class MemoGroup:
     Additional processing can be applied to the unchunked memo_data.
     """
     group_id: str
-    memos: List[Dict[str, Any]]
+    memos: List[Union[Dict[str, Any], Memo]]  # Supports both parsed txs and Memo objects
     structure: Optional[MemoStructure] = None
 
     @classmethod
@@ -198,6 +218,16 @@ class MemoGroup:
             group_id=tx.get("memo_type"),
             memos=[tx],
             structure=structure,
+        )
+    
+    @classmethod
+    def create_from_memos(cls, memos: List[Memo]) -> 'MemoGroup':
+        """Create a new message group from constructed memos"""
+        structure = MemoStructure.from_transaction(memos[0])
+        return cls(
+            group_id=memos[0].memo_type,
+            memos=memos,
+            structure=structure
         )
     
     def _is_structure_consistent(self, new_structure: MemoStructure) -> bool:
@@ -458,11 +488,82 @@ class RequestRule(InteractionRule):
 
 @dataclass
 class ResponseParameters:
-    """Standardized response parameters for transaction construction"""
+    """
+    Response parameters for transaction construction.
+    
+    For standardized memos:
+    - memo_type and memo_data are provided directly
+    - memo_format will be constructed during processing
+    
+    For legacy memos:
+    - memo contains the pre-constructed Memo object
+    - memo_type and memo_data should be None
+    """
     source: str  # Name of the address that should send the response
-    memo: Memo  # XRPL memo object
     destination: str  # XRPL destination address
+    memo: Optional[Memo] = None  # Pre-constructed memo for legacy format
+    memo_type: Optional[str] = None  # Unique group ID for standardized memos
+    memo_data: Optional[str] = None  # Payload for standardized memos
     pft_amount: Optional[Decimal] = None  # Optional PFT amount for the transaction
+    should_encrypt: bool = False  # Whether the memo should be encrypted
+    should_compress: bool = False  # Whether the memo should be compressed
+    should_chunk: bool = False  # Whether the memo should be chunked
+    processed_memo: Optional[Union[Memo, List[Memo]]] = None  # The final XRPL memo after processing
+    legacy_memo: bool = True  # Whether the memo should be in legacy format
+
+    def __post_init__(self):
+        """Validate memo configuration"""
+        if self.legacy_memo:
+            if self.memo is None:
+                raise ValueError("Legacy memo requires pre-constructed Memo object")
+            if self.memo_type is not None or self.memo_data is not None:
+                raise ValueError("Legacy memos cannot have memo_type or memo_data")
+            
+        else:
+            if self.memo is not None:
+                raise ValueError("Standardized memos should not have pre-constructed Memo object")
+            if self.memo_type is None or self.memo_data is None:
+                raise ValueError("Standardized memos must have memo_type and memo_data")
+            
+    @classmethod
+    def construct_legacy_memo(
+        cls,
+        source: str,
+        destination: str,
+        memo: Memo,
+        pft_amount: Optional[Decimal] = None
+    ) -> 'ResponseParameters':
+        """Create ResponseParameters for a legacy memo."""
+        return cls(
+            source=source,
+            destination=destination,
+            memo=memo,
+            pft_amount=pft_amount,
+            legacy_memo=True
+        )
+
+    @classmethod
+    def construct_standardized_memo(
+        cls,
+        source: str,
+        destination: str,
+        memo_data: str,
+        memo_type: str,
+        should_encrypt: bool = False,
+        should_compress: bool = False,
+        pft_amount: Optional[Decimal] = None
+    ) -> 'ResponseParameters':
+        """Create ResponseParameters for a standardized memo."""
+        return cls(
+            source=source,
+            destination=destination,
+            memo_data=memo_data,
+            memo_type=memo_type,
+            should_encrypt=should_encrypt,
+            should_compress=should_compress,
+            pft_amount=pft_amount,
+            legacy_memo=False
+        )
 
 class ResponseGenerator(ABC):
     """Abstract base class defining how to generate a response"""

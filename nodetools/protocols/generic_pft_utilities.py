@@ -7,6 +7,7 @@ from nodetools.configuration.configuration import NetworkConfig, NodeConfig
 from nodetools.utilities.db_manager import DBConnectionManager
 from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
 from nodetools.protocols.transaction_repository import TransactionRepository
+from nodetools.models.models import MemoGroup
 
 class GenericPFTUtilities(Protocol):
     """Protocol defining the interface for GenericPFTUtilities implementations"""
@@ -38,6 +39,16 @@ class GenericPFTUtilities(Protocol):
 
     async def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
         """Get memo history for a given account"""
+        ...
+
+    async def send_memo_group(
+        self,
+        wallet_seed_or_wallet: Union[str, Wallet],
+        destination: str,
+        memo_group: MemoGroup,
+        pft_amount: Optional[Decimal] = None,
+    ) -> list[Response]:
+        """Send a memo group to a destination"""
         ...
 
     async def send_memo(self, 
