@@ -2,6 +2,7 @@
 from typing import List, Dict, Any, Optional, Union
 import re
 import traceback
+import asyncio
 # Third party imports
 import xrpl
 from loguru import logger
@@ -49,6 +50,7 @@ class LegacyMemoProcessor:
 
         Raises exception if processing fails.
         """
+        await asyncio.sleep(0)  # Ensure this is a coroutine
         if not group:
             raise ValueError("Empty sequence")
 
@@ -176,6 +178,7 @@ class StandardizedMemoProcessor:
         
         Raises ValueError if group is incomplete or processing fails.
         """
+        await asyncio.sleep(0)  # Ensure this is a coroutine
         if not group.memos:
             raise ValueError("Empty group")
         
