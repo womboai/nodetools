@@ -10,7 +10,7 @@ import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
 from nodetools.utilities.ecdh import ECDHUtils
 
-CREDENTIALS_DB_FILENAME = "credentials.sqlite"
+CREDENTIALS_DB_FILENAME = "node_credentials.sqlite"
 BACKUP_SUFFIX = ".sqlite_backup"
 KEY_EXPIRY = -1  # No expiration by default
 

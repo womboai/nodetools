@@ -11,7 +11,7 @@ from xrpl.utils import str_to_hex
 from loguru import logger
 from cryptography.fernet import InvalidToken
 # Local imports
-from nodetools.models.models import MemoGroup, MemoStructure, MemoDataStructureType, ResponseParameters
+from nodetools.models.models import MemoGroup, MemoStructure, MemoDataStructureType, ResponseParameters, MemoTransaction
 from nodetools.utilities.compression import compress_data, decompress_data, CompressionError
 from nodetools.protocols.encryption import MessageEncryption
 from nodetools.protocols.credentials import CredentialManager
@@ -370,11 +370,11 @@ class StandardizedMemoProcessor:
             
             processed_data = ''
             for tx in sorted_msgs:
-                processed_data += tx['memo_data']
+                processed_data += tx.memo_data
                 
         else:
             # Single message
-            processed_data = group.memos[0]['memo_data']
+            processed_data = group.memos[0].memo_data
         
         # Apply decompression if specified
         if structure.compression_type == MemoDataStructureType.BROTLI:
@@ -402,12 +402,12 @@ class StandardizedMemoProcessor:
             # For example, if the message is from the node to the user, the account is the node's address and the destination is the user's address
             # But the channel address must always be the node's address, and the channel counterparty must always be the user's address
             # node_config.auto_handshake_addresses corresponds to the node's addresses that support encrypted channels
-            if first_tx['destination'] in node_config.auto_handshake_addresses:
-                channel_address = first_tx['destination']
-                channel_counterparty = first_tx['account']
+            if first_tx.destination in node_config.auto_handshake_addresses:
+                channel_address = first_tx.destination
+                channel_counterparty = first_tx.account
             else:  # The message is from the user to the node
-                channel_address = first_tx['account']
-                channel_counterparty = first_tx['destination']
+                channel_address = first_tx.account
+                channel_counterparty = first_tx.destination
 
             try:
                 # Determine secret type based on receiving address
@@ -591,10 +591,7 @@ class StandardizedMemoProcessor:
             )
             memos.append(memo)
 
-        return MemoGroup.create_from_memos(
-            group_id=response_params.memo_type,
-            memos=memos
-        )
+        return MemoGroup.create_from_memos(memos=memos)
 
 class LegacyMemoProcessor:
     """Handles processing of legacy format memos"""
@@ -644,7 +641,7 @@ class LegacyMemoProcessor:
         # Join chunks (removing chunk prefixes)
         processed_data = ''
         for tx in sorted_sequence:
-            chunk_data = tx['memo_data']
+            chunk_data = tx.memo_data
             if chunk_match := re.match(r'^chunk_\d+__', chunk_data):
                 chunk_data = chunk_data[len(chunk_match.group(0)):]
             processed_data += chunk_data
@@ -675,12 +672,12 @@ class LegacyMemoProcessor:
             # For example, if the message is from the node to the user, the account is the node's address and the destination is the user's address
             # But the channel address must always be the node's address, and the channel counterparty must always be the user's address
             # node_config.auto_handshake_addresses corresponds to the node's addresses that support encrypted channels
-            if first_tx['destination'] in node_config.auto_handshake_addresses:
-                channel_address = first_tx['destination']
-                channel_counterparty = first_tx['account']
+            if first_tx.destination in node_config.auto_handshake_addresses:
+                channel_address = first_tx.destination
+                channel_counterparty = first_tx.account
             else:  # The message is from the user to the node
-                channel_address = first_tx['account']
-                channel_counterparty = first_tx['destination']
+                channel_address = first_tx.account
+                channel_counterparty = first_tx.destination
             
             try:
                 # Determine secret type based on receiving address
@@ -806,15 +803,9 @@ class LegacyMemoProcessor:
             # Encode each chunk for XRPL
             encoded_memos = [encode_memo(memo) for memo in chunked_memos]
 
-            return MemoGroup.create_from_memos(
-                group_id=base_memo.memo_type,
-                memos=encoded_memos
-            )
+            return MemoGroup.create_from_memos(memos=encoded_memos)
             
         else:
             # Single memo case - encode for XRPL
             encoded_memo = encode_memo(base_memo)
-            return MemoGroup.create_from_memos(
-                group_id=response_params.memo_type, 
-                memos=[encoded_memo]
-            )
+            return MemoGroup.create_from_memos(memos=[encoded_memo])

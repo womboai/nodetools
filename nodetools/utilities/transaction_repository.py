@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Optional, TYPE_CHECKING, Tuple, Union
 from loguru import logger
 from nodetools.utilities.db_manager import DBConnectionManager
 from nodetools.sql.sql_manager import SQLManager
+from nodetools.models.models import MemoTransaction
 import traceback
 import json
 from decimal import Decimal
@@ -229,10 +230,10 @@ class TransactionRepository:
 
     async def get_unprocessed_transactions(
         self, 
-        order_by: str = "close_time_iso ASC",
+        order_by: str = "datetime ASC",
         limit: Optional[int] = None,
         include_processed: bool = False
-    ) -> List[Dict[str, Any]]:
+    ) -> List[MemoTransaction]:
         """Get transactions that haven't been processed yet.
         
         Args:
@@ -241,7 +242,7 @@ class TransactionRepository:
             include_processed: If True, includes all transactions regardless of processing status
             
         Returns:
-            List of dictionaries containing transaction data
+            List of MemoTransaction objects
         """
         params = [
             include_processed,
@@ -251,11 +252,13 @@ class TransactionRepository:
             limit          # For actual limit value
         ]
         
-        return await self._execute_query(
+        results = await self._execute_query(
             query_name='get_unprocessed_transactions',
             query_category='xrpl',
             params=params
         )
+        
+        return [MemoTransaction(**tx) for tx in results]
 
     async def store_reviewing_result(self, result: 'ReviewingResult') -> None:
         """Store the reviewing result for a transaction
@@ -263,8 +266,9 @@ class TransactionRepository:
         Args:
             result: ReviewingResult object containing transaction processing outcome
         """
+        result_tx : MemoTransaction = result.tx
         params = [
-            result.tx['hash'],
+            result_tx.hash,
             result.processed,
             result.rule_name,
             result.response_tx_hash,
@@ -278,7 +282,7 @@ class TransactionRepository:
         )
 
     async def batch_insert_transactions(self, tx_list: List[Dict[str, Any]]) -> int:
-        """Batch insert transactions into postfiat_tx_cache.
+        """Batch insert raw XRPL transactions into postfiat_tx_cache.
         
         Args:
             tx_list: List of transaction dictionaries
@@ -361,7 +365,6 @@ class TransactionRepository:
         Returns:
             Dict containing transaction data with decoded memos if found, None otherwise
         """
-        # TODO: Adjust get_decoded_memo to query the transaction_memos table instead of the decoded_memos view
         result = await self._execute_query(
             query_name='get_decoded_memo',
             query_category='xrpl',

@@ -1,1 +1,1 @@
-SELECT * FROM decoded_memos WHERE hash = $1
+SELECT * from transaction_memos WHERE hash = $1

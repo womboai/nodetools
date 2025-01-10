@@ -1,4 +1,5 @@
 from typing import Protocol, TYPE_CHECKING, List, Dict, Any, Optional
+from nodetools.models.models import MemoTransaction
 from decimal import Decimal
 
 if TYPE_CHECKING:
@@ -9,17 +10,19 @@ class TransactionRepository(Protocol):
 
     async def get_unprocessed_transactions(
         self, 
-        order_by: str = "close_time_iso ASC",
+        order_by: str = "datetime ASC",
         limit: Optional[int] = None,
         include_processed: bool = False
-    ) -> List[Dict[str, Any]]:
-        """
-        Get transactions that haven't been processed yet.
+    ) -> List[MemoTransaction]:
+        """Get transactions that haven't been processed yet.
         
         Args:
             order_by: SQL ORDER BY clause
             limit: Optional limit on number of transactions to return
             include_processed: If True, includes all transactions regardless of processing status
+            
+        Returns:
+            List of MemoTransaction objects
         """
         ...
 

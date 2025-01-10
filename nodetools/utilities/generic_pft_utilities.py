@@ -51,12 +51,6 @@ class GenericPFTUtilities:
     _instance = None
     _initialized = False
 
-    TX_JSON_FIELDS = [
-        'Account', 'DeliverMax', 'Destination', 'Fee', 'Flags',
-        'LastLedgerSequence', 'Sequence', 'SigningPubKey', 
-        'TransactionType', 'TxnSignature', 'date', 'ledger_index', 'Memos'
-    ]
-
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
@@ -247,7 +241,7 @@ class GenericPFTUtilities:
             response: Transaction response from submit_and_wait
 
         Returns:
-            Tuple[bool, Response]: True if the transaction was successful, False otherwise
+            bool: True if the transaction was successful, False otherwise
         """
         try:
             # Handle list of responses
@@ -749,7 +743,7 @@ class GenericPFTUtilities:
         else:
             return await self._send_memo_single(wallet, destination, memo, pft_amount)
 
-    async def _send_memo_single(self, wallet: Wallet, destination: str, memo: Memo, pft_amount: Decimal) -> Response:
+    async def _send_memo_single(self, wallet: Wallet, destination: str, memo: Memo, pft_amount: Optional[Decimal] = None) -> Response:
         """ Sends a single memo to a destination """
         client = AsyncJsonRpcClient(self.https_url)
 
@@ -759,7 +753,7 @@ class GenericPFTUtilities:
             "memos": [memo]
         }
 
-        if pft_amount > 0:
+        if pft_amount and pft_amount > 0:
             payment_args["amount"] = xrpl.models.amounts.IssuedCurrencyAmount(
                 currency="PFT",
                 issuer=self.pft_issuer,
