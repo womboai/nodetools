@@ -1003,15 +1003,33 @@ class TransactionOrchestrator:
         Returns:
             int: Number of transactions queued
         """
-        logger.debug("TransactionOrchestrator: Getting unprocessed transactions")
-        unprocessed_txs = await self.transaction_repository.get_unprocessed_transactions(
-            order_by="datetime ASC",
-            include_processed=False   # Set to True for debugging only
-        )
-        logger.debug(f"TransactionOrchestrator: Found {len(unprocessed_txs)} unprocessed transactions")
+        BATCH_SIZE = 1000
+        offset = 0
+        total_queued = 0
 
-        for tx in unprocessed_txs:
-            await self.review_queue.put(tx)
+        while True:
+            logger.debug(f"TransactionOrchestrator: Getting unprocessed transactions batch (offset: {offset})")
+            batch = await self.transaction_repository.get_unprocessed_transactions(
+                order_by="datetime ASC",
+                include_processed=False,   # Set to True for debugging only
+                offset=offset,
+                limit=BATCH_SIZE
+            )
+            if not batch:
+                break
+            
+            for tx in batch:
+                await self.review_queue.put(tx)
+                total_queued += 1
+
+            if len(batch) < BATCH_SIZE:
+                break
+
+            offset += BATCH_SIZE
+            logger.debug(f"TransactionOrchestrator: Queued {total_queued} unprocessed transactions")
+
+        logger.info(f"TransactionOrchestrator: Total unprocessed transactions queued: {total_queued}")
+        return total_queued
 
     async def _state_sync_loop(self):
         """Handles initial and periodic state synchronization between XRPL and local database"""

@@ -82,14 +82,14 @@ class TransactionRepository(Protocol):
         """
         ...
 
-    async def get_decoded_memo_w_processing(self, tx_hash: str) -> Optional[Dict[str, Any]]:
+    async def get_decoded_memo_w_processing(self, tx_hash: str) -> Optional[MemoTransaction]:
         """Get a specific transaction with decoded memos and processing results by hash.
         
         Args:
             tx_hash: The transaction hash to look up
             
         Returns:
-            Dict containing transaction data with decoded memos if found, None otherwise
+            MemoTransaction object with decoded memos and processing results if found, None otherwise
         """
         ...
 

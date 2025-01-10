@@ -181,6 +181,7 @@ class TransactionRepository:
             logger.error(traceback.format_exc())
             raise
 
+    # TODO: Adjust to return MemoTransaction objects instead of dictionaries
     async def get_account_memo_history(
         self,
         account_address: str,
@@ -204,6 +205,7 @@ class TransactionRepository:
             enforce_column_structure=True
         )
     
+    # TODO: Adjust to return MemoTransaction objects instead of dictionaries
     async def get_account_memo_histories(self, wallet_addresses: List[str]) -> List[Dict[str, Any]]:
         """Get all transaction histories for the specified wallet addresses.
         
@@ -232,6 +234,7 @@ class TransactionRepository:
         self, 
         order_by: str = "datetime ASC",
         limit: Optional[int] = None,
+        offset: Optional[int] = None,
         include_processed: bool = False
     ) -> List[MemoTransaction]:
         """Get transactions that haven't been processed yet.
@@ -239,6 +242,7 @@ class TransactionRepository:
         Args:
             order_by: SQL ORDER BY clause
             limit: Optional limit on number of transactions to return
+            offset: Optional offset for pagination
             include_processed: If True, includes all transactions regardless of processing status
             
         Returns:
@@ -246,10 +250,9 @@ class TransactionRepository:
         """
         params = [
             include_processed,
-            order_by,      # First usage in ORDER BY
-            order_by,      # Second usage in ORDER BY
-            limit,         # For CASE WHEN NULL check
-            limit          # For actual limit value
+            order_by,
+            offset,
+            limit
         ]
         
         results = await self._execute_query(
@@ -316,14 +319,14 @@ class TransactionRepository:
             count_params=[hash_array]
         ) or 0  # Return 0 if None is returned
 
-    async def insert_transaction(self, tx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def insert_transaction(self, tx: Dict[str, Any]) -> Optional[MemoTransaction]:
         """Insert a single transaction and return the processed record.
         
         Args:
             tx: Transaction dictionary to insert
             
         Returns:
-            Optional[Dict[str, Any]]: Processed record if found, None if not found
+            Optional[MemoTransaction]: Processed record if found, None if not found
         """
         try:
             # Insert the transaction
@@ -349,21 +352,21 @@ class TransactionRepository:
                 params=[tx["hash"]]
             )
             
-            return result[0] if result and result[0]['hash'] is not None else None
+            return MemoTransaction(**result[0]) if result and result[0]['hash'] is not None else None
 
         except Exception as e:
             logger.error(f"Error storing transaction: {e}")
             logger.error(traceback.format_exc())
             return None
         
-    async def get_decoded_memo(self, tx_hash: str) -> Optional[Dict[str, Any]]:
+    async def get_decoded_memo(self, tx_hash: str) -> Optional[MemoTransaction]:
         """Get a specific transaction with decoded memos by hash.
         
         Args:
             tx_hash: The transaction hash to look up
             
         Returns:
-            Dict containing transaction data with decoded memos if found, None otherwise
+            MemoTransaction object with decoded memos if found, None otherwise
         """
         result = await self._execute_query(
             query_name='get_decoded_memo',
@@ -371,16 +374,16 @@ class TransactionRepository:
             params=[tx_hash]
         )
         
-        return result[0] if result and result[0]['hash'] is not None else None
+        return MemoTransaction(**result[0]) if result and result[0]['hash'] is not None else None
         
-    async def get_decoded_memo_w_processing(self, tx_hash: str) -> Optional[Dict[str, Any]]:
+    async def get_decoded_memo_w_processing(self, tx_hash: str) -> Optional[MemoTransaction]:
         """Get a specific transaction with decoded memos and processing results by hash.
         
         Args:
             tx_hash: The transaction hash to look up
             
         Returns:
-            Dict containing transaction data with decoded memos if found, None otherwise
+            MemoTransaction object with decoded memos and processing results if found, None otherwise
         """
         result = await self._execute_query(
             query_name='get_decoded_memo_w_processing',
@@ -388,7 +391,7 @@ class TransactionRepository:
             params=[tx_hash]
         )
         
-        return result[0] if result and result[0]['hash'] is not None else None
+        return MemoTransaction(**result[0]) if result and result[0]['hash'] is not None else None
     
     async def get_last_ledger_index(self, account: str) -> Optional[int]:
         """Get the last processed ledger index for an account.

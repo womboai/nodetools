@@ -28,7 +28,8 @@ SELECT
     (p.close_time_iso::timestamp)::date as simple_date,
     (p.tx_json_parsed->'Memos'->0->'Memo') as main_memo_data
 FROM parsed_json p
-LEFT JOIN transaction_memos tm ON p.hash = tm.hash;
+LEFT JOIN transaction_memos tm ON p.hash = tm.hash
+ORDER BY p.close_time_iso::timestamp DESC;
 
 CREATE VIEW enriched_transaction_results AS
 SELECT 
@@ -48,4 +49,5 @@ SELECT
     m.datetime,
     m.transaction_result
 FROM transaction_processing_results r
-LEFT JOIN transaction_memos m ON r.hash = m.hash;
+LEFT JOIN transaction_memos m ON r.hash = m.hash
+ORDER BY m.datetime DESC;
