@@ -32,3 +32,10 @@ class SystemMemoType(Enum):
     # INITIATION_GRANT = 'discord_wallet_funding'  # TODO: Deprecate this
 
 SYSTEM_MEMO_TYPES = [memo_type.value for memo_type in SystemMemoType]
+
+
+class PFTSendDistribution(Enum):
+    """Controls how PFT amounts are distributed across memo chunks"""
+    DISTRIBUTE_EVENLY = "distribute_evenly"  # Split total PFT amount evenly across all chunks
+    LAST_CHUNK_ONLY = "last_chunk_only"     # Send entire PFT amount with last chunk only
+    FULL_AMOUNT_EACH = "full_amount_each"   # Send full PFT amount with each chunk

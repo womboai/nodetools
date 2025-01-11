@@ -32,7 +32,9 @@ from loguru import logger
 # NodeTools imports
 import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
-from nodetools.models.models import MemoGroup
+from nodetools.configuration.constants import PFTSendDistribution
+from nodetools.models.models import MemoGroup, MemoConstructionParameters
+from nodetools.models.memo_processor import MemoProcessor
 from nodetools.performance.monitor import PerformanceMonitor
 from nodetools.utilities.encryption import MessageEncryption
 from nodetools.utilities.transaction_requirements import TransactionRequirementService
@@ -266,112 +268,6 @@ class GenericPFTUtilities:
             logger.error(f"Error verifying transaction response: {e}")
             logger.error(traceback.format_exc())
             return False
-    
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def generate_custom_id():
-        """ Generate a unique memo_type """
-        letters = ''.join(random.choices(string.ascii_uppercase, k=2))
-        numbers = ''.join(random.choices(string.digits, k=2))
-        second_part = letters + numbers
-        date_string = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        output= date_string+'__'+second_part
-        output = output.replace(' ',"_")
-        return output
-
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def decode_xrpl_memo(memo_dict):
-        """Convert hex-encoded memo fields to readable text.
-        
-        Args:
-            memo_dict: Dictionary containing hex-encoded memo fields
-                (MemoFormat, MemoType, MemoData)
-                
-        Returns:
-            dict: Dictionary with decoded text values for each memo field
-        """
-        memo_fields = {
-            'MemoFormat': '',
-            'MemoType': '',
-            'MemoData': ''
-        }
-        
-        for field in memo_fields:
-            try:
-                if field in memo_dict:
-                    memo_fields[field] = GenericPFTUtilities.hex_to_text(memo_dict[field])
-            except Exception as e:
-                logger.debug(f"Failed to decode {field}: {e}")
-                
-        return memo_fields
-    
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def calculate_memo_size(memo_format: str, memo_type: str, memo_data: str) -> dict:
-        """
-        Calculates the size components of a memo using consistent logic.
-        
-        Args:
-            memo_format: The format field (usually username)
-            memo_type: The type field (usually task_id)
-            memo_data: The data field (the actual content)
-            
-        Returns:
-            dict: Size breakdown including:
-                - format_size: Size of hex-encoded format
-                - type_size: Size of hex-encoded type
-                - data_size: Size of hex-encoded data
-                - structural_overhead: Fixed overhead for JSON structure
-                - total_size: Total size including all components
-        """
-        format_size = len(str_to_hex(memo_format))
-        type_size = len(str_to_hex(memo_type))
-        data_size = len(str_to_hex(memo_data))
-        structural_overhead = global_constants.XRP_MEMO_STRUCTURAL_OVERHEAD
-
-        logger.debug(f"Memo size breakdown:")
-        logger.debug(f"  format_size: {format_size}")
-        logger.debug(f"  type_size: {type_size}")
-        logger.debug(f"  data_size: {data_size}")
-        logger.debug(f"  structural_overhead: {structural_overhead}")
-        logger.debug(f"  total_size: {format_size + type_size + data_size + structural_overhead}")
-
-        return {
-            'format_size': format_size,
-            'type_size': type_size,
-            'data_size': data_size,
-            'structural_overhead': structural_overhead,
-            'total_size': format_size + type_size + data_size + structural_overhead
-        }
-
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def construct_memo(memo_format, memo_type, memo_data, validate_size=False):
-        """Constructs a memo object, checking total size"""
-        # NOTE: This is a hack and appears too conservative
-        # NOTE: We don't know if this is the correct way calculate the XRPL size limits
-        # NOTE: This will raise an error even when a transaction might otherwise succeed
-        if validate_size:
-            size_info = GenericPFTUtilities.calculate_memo_size(memo_format, memo_type, memo_data)
-            if GenericPFTUtilities.is_over_1kb(size_info['total_size']):
-                raise ValueError(f"Memo exceeds 1 KB, raising ValueError: {size_info['total_size']}")
-
-        return Memo(
-            memo_data=GenericPFTUtilities.to_hex(memo_data),
-            memo_type=GenericPFTUtilities.to_hex(memo_type),
-            memo_format=GenericPFTUtilities.to_hex(memo_format)
-        )
-    
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def construct_handshake_memo(user, ecdh_public_key):
-        """Constructs a handshake memo for encrypted communication"""
-        return GenericPFTUtilities.construct_memo(
-            memo_data=ecdh_public_key,
-            memo_type=global_constants.SystemMemoType.HANDSHAKE.value,
-            memo_format=user
-        )
 
     async def send_xrp(
             self,
@@ -466,137 +362,6 @@ class GenericPFTUtilities:
         The channel private key is the wallet secret.
         """
         return self.message_encryption.get_shared_secret(received_public_key, channel_private_key)
-
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def decode_memo_fields_to_dict(memo: Union[xrpl.models.transactions.Memo, dict]):
-        """Decodes hex-encoded XRP memo fields from a dictionary to a more readable dictionary format."""
-        # Handle xrpl.models.transactions.Memo objects
-        if hasattr(memo, 'memo_format'):  # This is a Memo object
-            fields = {
-                'memo_format': memo.memo_format,
-                'memo_type': memo.memo_type,
-                'memo_data': memo.memo_data
-            }
-        else:  # This is a dictionary from transaction JSON
-            fields = {
-                'memo_format': memo.get('MemoFormat', ''),
-                'memo_type': memo.get('MemoType', ''),
-                'memo_data': memo.get('MemoData', '')
-            }
-        
-        return {
-            key: GenericPFTUtilities.hex_to_text(value or '')
-            for key, value in fields.items()
-        }
-    
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def calculate_required_chunks(memo: Memo, max_size: int = global_constants.MAX_CHUNK_SIZE) -> int:
-        """
-        Calculates how many chunks will be needed to send a memo.
-        
-        Args:
-            memo: Original Memo object to analyze
-            max_size: Maximum size in bytes for each complete Memo object
-            
-        Returns:
-            int: Number of chunks required
-            
-        Raises:
-            ValueError: If the memo cannot be chunked (overhead too large)
-        """
-        # Extract memo components
-        memo_dict = GenericPFTUtilities.decode_memo_fields_to_dict(memo)
-        memo_format = memo_dict['memo_format']
-        memo_type = memo_dict['memo_type']
-        memo_data = memo_dict['memo_data']
-
-        logger.debug(f"Deconstructed (plaintext) memo sizes: "
-                    f"memo_format: {len(memo_format)}, "
-                    f"memo_type: {len(memo_type)}, "
-                    f"memo_data: {len(memo_data)}")
-
-        # Calculate overhead sizes
-        size_info = GenericPFTUtilities.calculate_memo_size(memo_format, memo_type, "chunk_999__")  # assuming chunk_999__ is worst-case chunk label overhead
-        max_data_size = max_size - size_info['total_size']
-
-        logger.debug(f"Size allocation:")
-        logger.debug(f"  Max size: {max_size}")
-        logger.debug(f"  Total overhead: {size_info['total_size']}")
-        logger.debug(f"  Available for data: {max_size} - {size_info['total_size']} = {max_data_size}")
-
-        if max_data_size <= 0:
-            raise ValueError(
-                f"No space for data: max_size={max_size}, total_overhead={size_info['total_size']}"
-            )
-        
-        # Calculate number of chunks needed
-        data_bytes = memo_data.encode('utf-8')
-        required_chunks = math.ceil(len(data_bytes) / max_data_size)
-        required_chunks = 1 if required_chunks == 0 else required_chunks
-        return required_chunks
-    
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def _chunk_memos(memo: Memo, max_size: int = global_constants.MAX_CHUNK_SIZE) -> List[Memo]:
-        """
-        Splits a Memo object into multiple Memo objects, each under MAX_CHUNK_SIZE bytes.
-        Only chunks the memo_data field while preserving memo_format and memo_type.
-        
-        Args:
-            memo: Original Memo object to split
-            max_size: Maximum size in bytes for each complete Memo object
-            
-        Returns:
-            List of Memo objects, each under max_size bytes
-        """
-        logger.debug("Chunking memo...")
-
-        # Extract memo components
-        memo_dict = GenericPFTUtilities.decode_memo_fields_to_dict(memo)
-        memo_format = memo_dict['memo_format']
-        memo_type = memo_dict['memo_type']
-        memo_data = memo_dict['memo_data']
-
-        # Calculate chunks needed and validate size
-        num_chunks = GenericPFTUtilities.calculate_required_chunks(memo, max_size)
-        chunk_size = len(memo_data.encode('utf-8')) // num_chunks
-                
-        # Split into chunks
-        chunked_memos = []
-        data_bytes = memo_data.encode('utf-8')
-        for chunk_number in range(1, num_chunks + 1):
-            start_idx = (chunk_number - 1) * chunk_size
-            end_idx = start_idx + chunk_size if chunk_number < num_chunks else len(data_bytes)
-            chunk = data_bytes[start_idx:end_idx]
-            chunk_with_label = f"chunk_{chunk_number}__{chunk.decode('utf-8', errors='ignore')}"
-
-            # Debug the sizes
-            test_format = str_to_hex(memo_format)
-            test_type = str_to_hex(memo_type)
-            test_data = str_to_hex(chunk_with_label)
-            
-            logger.debug(f"Chunk {chunk_number} sizes:")
-            logger.debug(f"  Plaintext Format size: {len(memo_format)}")
-            logger.debug(f"  Plaintext Type size: {len(memo_type)}")
-            logger.debug(f"  Plaintext Data size: {len(chunk_with_label)}")
-            logger.debug(f"  Plaintext Total size: {len(memo_format) + len(memo_type) + len(chunk_with_label)}")
-            logger.debug(f"  Hex Format size: {len(test_format)}")
-            logger.debug(f"  Hex Type size: {len(test_type)}")
-            logger.debug(f"  Hex Data size: {len(test_data)}")
-            logger.debug(f"  Hex Total size: {len(test_format) + len(test_type) + len(test_data)}")
-            
-            chunk_memo = GenericPFTUtilities.construct_memo(
-                memo_format=memo_format,
-                memo_type=memo_type,
-                memo_data=chunk_with_label,
-                validate_size=False  # TODO: The size validation appears too conservative
-            )
-
-            chunked_memos.append(chunk_memo)
-
-        return chunked_memos
     
     async def send_memo_group(
         self,
@@ -604,8 +369,23 @@ class GenericPFTUtilities:
         destination: str,
         memo_group: MemoGroup,
         pft_amount: Optional[Decimal] = None,
-    ) -> list[Response]:
-        """Send a memo group to a destination"""
+        pft_distribution: PFTSendDistribution = PFTSendDistribution.FULL_AMOUNT_EACH
+    ) -> Union[Response, list[Response]]:
+        """Send a memo group to a destination
+        
+        Args:
+            wallet_seed_or_wallet: Either a wallet seed string or a Wallet object
+            destination: XRPL destination address
+            memo_group: MemoGroup object containing memos to send
+            pft_amount: Optional total PFT amount to send
+            pft_distribution: Strategy for distributing PFT across chunks:
+                - DISTRIBUTE_EVENLY: Split total amount evenly across all chunks
+                - LAST_CHUNK_ONLY: Send entire amount with last chunk only
+                - FULL_AMOUNT_EACH: Send full amount with each chunk
+        
+        Returns:
+            Single Response or list of Responses depending on number of memos
+        """
         # Handle wallet input
         if isinstance(wallet_seed_or_wallet, str):
             wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
@@ -616,44 +396,53 @@ class GenericPFTUtilities:
             raise ValueError("Invalid wallet input")
         
         responses = []
-        for memo in memo_group.memos:
-            responses.append(await self._send_memo_single(wallet, destination, memo, pft_amount))
+        num_memos = len(memo_group.memos)
 
-        return responses
+        for idx, memo in enumerate(memo_group.memos):
+            # Determine PFT amount for this chunk based on distribution strategy
+            chunk_pft_amount = None
+            match pft_distribution:
+                case PFTSendDistribution.DISTRIBUTE_EVENLY:
+                    chunk_pft_amount = pft_amount / (Decimal(num_memos) if num_memos > 0 else 1)
+                case PFTSendDistribution.LAST_CHUNK_ONLY:
+                    chunk_pft_amount = pft_amount if idx == num_memos - 1 else 0
+                case PFTSendDistribution.FULL_AMOUNT_EACH:
+                    chunk_pft_amount = pft_amount
+
+            logger.debug(f"Sending memo {idx + 1} of {len(memo_group.memos)} from {wallet.address} to {destination}")
+            responses.append(await self._send_memo_single(wallet, destination, memo, chunk_pft_amount))
+
+        return responses if len(memo_group.memos) > 1 else responses[0]
 
     async def send_memo(self, 
         wallet_seed_or_wallet: Union[str, Wallet], 
         destination: str, 
-        memo: Union[str, Memo], 
-        username: str = None,
-        message_id: str = None,
-        chunk: bool = False,
+        memo_data: str, 
+        memo_type: Optional[str] = None,
         compress: bool = False, 
         encrypt: bool = False,
         pft_amount: Optional[Decimal] = None,
-        disable_pft_check: bool = False
+        disable_pft_check: bool = True,
+        pft_distribution: PFTSendDistribution = PFTSendDistribution.LAST_CHUNK_ONLY
     ) -> Union[Response, list[Response]]:
         """Primary method for sending memos on the XRPL with PFT requirements.
-        
-        This method handles all aspects of memo sending including:
-        - PFT requirement calculation based on destination and memo type
-        - Encryption for secure communication (requires prior handshake) TODO: Move this to a MemoBuilder class
-        - Compression for large messages TODO: Move this to a MemoBuilder class
-        - Automatic chunking for messages exceeding size limits TODO: Move this to a MemoBuilder class
-        - Standardized memo formatting TODO: Move this to a MemoBuilder class
+
+        This method constructs a MemoGroup using the MemoProcessor and sends it via send_memo_group.
         
         Args:
             wallet_seed_or_wallet: Either a wallet seed string or a Wallet object
             destination: XRPL destination address
-            memo: Either a string message or pre-constructed Memo object
-            username: Optional user identifier for memo format field
-            message_id: Optional custom ID for memo type field, auto-generated if None
-            chunk: Whether to chunk the memo data (default False)
+            memo_data: The message content to send
+            memo_type: Message type identifier
             compress: Whether to compress the memo data (default False)
             encrypt: Whether to encrypt the memo data (default False)
-            pft_amount: Optional specific PFT amount to send. If None, amount will be 
-                determined by transaction requirements service.
-                
+            pft_amount: Optional specific PFT amount to send
+            disable_pft_check: Skip PFT requirement check if True
+            pft_distribution: Strategy for distributing PFT across chunks:
+                - DISTRIBUTE_EVENLY: Split total amount evenly across all chunks
+                - LAST_CHUNK_ONLY: Send entire amount with last chunk only
+                - FULL_AMOUNT_EACH: Send full amount with each chunk
+
         Returns:
             list[dict]: Transaction responses for each chunk sent
             
@@ -664,23 +453,12 @@ class GenericPFTUtilities:
         # Handle wallet input
         if isinstance(wallet_seed_or_wallet, str):
             wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
-            logged_user = f"{username} ({wallet.address})" if username else wallet.address
-            logger.debug(f"GenericPFTUtilities.send_memo: Spawned wallet for {logged_user} to send memo to {destination}...")
+            logger.debug(f"GenericPFTUtilities.send_memo: Spawned wallet for {wallet.address} to send memo to {destination}...")
         elif isinstance(wallet_seed_or_wallet, Wallet):
             wallet = wallet_seed_or_wallet
         else:
             logger.error("GenericPFTUtilities.send_memo: Invalid wallet input, raising ValueError")
             raise ValueError("Invalid wallet input")
-
-        # Extract memo data, type, and format
-        if isinstance(memo, Memo):
-            memo_data = self.hex_to_text(memo.memo_data)
-            memo_type = self.hex_to_text(memo.memo_type)
-            memo_format = self.hex_to_text(memo.memo_format)
-        else:
-            memo_data = str(memo)
-            memo_type = message_id or self.generate_custom_id()
-            memo_format = username or wallet.classic_address
 
         # TODO: Adopt a spec for PFT requirements
         # Get per-tx PFT requirement
@@ -690,58 +468,26 @@ class GenericPFTUtilities:
                 memo_type=memo_type
             )
 
-        # Check if this is a system memo type
-        is_system_memo = any(
-            memo_type == system_type.value 
-            for system_type in global_constants.SystemMemoType
-        )
-
-        # Handle encryption if requested
-        if encrypt:
-            logger.debug(f"GenericPFTUtilities.send_memo: {username} requested encryption. Checking handshake status.")
-            channel_key, counterparty_key = await self.message_encryption.get_handshake_for_address(wallet.address, destination)
-            if not (channel_key and counterparty_key):
-                raise HandshakeRequiredException(wallet.address, destination)
-            shared_secret = self.message_encryption.get_shared_secret(counterparty_key, wallet.seed)
-            encrypted_memo = self.message_encryption.encrypt_memo(memo_data, shared_secret)
-            memo_data = "WHISPER__" + encrypted_memo
-
-        # Handle compression if requested
-        if compress:
-            logger.debug(f"GenericPFTUtilities.send_memo: {username} requested compression. Compressing memo.")
-            compressed_data = self.compress_string(memo_data)
-            logger.debug(f"GenericPFTUtilities.send_memo: Compressed memo to length {len(compressed_data)}")
-            memo_data = "COMPRESSED__" + compressed_data
-
-        # For system memos, verify size and prevent chunking
-        # construct_memo will raise ValueError if size exceeds limit, since SystemMemoTypes cannot be chunked due to collision risk
-        memo = self.construct_memo(
-            memo_format=memo_format,
-            memo_type=memo_type,
+        # Construct parameters for memo processing
+        params = MemoConstructionParameters.construct_standardized_memo(
+            source=wallet.address,
+            destination=destination,
             memo_data=memo_data,
-            validate_size=(is_system_memo and chunk)
+            memo_type=memo_type,
+            should_encrypt=encrypt,
+            should_compress=compress,
+            pft_amount=pft_amount
         )
 
-        if is_system_memo:
-            return await self._send_memo_single(wallet, destination, memo, pft_amount)
+        # Generate memo group using processor
+        memo_group = await MemoProcessor.construct_group_generic(
+            memo_params=params,
+            wallet=wallet,
+            message_encryption=self.message_encryption
+        )
 
-        # Handle chunking for non-system memos if requested, or if _chunk_memos returns more than one memo
-        chunk_memos = self._chunk_memos(memo)
-        if chunk or len(chunk_memos) > 1:
-            try:
-                responses = []
-
-                for idx, chunk_memo in enumerate(chunk_memos):
-                    logger.debug(f"Sending chunk {idx+1} of {len(chunk_memos)}: {chunk_memo.memo_data[:100]}...")
-                    responses.append(await self._send_memo_single(wallet, destination, chunk_memo, pft_amount))
-
-                return responses
-            except Exception as e:
-                logger.error(f"GenericPFTUtilities.send_memo: Error chunking memo: {e}")
-                logger.error(traceback.format_exc())
-                raise e
-        else:
-            return await self._send_memo_single(wallet, destination, memo, pft_amount)
+        # Send memo group
+        return await self.send_memo_group(wallet, destination, memo_group, pft_amount, pft_distribution)
 
     async def _send_memo_single(self, wallet: Wallet, destination: str, memo: Memo, pft_amount: Optional[Decimal] = None) -> Response:
         """ Sends a single memo to a destination """

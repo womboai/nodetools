@@ -128,19 +128,19 @@ class MemoStructure:
     Describes how a memo is structured across transactions.
     This is designed to be used for parsing memos from transactions, but not for constructing memo groups.
     """
-    is_chunked: bool
+    is_chunked: Optional[bool] = None
     chunk_index: Optional[int] = None
     total_chunks: Optional[int] = None
     group_id: Optional[str] = None
     compression_type: Optional[MemoDataStructureType] = None  # Might be unknown until processing
     encryption_type: Optional[MemoDataStructureType] = None   # Might be unknown until processing
     version: Optional[MemoVersion] = None
-    is_standardized_format: bool = False  
+    is_valid_format: bool = False
 
-    @property
-    def is_complete(self) -> bool:
-        """Whether this represents a complete memo"""
-        return not self.is_chunked  # A non-chunked memo is always complete
+    @classmethod
+    def invalid_format(cls) -> 'MemoStructure':
+        """Return an empty MemoStructure, indicating an invalid format"""
+        return cls()
     
     @classmethod
     def is_standardized_memo_format(cls, memo_format: Optional[str]) -> bool:
@@ -220,7 +220,7 @@ class MemoStructure:
             compression_type=compression_type,
             encryption_type=encryption_type,
             version=version_type,
-            is_standardized_format=True
+            is_valid_format=True
         )
     
     @classmethod
@@ -232,22 +232,8 @@ class MemoStructure:
             "e.b.c1/4"                    # encrypted, compressed, chunk 1 of 4
             "-.b.c2/4"                    # not encrypted, compressed, chunk 2 of 4
             "-.-.-"                       # no special processing
-            "invalid_format"              # Invalid - will fall back to legacy
-        
-        Legacy format example: 
-            memo_data with "chunk_1__" prefix and nested "COMPRESSED__" and "WHISPER__" prefixes
-
-        Legacy format caveats:
-        1. COMPRESSED__ prefix only appears in first chunk
-        2. WHISPER__ prefix only visible after decompression
-        3. Structure might need to be updated after processing
-        
-        Examples:
-            First chunk:  "chunk_1__COMPRESSED__<compressed_data>"
-            Other chunks: "chunk_2__<compressed_data>"
-            After joining and decompressing: "WHISPER__<encrypted_data>"
+            "invalid_format"              # Invalid
         """
-        memo_data = tx.memo_data
         memo_format = tx.memo_format
 
         # Check if using standardized format
@@ -255,27 +241,8 @@ class MemoStructure:
             structure = cls.parse_standardized_format(memo_format)
             structure.group_id = tx.memo_type  # Set group_id from transaction
             return structure
-
-        ## Backwards compatibility for legacy format
-        # Fall back to legacy prefix detection
-        chunk_match = re.match(r'^chunk_(\d+)__', memo_data)
-        
-        # Only check compression on first chunk
-        is_compressed = (
-            "COMPRESSED__" in memo_data 
-            if chunk_match and chunk_match.group(1) == "1" 
-            else None  # Unknown for other chunks
-        )
-
-        return cls(
-            is_chunked=chunk_match is not None,
-            chunk_index=int(chunk_match.group(1)) if chunk_match else None,
-            total_chunks=None,  # Legacy format doesn't specify total chunks
-            group_id=tx.memo_type,
-            compression_type=MemoDataStructureType.BROTLI if is_compressed else None,
-            encryption_type=None,  # Will be determined after processing
-            is_standardized_format=False
-        )
+        else:
+            return cls.invalid_format()
     
 @dataclass
 class MemoGroup:
@@ -334,7 +301,7 @@ class MemoGroup:
         new_structure = MemoStructure.from_transaction(tx)
 
         # For new format messages, validate consistency
-        if new_structure.is_standardized_format:
+        if new_structure.is_valid_format:
             if not self._is_structure_consistent(new_structure):
                 logger.warning(f"Inconsistent message structure in group {self.group_id}")
                 return False
@@ -379,7 +346,7 @@ class StructuralPattern(Enum):
     # NO_MEMO = "no_memo"                    # No memo present 
     DIRECT_MATCH = "direct_match"          # Can be pattern matched directly
     NEEDS_GROUPING = "needs_grouping"      # New format, needs grouping
-    NEEDS_LEGACY_GROUPING = "needs_legacy_grouping"  # Legacy format, needs grouping
+    INVALID_STRUCTURE = "invalid_structure"  # Invalid structure, cannot be processed
 
     @staticmethod
     def match(tx: MemoTransaction) -> str:
@@ -392,14 +359,11 @@ class StructuralPattern(Enum):
 
         # Check if there is no memo present
         structure = MemoStructure.from_transaction(tx)
-        if structure.is_standardized_format:
+        if structure.is_valid_format:
             # New format: Use metadata to determine grouping needs
             return StructuralPattern.NEEDS_GROUPING if structure.is_chunked else StructuralPattern.DIRECT_MATCH
         else:
-            # Legacy format: Check for chunk prefix
-            if "chunk_" in tx.memo_data:
-                return StructuralPattern.NEEDS_LEGACY_GROUPING
-            return StructuralPattern.DIRECT_MATCH
+            return StructuralPattern.INVALID_STRUCTURE
 
 @dataclass(frozen=True)  # Making it immutable for hashability
 class MemoPattern:
@@ -575,9 +539,9 @@ class RequestRule(InteractionRule):
         pass
 
 @dataclass
-class ResponseParameters:
+class MemoConstructionParameters:
     """
-    Response parameters for transaction construction.
+    Parameters for transaction construction.
     
     For standardized memos:
     - memo_type and memo_data are provided directly
@@ -589,7 +553,6 @@ class ResponseParameters:
     """
     source: str  # Name of the address that should send the response
     destination: str  # XRPL destination address
-    memo: Optional[Memo] = None  # Pre-constructed memo for legacy format
     memo_type: Optional[str] = None  # Unique group ID for standardized memos
     memo_data: Optional[str] = None  # Payload for standardized memos
     pft_amount: Optional[Decimal] = None  # Optional PFT amount for the transaction
@@ -597,38 +560,6 @@ class ResponseParameters:
     should_compress: bool = False  # Whether the memo should be compressed
     should_chunk: bool = False  # Whether the memo should be chunked
     processed_memo: Optional[Union[Memo, List[Memo]]] = None  # The final XRPL memo after processing
-    legacy_memo: bool = True  # Whether the memo should be in legacy format
-
-    def __post_init__(self):
-        """Validate memo configuration"""
-        if self.legacy_memo:
-            if self.memo is None:
-                raise ValueError("Legacy memo requires pre-constructed Memo object")
-            if self.memo_type is not None or self.memo_data is not None:
-                raise ValueError("Legacy memos cannot have memo_type or memo_data")
-            
-        else:
-            if self.memo is not None:
-                raise ValueError("Standardized memos should not have pre-constructed Memo object")
-            if self.memo_type is None or self.memo_data is None:
-                raise ValueError("Standardized memos must have memo_type and memo_data")
-            
-    @classmethod
-    def construct_legacy_memo(
-        cls,
-        source: str,
-        destination: str,
-        memo: Memo,
-        pft_amount: Optional[Decimal] = None
-    ) -> 'ResponseParameters':
-        """Create ResponseParameters for a legacy memo."""
-        return cls(
-            source=source,
-            destination=destination,
-            memo=memo,
-            pft_amount=pft_amount,
-            legacy_memo=True
-        )
 
     @classmethod
     def construct_standardized_memo(
@@ -640,8 +571,8 @@ class ResponseParameters:
         should_encrypt: bool = False,
         should_compress: bool = False,
         pft_amount: Optional[Decimal] = None
-    ) -> 'ResponseParameters':
-        """Create ResponseParameters for a standardized memo."""
+    ) -> 'MemoConstructionParameters':
+        """Create MemoConstructionParameters for a standardized memo."""
         return cls(
             source=source,
             destination=destination,
@@ -649,8 +580,7 @@ class ResponseParameters:
             memo_type=memo_type,
             should_encrypt=should_encrypt,
             should_compress=should_compress,
-            pft_amount=pft_amount,
-            legacy_memo=False
+            pft_amount=pft_amount
         )
 
 class ResponseGenerator(ABC):
@@ -665,7 +595,7 @@ class ResponseGenerator(ABC):
         self, 
         request_tx: MemoTransaction,
         evaluation_result: Dict[str, Any]
-    ) -> ResponseParameters:
+    ) -> MemoConstructionParameters:
         """Construct the response memo and parameters"""
         pass
 

@@ -4,6 +4,7 @@ from xrpl.wallet import Wallet
 from xrpl.models import Memo, Response
 from decimal import Decimal
 from nodetools.configuration.configuration import NetworkConfig, NodeConfig
+from nodetools.configuration.constants import PFTSendDistribution
 from nodetools.utilities.db_manager import DBConnectionManager
 from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
 from nodetools.protocols.transaction_repository import TransactionRepository
@@ -47,22 +48,61 @@ class GenericPFTUtilities(Protocol):
         destination: str,
         memo_group: MemoGroup,
         pft_amount: Optional[Decimal] = None,
-    ) -> list[Response]:
-        """Send a memo group to a destination"""
+        pft_distribution: PFTSendDistribution = PFTSendDistribution.FULL_AMOUNT_EACH
+    ) -> Union[Response, list[Response]]:
+        """Send a memo group to a destination
+        
+        Args:
+            wallet_seed_or_wallet: Either a wallet seed string or a Wallet object
+            destination: XRPL destination address
+            memo_group: MemoGroup object containing memos to send
+            pft_amount: Optional total PFT amount to send
+            pft_distribution: Strategy for distributing PFT across chunks:
+                - DISTRIBUTE_EVENLY: Split total amount evenly across all chunks
+                - LAST_CHUNK_ONLY: Send entire amount with last chunk only
+                - FULL_AMOUNT_EACH: Send full amount with each chunk
+        
+        Returns:
+            Single Response or list of Responses depending on number of memos
+        """
         ...
 
     async def send_memo(self, 
-            wallet_seed_or_wallet: Union[str, Wallet], 
-            destination: str, 
-            memo: Union[str, Memo], 
-            username: str = None,
-            message_id: str = None,
-            chunk: bool = False,
-            compress: bool = False, 
-            encrypt: bool = False,
-            pft_amount: Optional[Decimal] = None
-        ) -> Union[Response, list[Response]]:
-        """Send a memo to a given account"""
+        wallet_seed_or_wallet: Union[str, Wallet], 
+        destination: str, 
+        memo_data: str, 
+        memo_type: Optional[str] = None,
+        compress: bool = False, 
+        encrypt: bool = False,
+        pft_amount: Optional[Decimal] = None,
+        disable_pft_check: bool = True,
+        pft_distribution: PFTSendDistribution = PFTSendDistribution.LAST_CHUNK_ONLY
+    ) -> Union[Response, list[Response]]:
+        """Primary method for sending memos on the XRPL with PFT requirements.
+
+        This method constructs a MemoGroup using the MemoProcessor and sends it via send_memo_group.
+        
+        Args:
+            wallet_seed_or_wallet: Either a wallet seed string or a Wallet object
+            destination: XRPL destination address
+            memo_data: The message content to send
+            memo_type: Message type identifier
+            compress: Whether to compress the memo data (default False)
+            encrypt: Whether to encrypt the memo data (default False)
+            pft_amount: Optional specific PFT amount to send
+            disable_pft_check: Skip PFT requirement check if True
+            pft_distribution: Strategy for distributing PFT across chunks:
+                - DISTRIBUTE_EVENLY: Split total amount evenly across all chunks
+                - LAST_CHUNK_ONLY: Send entire amount with last chunk only
+                - FULL_AMOUNT_EACH: Send full amount with each chunk
+
+        Returns:
+            list[dict]: Transaction responses for each chunk sent
+            
+        Raises:
+            ValueError: If wallet input is invalid
+            HandshakeRequiredException: If encryption requested without prior handshake
+        """
         ...
     
     def verify_transaction_response(self, response: Union[Response, list[Response]]) -> bool:
@@ -71,14 +111,6 @@ class GenericPFTUtilities(Protocol):
 
     async def get_all_account_compressed_messages(self, account_address: str) -> pd.DataFrame:
         """Get all compressed messages for a given account"""
-        ...
-
-    def construct_handshake_memo(self, user: str, ecdh_public_key: str) -> str:
-        """Construct a handshake memo"""
-        ...
-
-    def construct_memo(self, memo_data: str, memo_type: str, memo_format: str) -> Memo:
-        """Construct a standardized memo object for XRPL transactions"""
         ...
 
     def spawn_wallet_from_seed(self, seed: str) -> Wallet:
@@ -177,11 +209,6 @@ class GenericPFTUtilities(Protocol):
         Returns:
         dict: A dictionary containing extracted transaction information.
         """
-        ...
-
-    @staticmethod
-    def generate_custom_id():
-        """ Generate a unique memo_type """
         ...
 
     async def fetch_pft_trustline_data(self, batch_size: int = 200) -> Dict[str, Dict[str, Any]]:

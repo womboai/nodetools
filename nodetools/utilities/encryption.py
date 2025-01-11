@@ -3,6 +3,7 @@ import base64
 import hashlib
 from cryptography.fernet import Fernet
 import pandas as pd
+from nodetools.models.memo_processor import generate_custom_id
 from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
 from nodetools.protocols.transaction_repository import TransactionRepository
 import nodetools.configuration.configuration as config
@@ -257,12 +258,6 @@ class MessageEncryption:
             # Get ECDH public key
             public_key = self.get_ecdh_public_key_from_seed(channel_private_key)
             
-            # Construct handshake memo
-            handshake_memo = self.pft_utilities.construct_handshake_memo(
-                user=username,
-                ecdh_public_key=public_key
-            )
-            
             # Send transaction
             wallet = self.pft_utilities.spawn_wallet_from_seed(channel_private_key)
             log_message_source = f"{username} ({wallet.address})" if username else wallet.address
@@ -270,7 +265,8 @@ class MessageEncryption:
             response = await self.pft_utilities.send_memo(
                 wallet_seed_or_wallet=channel_private_key, 
                 destination=channel_counterparty, 
-                memo=handshake_memo,
+                memo_data=public_key,
+                memo_type=generate_custom_id() + "_" + global_constants.SystemMemoType.HANDSHAKE.value,
                 username=username
             )
             if not self.pft_utilities.verify_transaction_response(response):

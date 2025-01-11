@@ -22,7 +22,7 @@ from nodetools.models.models import (
     InteractionType, 
     InteractionPattern, 
     ResponseGenerator, 
-    ResponseParameters,
+    MemoConstructionParameters,
     Dependencies,
     StructuralPattern,
     MemoGroup,
@@ -157,12 +157,17 @@ class TransactionReviewer:
                 return await self._review_direct_match(tx)
             
             case StructuralPattern.NEEDS_GROUPING:
-                return await self._review_group(tx, is_standardized=True)
+                return await self._review_group(tx)
             
-            case StructuralPattern.NEEDS_LEGACY_GROUPING:
-                return await self._review_group(tx, is_standardized=False)
+            case StructuralPattern.INVALID_STRUCTURE:
+                return ReviewingResult(
+                    tx=tx,
+                    processed=True,
+                    rule_name="NoRule",
+                    notes="Invalid structure"
+                )
             
-    async def _review_group(self, tx: MemoTransaction, is_standardized: bool) -> ReviewingResult:
+    async def _review_group(self, tx: MemoTransaction) -> ReviewingResult:
         """Handle review of grouped transactions"""
         group_id = tx.memo_type
 
@@ -185,8 +190,8 @@ class TransactionReviewer:
         group = self.pending_groups[group_id]
         structure = group.structure
 
-        # For standardized format, only attempting processing when we have all chunks
-        if is_standardized and len(group.chunk_indices) < structure.total_chunks:
+        # Only attempting processing when we have all chunks
+        if len(group.chunk_indices) < structure.total_chunks:
             return ReviewingResult(
                 tx=tx,
                 processed=False,
@@ -208,21 +213,6 @@ class TransactionReviewer:
             complete_tx.memo_data = processed_content
             self.pending_groups.pop(group_id)
             return await self._review_direct_match(complete_tx)
-        
-        except (CompressionError, InvalidToken) as e:
-            # For legacy groups, we lack the metadata to explicitly know if we've received all chunks
-            # So we'll keep the group in pending and try again later if we receive more chunks
-            # Groups in pending are subject to a timeout and will be cleaned up if they're not updated
-            if not is_standardized:
-                return ReviewingResult(
-                    tx=tx,
-                    processed=True,
-                    rule_name="NoRule",
-                    notes=f"Failed to process group (legacy). May be due to missing chunks."
-                )
-            
-            # For standardized format, re-raise to be caught by general exception handler
-            raise
         
         except Exception as e:
             logger.error(f"Error processing group {group_id}: {e}")
@@ -648,7 +638,7 @@ class ResponseProcessor:
 
             # Construct response parameters
             logger.debug(f"ResponseProcessor_{self.pattern_id}: Constructing response")
-            response_params: ResponseParameters = await self.generator.construct_response(tx, evaluation)
+            response_params: MemoConstructionParameters = await self.generator.construct_response(tx, evaluation)
 
             # Construct memo group based on response parameters
             memo_group = await MemoProcessor.construct_group(
