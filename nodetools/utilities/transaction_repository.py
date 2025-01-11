@@ -523,20 +523,41 @@ class TransactionRepository:
         self,
         address: str,
         flag_type: str,
+        yellow_flag_hours: int = 24,
+        red_flag_hours: int = 240
     ) -> None:
         """Flag an address with either YELLOW or RED flag status.
         
         Args:
             address: XRPL address to flag
             flag_type: Either 'YELLOW' or 'RED'
+            yellow_flag_hours: Number of hours for a yellow flag
+            red_flag_hours: Number of hours for a red flag
         """
         if flag_type not in ('YELLOW', 'RED'):
             raise ValueError("flag_type must be either 'YELLOW' or 'RED'")
             
-        params = [address, flag_type]
+        params = [address, flag_type, yellow_flag_hours, red_flag_hours]
         
         await self._execute_mutation(
             query_name='flag_address',
+            query_category='xrpl',
+            params=params
+        )
+
+    async def clear_address_flags(
+        self,
+        address: str,
+    ) -> None:
+        """Clear all flags for a specific address, regardless of expiration status.
+        
+        Args:
+            address: XRPL address to clear flags for
+        """
+        params = [address]
+        
+        await self._execute_mutation(
+            query_name='clear_address_flags',
             query_category='xrpl',
             params=params
         )
@@ -595,6 +616,25 @@ class TransactionRepository:
         if result and result[0]['cooldown_seconds'] is not None:
             return (result[0]['cooldown_seconds'], result[0]['flag_type'])
         return None
+    
+    async def get_associated_addresses(self, address: str) -> list[str]:
+        """Get all addresses associated with the same auth_source_user_id as the given address.
+        
+        Args:
+            address: Any XRPL address belonging to the user
+            
+        Returns:
+            list[str]: List of all addresses associated with the same user
+        """
+        params = [address]
+        
+        result = await self._execute_query(
+            query_name='get_associated_addresses',
+            query_category='xrpl',
+            params=params
+        )
+        
+        return [row['address'] for row in result]
 
     async def get_address_handshakes(
         self,

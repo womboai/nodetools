@@ -119,16 +119,44 @@ class TransactionRepository(Protocol):
         """
         ...
 
+    async def deauthorize_addresses(
+        self,
+        auth_source: str,
+        auth_source_user_id: str
+    ) -> None:
+        """Deauthorize all addresses for a given auth source user.
+        
+        Args:
+            auth_source: Source of authorization (e.g. 'discord', 'twitter')
+            auth_source_user_id: User ID from the auth source
+        """
+        ...
+
     async def flag_address(
         self,
         address: str,
         flag_type: str,
+        yellow_flag_hours: int = 24,
+        red_flag_hours: int = 240
     ) -> None:
         """Flag an address with either YELLOW or RED flag status.
         
         Args:
             address: XRPL address to flag
             flag_type: Either 'YELLOW' or 'RED'
+            yellow_flag_hours: Number of hours for a yellow flag
+            red_flag_hours: Number of hours for a red flag
+        """
+        ...
+
+    async def clear_address_flags(
+        self,
+        address: str,
+    ) -> None:
+        """Clear all flags for a specific address, regardless of expiration status.
+        
+        Args:
+            address: XRPL address to clear flags for
         """
         ...
 
@@ -145,6 +173,17 @@ class TransactionRepository(Protocol):
             
         Returns:
             bool: True if user has active flags, False otherwise
+        """
+        ...
+
+    async def get_associated_addresses(self, address: str) -> list[str]:
+        """Get all addresses associated with the same auth_source_user_id as the given address.
+        
+        Args:
+            address: Any XRPL address belonging to the user
+            
+        Returns:
+            list[str]: List of all addresses associated with the same user
         """
         ...
 
