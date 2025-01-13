@@ -38,8 +38,42 @@ class GenericPFTUtilities(Protocol):
         """Get the transaction repository"""
         ...
 
-    async def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
-        """Get memo history for a given account"""
+    async def get_account_memo_history(
+        self, 
+        account_address: str, 
+        pft_only: bool = False, 
+        memo_type_filter: Optional[str] = None
+    ) -> pd.DataFrame:
+        """Get transaction history with memos for an account.
+        
+        Args:
+            account_address: XRPL account address to get history for
+            pft_only: If True, only return transactions with PFT included.
+            memo_type_filter: Optional string to filter memo_types using LIKE. E.g. '%google_doc_context_link'
+    
+        Returns:
+            DataFrame containing transaction history with memo details
+        """
+        ...
+
+    async def get_latest_valid_memo_groups(
+        self,
+        memo_history: pd.DataFrame,
+        num_groups: Optional[int] = 1
+    ) -> Optional[Union[MemoGroup, list[MemoGroup]]]:
+        """Get the most recent valid MemoGroup from a set of memo records.
+        This method is designed to process data returned from GenericPFTUtilities.get_account_memo_history.
+        
+        Args:
+            memo_history: DataFrame containing memo records
+            num_groups: Optional int limiting the number of memo groups to return.
+                       If 1 (default), returns a single MemoGroup.
+                       If > 1, returns a list of up to num_groups MemoGroups.
+                       If 0 or None, returns all valid memo groups.
+
+        Returns:
+            Optional[Union[MemoGroup, list[MemoGroup]]]: Most recent valid MemoGroup(s) or None if no valid groups found
+        """
         ...
 
     async def send_memo_group(
@@ -109,20 +143,8 @@ class GenericPFTUtilities(Protocol):
         """Verify a transaction response"""
         ...
 
-    async def get_all_account_compressed_messages(self, account_address: str) -> pd.DataFrame:
-        """Get all compressed messages for a given account"""
-        ...
-
     def spawn_wallet_from_seed(self, seed: str) -> Wallet:
         """Spawn a wallet from a seed"""
-        ...
-
-    async def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
-        """Get the most recent messages from a user's memo history"""
-        ...
-
-    async def get_all_account_compressed_messages_for_remembrancer(self, account_address: str) -> pd.DataFrame:
-        """Convenience method for getting all messages for a user from the remembrancer's perspective"""
         ...
 
     async def fetch_pft_balance(self, address: str) -> Decimal:
@@ -135,20 +157,6 @@ class GenericPFTUtilities(Protocol):
 
     async def get_pft_balance(self, account_address: str) -> Decimal:
         """Get PFT balance for an account from the database"""
-        ...
-
-    async def process_memo_data(
-        self,
-        memo_type: str,
-        memo_data: str,
-        decompress: bool = True,
-        decrypt: bool = True,
-        full_unchunk: bool = False, 
-        memo_history: Optional[pd.DataFrame] = None,
-        channel_address: Optional[str] = None,
-        channel_counterparty: Optional[str] = None,
-        channel_private_key: Optional[Union[str, Wallet]] = None
-    ) -> str:
         ...
 
     async def verify_xrp_balance(self, address: str, minimum_xrp_balance: int) -> bool:

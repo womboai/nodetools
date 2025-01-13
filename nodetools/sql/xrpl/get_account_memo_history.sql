@@ -28,3 +28,5 @@ WITH base_query AS (
 SELECT * FROM base_query 
 WHERE 1=1
     AND CASE WHEN $2 THEN pft_amount IS NOT NULL ELSE TRUE END
+    AND CASE WHEN $3::text IS NOT NULL THEN memo_type LIKE $3::text ELSE TRUE END
+ORDER BY datetime DESC

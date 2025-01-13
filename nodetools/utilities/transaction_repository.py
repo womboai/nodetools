@@ -186,17 +186,19 @@ class TransactionRepository:
         self,
         account_address: str,
         pft_only: bool = False,
+        memo_type_filter: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Get transaction history with memos for an account using transaction_memos table.
         
         Args:
             account_address: XRPL account address to get history for
             pft_only: If True, only return transactions with PFT amounts. Defaults to False.
+            memo_type_filter: Optional string to filter memo_types using LIKE. E.g. '%google_doc_context_link'
             
         Returns:
             List of dictionaries containing transaction history with memo details
         """ 
-        params = [account_address, pft_only]
+        params = [account_address, pft_only, memo_type_filter]
 
         return await self._execute_query(
             query_name='get_account_memo_history',

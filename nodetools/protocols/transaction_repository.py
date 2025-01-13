@@ -78,8 +78,15 @@ class TransactionRepository(Protocol):
         """
         ...
     
-    async def insert_transaction(self, tx_message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Insert a single transaction and return the processed record"""
+    async def insert_transaction(self, tx: Dict[str, Any]) -> Optional[MemoTransaction]:
+        """Insert a single transaction and return the processed record.
+        
+        Args:
+            tx: Transaction dictionary to insert
+            
+        Returns:
+            Optional[MemoTransaction]: Processed record if found, None if not found
+        """
         ...
 
     async def get_decoded_memo(self, tx_hash: str) -> Optional[Dict[str, Any]]:

@@ -4,8 +4,9 @@ import random
 from xrpl.asyncio.clients import AsyncWebsocketClient
 import xrpl.models.requests
 from loguru import logger
+from nodetools.models.models import MemoTransaction
 import traceback
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from nodetools.protocols.generic_pft_utilities import GenericPFTUtilities
@@ -209,19 +210,13 @@ class XRPLWebSocketMonitor:
 
             logger.debug(f"XRPLWebSocketMonitor: Received transaction {tx_message['hash']}, storing in database")
 
-            # First insert the transaction into the cache
-            if await self.transaction_repository.insert_transaction(tx_message):
-                # Retrieve the complete transaction record from the database
-                # to ensure consistent format, which includes decoded memo fields
-                tx = await self.transaction_repository.get_decoded_memo(tx_message['hash'])
-
-                if tx and tx['hash'] == tx_message['hash']:
-                    # Place complete transaction record into review queue
-                    await self.review_queue.put(tx)
-                else:
-                    logger.error(f"Failed to retrieve stored transaction {tx_message['hash']} from database")
+            inserted_tx: Optional[MemoTransaction] = await self.transaction_repository.insert_transaction(tx_message)
+            
+            if inserted_tx and inserted_tx.hash == tx_message['hash']:
+                await self.review_queue.put(inserted_tx)
             else:
-                logger.error(f"Failed to store transaction {tx_message['hash']} in database")
+                logger.error(f"Transaction: {tx_message}")
+                raise Exception(f"Failed to store transaction {tx_message['hash']} in database")
 
         except Exception as e:
             logger.error(f"Error processing transaction update: {e}")

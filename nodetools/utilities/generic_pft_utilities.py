@@ -14,6 +14,7 @@ import json
 import traceback
 import asyncio
 import math
+from inspect import signature
 
 # Third party imports
 import nest_asyncio
@@ -33,7 +34,7 @@ from loguru import logger
 import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
 from nodetools.configuration.constants import PFTSendDistribution
-from nodetools.models.models import MemoGroup, MemoConstructionParameters
+from nodetools.models.models import MemoGroup, MemoConstructionParameters, MemoTransaction
 from nodetools.models.memo_processor import MemoProcessor
 from nodetools.performance.monitor import PerformanceMonitor
 from nodetools.utilities.encryption import MessageEncryption
@@ -277,19 +278,26 @@ class GenericPFTUtilities:
         return wallet
     
     @PerformanceMonitor.measure('get_account_memo_history')
-    async def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
+    async def get_account_memo_history(
+        self, 
+        account_address: str, 
+        pft_only: bool = False, 
+        memo_type_filter: Optional[str] = None
+    ) -> pd.DataFrame:
         """Get transaction history with memos for an account.
         
         Args:
             account_address: XRPL account address to get history for
-            pft_only: If True, only return PFT transactions. Defaults to True.
-            
+            pft_only: If True, only return transactions with PFT included.
+            memo_type_filter: Optional string to filter memo_types using LIKE. E.g. '%google_doc_context_link'
+    
         Returns:
             DataFrame containing transaction history with memo details
         """
         results = await self.transaction_repository.get_account_memo_history(
             account_address=account_address,
-            pft_only=pft_only
+            pft_only=pft_only,
+            memo_type_filter=memo_type_filter
         )
 
         df = pd.DataFrame(results)
@@ -298,9 +306,68 @@ class GenericPFTUtilities:
         df['datetime'] = pd.to_datetime(df['datetime'])
         return df
     
-    def is_encrypted(self, memo: str):
-        """Check if a memo is encrypted"""
-        return self.message_encryption.is_encrypted(memo)
+    async def get_latest_valid_memo_groups(
+        self,
+        memo_history: pd.DataFrame,
+        num_groups: Optional[int] = 1
+    ) -> Optional[Union[MemoGroup, list[MemoGroup]]]:
+        """Get the most recent valid MemoGroup from a set of memo records.
+        This method is designed to process data returned from GenericPFTUtilities.get_account_memo_history.
+        
+        Args:
+            memo_history: DataFrame containing memo records
+            num_groups: Optional int limiting the number of memo groups to return.
+                       If 1 (default), returns a single MemoGroup.
+                       If > 1, returns a list of up to num_groups MemoGroups.
+                       If 0 or None, returns all valid memo groups.
+
+        Returns:
+            Optional[Union[MemoGroup, list[MemoGroup]]]: Most recent valid MemoGroup(s) or None if no valid groups found
+        """
+        if memo_history.empty or len(memo_history) == 0:
+            return None
+
+        # Filter for successful transactions
+        filtered_records = memo_history[memo_history['transaction_result'] == "tesSUCCESS"]
+
+        if filtered_records.empty or len(filtered_records) == 0:
+            return None
+        
+        # Get valid MemoTransaction fields
+        valid_fields = set(signature(MemoTransaction).parameters.keys())
+
+        valid_groups = []
+        
+        # Group by memo_type to handle chunked memos
+        for memo_type in filtered_records['memo_type'].unique():
+            try:
+                # Get all transactions for this memo_group
+                group_txs: pd.DataFrame = filtered_records[filtered_records['memo_type'] == memo_type]
+
+                # Convert DataFrame rows to MemoTransaction objects
+                memo_txs = []
+                for tx in group_txs.to_dict(orient='records'):
+                    valid_tx = {k: v for k, v in tx.items() if k in valid_fields}
+                    memo_txs.append(MemoTransaction(**valid_tx))
+
+                # Create and validate MemoGroup
+                memo_group = MemoGroup.create_from_memos(memo_txs)
+                valid_groups.append(memo_group)
+
+                # Return early if we've reached the desired number of groups
+                if len(valid_groups) == num_groups:
+                    break
+            
+            except ValueError as e:
+                logger.warning(f"Failed to process memo group {memo_type}: {e}")
+                continue
+
+        # If no valid memo groups found, return None
+        if not valid_groups:
+            return None
+        
+        # Return a single MemoGroup if num_groups is 1, otherwise return a list
+        return valid_groups[0] if num_groups == 1 else valid_groups
     
     async def send_handshake(self, wallet_seed: str, destination: str, username: str = None):
         """Sends a handshake memo to establish encrypted communication"""
@@ -580,376 +647,6 @@ class GenericPFTUtilities:
             logger.error(traceback.format_exc())
             raise
 
-    # TODO: Deprecate this method, move its functionality to memo_processor.py
-    def _reconstruct_chunked_message(
-        self,
-        memo_type: str,
-        memo_history: pd.DataFrame
-    ) -> str:
-        """Reconstruct a message from its chunks.
-        
-        Args:
-            memo_type: Message ID to reconstruct
-            memo_history: DataFrame containing memo history
-            account_address: Account address that sent the chunks
-            
-        Returns:
-            str: Reconstructed message or None if reconstruction fails
-        """
-        try:
-            # Get all chunks with this memo type from this account
-            memo_chunks = memo_history[
-                (memo_history['memo_type'] == memo_type) &
-                (memo_history['memo_data'].str.match(r'^chunk_\d+__'))  # Only get actual chunks
-            ].copy()
-
-            if memo_chunks.empty:
-                return None
-            
-            # Extract chunk numbers and sort
-            def extract_chunk_number(x):
-                match = re.search(r'^chunk_(\d+)__', x)
-                return int(match.group(1)) if match else 0
-            
-            memo_chunks['chunk_number'] = memo_chunks['memo_data'].apply(extract_chunk_number)
-            memo_chunks = memo_chunks.sort_values('datetime')
-
-            # Detect and handle multiple chunk sequences
-            # This is to handle the case when a new message is erroneusly sent with an existing message ID
-            current_sequence = []
-            highest_chunk_num = 0
-
-            for _, chunk in memo_chunks.iterrows():
-                # If we see a chunk_1 and already have chunks, this is a new sequence
-                if chunk['chunk_number'] == 1 and current_sequence:
-                    # Check if previous sequence was complete (no gaps)
-                    expected_chunks = set(range(1, highest_chunk_num + 1))
-                    actual_chunks = set(chunk['chunk_number'] for chunk in current_sequence)
-
-                    if expected_chunks == actual_chunks:
-                        # First sequence is complete, ignore all subsequent chunks
-                        # logger.warning(f"GenericPFTUtilities._reconstruct_chunked_message: Found complete sequence for {memo_type}, ignoring new sequence")
-                        break
-                    else:
-                        # First sequence was incomplete, start fresh with new sequence
-                        # logger.warning(f"GenericPFTUtilities._reconstruct_chunked_message: Previous sequence incomplete for {memo_type}, starting new sequence")
-                        current_sequence = []
-                        highest_chunk_num = 0
-
-                current_sequence.append(chunk)
-                highest_chunk_num = max(highest_chunk_num, chunk['chunk_number'])
-
-            # Verify final sequence is complete
-            expected_chunks = set(range(1, highest_chunk_num + 1))
-            actual_chunks = set(chunk['chunk_number'] for chunk in current_sequence)
-            if expected_chunks != actual_chunks:
-                # logger.warning(f"GenericPFTUtilities._reconstruct_chunked_message: Missing chunks for {memo_type}. Expected {expected_chunks}, got {actual_chunks}")
-                return None
-
-            # Combine chunks in order
-            current_sequence.sort(key=lambda x: x['chunk_number'])
-            reconstructed_parts = []
-            for chunk in current_sequence:
-                chunk_data = re.sub(r'^chunk_\d+__', '', chunk['memo_data'])
-                reconstructed_parts.append(chunk_data)
-
-            return ''.join(reconstructed_parts)
-        
-        except Exception as e:
-            # logger.error(f"GenericPFTUtilities._reconstruct_chunked_message: Error reconstructing message {memo_type}: {e}")
-            return None
-
-    # TODO: Deprecate this method, move its functionality to memo_processor.py
-    async def process_memo_data(
-        self,
-        memo_type: str,
-        memo_data: str,
-        decompress: bool = True,
-        decrypt: bool = True,
-        full_unchunk: bool = False, 
-        memo_history: Optional[pd.DataFrame] = None,
-        channel_address: Optional[str] = None,
-        channel_counterparty: Optional[str] = None,
-        channel_private_key: Optional[Union[str, xrpl.wallet.Wallet]] = None
-    ) -> str:
-        """Process memo data, handling both single and multi-chunk messages.
-        
-        For encrypted messages (WHISPER__ prefix), this method handles decryption using ECDH:
-        
-        Encryption Channel:
-        - An encrypted channel exists between two XRPL addresses (channel_address and channel_counterparty)
-        - To decrypt a message, you need the private key (channel_private_key) corresponding to one end 
-        of the channel (channel_address)
-        - It doesn't matter which end was the sender or receiver - what matters is having 
-        the private key for channel_address, and the public key for channel_counterparty
-        
-        Example Usage:
-        1. When node has the private key:
-            process_memo_data(
-                channel_address=node_address,               # The end we have the private key for
-                channel_counterparty=other_party_address,   # The other end of the channel
-                channel_private_key=node_private_key        # Must correspond to channel_address
-            )
-        
-        2. When we have a user's private key (legacy case):
-            process_memo_data(
-                channel_address=user_address,             # The end we have the private key for
-                channel_counterparty=node_address,        # The other end of the channel
-                channel_private_key=user_private_key      # Must correspond to channel_address
-            )
-
-        Args:
-            memo_type: The memo type to identify related chunks
-            memo_data: Initial memo data string
-            account_address: One end of the encryption channel - MUST correspond to wallet_seed
-            full_unchunk: If True, will attempt to unchunk by referencing memo history
-            decompress: If True, decompresses data if COMPRESSED__ prefix is present
-            decrypt: If True, decrypts data if WHISPER__ prefix is present
-            destination: Required for decryption - the other end of the encryption channel
-            memo_history: Optional pre-filtered memo history for chunk lookup
-            wallet_seed: Required for decryption - MUST be the private key corresponding 
-                        to account_address (not destination)
-        
-        Raises:
-            ValueError: If decrypt=True but wallet_seed is not provided
-            ValueError: If decrypt=True but destination is not provided
-            ValueError: If wallet_seed provided doesn't correspond to account_address
-        """
-        try:
-            processed_data = memo_data
-
-            # Handle chunking
-            if full_unchunk and memo_history is not None:
-
-                # Skip chunk processing for SystemMemoType messages
-                is_system_memo = any(
-                    memo_type == system_type.value 
-                    for system_type in global_constants.SystemMemoType
-                )
-
-                # Handle chunking for non-system messages only
-                if not is_system_memo:
-                    # Check if this is a chunked message
-                    chunk_match = re.match(r'^chunk_\d+__', memo_data)
-                    if chunk_match:
-                        reconstructed = self._reconstruct_chunked_message(
-                            memo_type=memo_type,
-                            memo_history=memo_history
-                        )
-                        if reconstructed:
-                            processed_data = reconstructed
-                        else:
-                            # If reconstruction fails, just clean the prefix from the single message
-                            # logger.warning(f"GenericPFTUtilities.process_memo_data: Reconstruction of chunked message {memo_type} from {channel_address} failed. Cleaning prefix from single message.")
-                            processed_data = re.sub(r'^chunk_\d+__', '', memo_data)
-            
-            elif isinstance(processed_data, str):
-                # Simple chunk prefix removal (no full unchunking)
-                processed_data = re.sub(r'^chunk_\d+__', '', processed_data)
-                
-            # Handle decompression
-            if decompress and processed_data.startswith('COMPRESSED__'):
-                processed_data = processed_data.replace('COMPRESSED__', '', 1)
-                # logger.debug(f"GenericPFTUtilities.process_memo_data: Decompressing data: {processed_data}")
-                try:
-                    processed_data = self.decompress_string(processed_data)
-                except Exception as e:
-                    # logger.warning(f"GenericPFTUtilities.process_memo_data: Error decompressing data: {e}")
-                    return processed_data
-
-            # Handle encryption
-            if decrypt and processed_data.startswith('WHISPER__'):
-                if not all([channel_private_key, channel_counterparty, channel_address]):
-                    logger.warning(
-                        f"GenericPFTUtilities.process_memo_data: Cannot decrypt message {memo_type} - "
-                        f"missing required parameters. Need channel_private_key: {bool(channel_private_key)}, "
-                        f"channel_counterparty: {bool(channel_counterparty)}, channel_address: {bool(channel_address)}"
-                    )
-                    return processed_data
-                
-                # Handle wallet object or seed
-                if isinstance(channel_private_key, xrpl.wallet.Wallet):
-                    channel_wallet = channel_private_key
-                    channel_private_key = channel_private_key.seed
-                else:
-                    channel_private_key = channel_private_key
-                    channel_wallet = xrpl.wallet.Wallet.from_seed(channel_private_key)
-                
-                # Validate that the channel_private_key passed to this method corresponds to channel_address
-                if channel_wallet.classic_address != channel_address:
-                    logger.warning(
-                        f"GenericPFTUtilities.process_memo_data: Cannot decrypt message {memo_type} - "
-                        f"wallet address derived from channel_private_key {channel_wallet.classic_address} does not match channel_address {channel_address}"
-                    )
-                    return processed_data
-
-                # logger.debug(f"GenericPFTUtilities.process_memo_data: Getting handshake for {channel_address} and {channel_counterparty}")
-                channel_key, counterparty_key = await self.message_encryption.get_handshake_for_address(
-                    channel_address=channel_address,
-                    channel_counterparty=channel_counterparty
-                )
-                if not (channel_key and counterparty_key):
-                    logger.warning(
-                        f"GenericPFTUtilities.process_memo_data: Cannot decrypt message {memo_type} - "
-                        f"no handshake found between {channel_address} and {channel_counterparty}... "
-                        f"channel_key: {channel_key}, counterparty_key: {counterparty_key}"
-                    )
-                    return processed_data
-                
-                # Get the shared secret from the handshake key
-                shared_secret = self.message_encryption.get_shared_secret(
-                    received_public_key=counterparty_key, 
-                    channel_private_key=channel_private_key
-                )
-                # logger.debug(f"GenericPFTUtilities.process_memo_data: Got shared secret for {channel_address} and {channel_counterparty}: {shared_secret}")
-                try:
-                    processed_data = self.message_encryption.process_encrypted_message(processed_data, shared_secret)
-                except Exception as e:
-                    message = (
-                        f"GenericPFTUtilities.process_memo_data: Error decrypting message {memo_type} "
-                        f"between address {channel_address} and counterparty {channel_counterparty}: {processed_data}"
-                    )
-                    logger.error(message)
-                    logger.error(traceback.format_exc())
-                    return f"[Decryption Failed] {processed_data}"
-
-            # logger.debug(f"GenericPFTUtilities.process_memo_data: Decrypted data: {processed_data}")
-                
-            return processed_data
-            
-        except Exception as e:
-            logger.warning(f"GenericPFTUtilities.process_memo_data: Error processing memo {memo_type}: {e}")
-            return processed_data
-        
-    async def get_all_account_compressed_messages_for_remembrancer(
-        self,
-        account_address: str,
-    ) -> pd.DataFrame:
-        """Convenience method for getting all messages for a user from the remembrancer's perspective"""
-        return await self.get_all_account_compressed_messages(
-            account_address=account_address,
-            channel_private_key=self.credential_manager.get_credential(
-                f"{self.node_config.remembrancer_name}__v1xrpsecret"
-            )
-        )
-
-    async def get_all_account_compressed_messages(
-        self,
-        account_address: str,
-        channel_private_key: Optional[Union[str, xrpl.wallet.Wallet]] = None,
-    ) -> pd.DataFrame:
-        """Get all messages for an account, handling chunked messages, compression, and encryption.
-        
-        This method is designed to be called from the node's perspective and handles two scenarios:
-        
-        1. Getting messages for a user's address:
-        - account_address = user's address
-        - channel_counterparty = user's address (for decryption)
-        
-        2. Getting messages for the remembrancer's address:
-        - account_address = remembrancer's address
-        - channel_counterparty = user_account from transaction (for decryption)
-        
-        The method handles:
-        - Message chunking/reconstruction
-        - Compression/decompression
-        - Encryption/decryption using ECDH
-        
-        For encrypted messages, the encryption channel is established between:
-        - One end: remembrancer (whose private key we're using)
-        - Other end: user (either account_address or user_account from transaction)
-        
-        Args:
-            account_address: XRPL account address to get history for
-            channel_private_key: Private key (wallet seed or wallet) for decryption.
-                Required if any messages are encrypted.
-                
-        Returns:
-            DataFrame with columns:
-                - memo_type: Message identifier
-                - processed_message: Decrypted, decompressed, reconstructed message
-                - datetime: Transaction timestamp
-                - direction: INCOMING or OUTGOING relative to account_address
-                - hash: Transaction hash
-                - account: Sender address
-                - destination: Recipient address
-                - pft_amount: Sum of PFT amounts for all chunks
-                
-            Returns empty DataFrame if no messages exist or processing fails.
-        """
-        try:
-            # Get transaction history
-            memo_history = await self.get_account_memo_history(account_address=account_address, pft_only=True)
-
-            if memo_history.empty:
-                return pd.DataFrame()
-
-            # Filter memo_history when getting messages for a user's address
-            if account_address != self.node_config.remembrancer_address:
-                # Scenario 1: Only include memos where remembrancer is involved
-                memo_history = memo_history[
-                    (memo_history['account'] == self.node_config.remembrancer_address) |
-                    (memo_history['destination'] == self.node_config.remembrancer_address)
-                ]
-                
-                if memo_history.empty:
-                    logger.debug(f"No messages found between {account_address} and remembrancer")
-                    return pd.DataFrame()
-
-            # Derive channel_address from channel_private_key
-            if isinstance(channel_private_key, xrpl.wallet.Wallet):
-                channel_address = channel_private_key.classic_address
-            else:
-                channel_address = xrpl.wallet.Wallet.from_seed(channel_private_key).classic_address
-
-            processed_messages = []
-            for msg_id in memo_history['memo_type'].unique():
-
-                msg_txns = memo_history[memo_history['memo_type'] == msg_id]
-                first_txn = msg_txns.iloc[0]
-
-                # Determine channel counterparty based on account_address
-                # If we're getting messages for a user, they are the counterparty
-                # If we're getting messages for the remembrancer, the user_account is the counterparty
-                channel_counterparty = (
-                    account_address 
-                    if account_address != self.node_config.remembrancer_address 
-                    else first_txn['user_account']
-                )
-
-                try:
-                    # Process the message (handles chunking, decompression, and decryption)
-                    processed_message = await self.process_memo_data(
-                        memo_type=msg_id,
-                        memo_data=first_txn['memo_data'],
-                        full_unchunk=True,
-                        memo_history=memo_history,
-                        channel_address=channel_address,
-                        channel_counterparty=channel_counterparty,
-                        channel_private_key=channel_private_key
-                    )
-                except Exception as e:
-                    processed_message = None
-
-                processed_messages.append({
-                    'memo_type': msg_id,
-                    'memo_format': first_txn['memo_format'],
-                    'processed_message': processed_message if processed_message else "[PROCESSING FAILED]",
-                    'datetime': first_txn['datetime'],
-                    'direction': first_txn['direction'],
-                    'hash': first_txn['hash'],
-                    'account': first_txn['account'],
-                    'destination': first_txn['destination'],
-                    'pft_amount': msg_txns['directional_pft'].sum()
-                })
-
-            result_df = pd.DataFrame(processed_messages)
-            return result_df
-        
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities.get_all_account_compressed_messages: Error processing memo data for {account_address}: {e}")
-            return pd.DataFrame()
-
     async def fetch_account_transactions(
             self,
             account_address: str,
@@ -1170,49 +867,6 @@ class GenericPFTUtilities:
         """Get PFT balance for an account from the database"""
         holder = self.get_pft_holder(account_address)
         return holder['balance'] if holder else Decimal(0)
-
-    async def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
-        """Get the most recent messages from a user's memo history.
-        
-        Args:
-            account_address: The XRPL account address to fetch messages for
-            num_messages: Number of most recent messages to return (default: 20)
-            
-        Returns:
-            str: JSON string containing datetime-indexed messages
-            
-        Example:
-            >>> get_recent_user_messages("r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n", 10)
-            '{"2024-01-01T12:00:00": "message1", "2024-01-02T14:30:00": "message2", ...}'
-        """
-        try:
-            # Get all messages and select relevant columns
-            df = await self.get_all_account_compressed_messages(
-                account_address=account_address,
-                channel_private_key=self.credential_manager.get_credential(
-                    f"{self.node_config.remembrancer_name}__v1xrpsecret"
-                )
-            )
-
-            if df.empty:
-                logger.debug(f"GenericPFTUtilities.get_recent_user_memos: No memo history found for {account_address}. Returning empty JSON")
-                return json.dumps({})
-        
-            messages_df = df[['processed_message', 'datetime']]
-            
-            # Get most recent messages, sort by time, and convert to JSON
-            recent_messages = (messages_df
-                .tail(num_messages)
-                .sort_values('datetime')
-                .set_index('datetime')['processed_message']
-                .to_json()
-            )
-
-            return recent_messages
-
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities.get_recent_user_memos: Failed to get recent user memos for account {account_address}: {e}")
-            return json.dumps({})
 
     def create_xrp_wallet(self):
         test_wallet = Wallet.create()

@@ -266,7 +266,15 @@ class TransactionReviewer:
                             tx_datetime = tx_datetime.replace(tzinfo=timezone.utc)
 
                         if pattern.notify and self.notification_queue and tx_datetime > (datetime.now(timezone.utc) - timedelta(minutes=1)):
-                            await self.notification_queue.put(tx)
+
+                            # Don't put decrypted payloads into the notification queue
+                            if "[Decrypted]" in tx.memo_data:
+                                undecrypted_tx = tx.copy()
+                                undecrypted_tx.memo_data = "[Encrypted payload]"
+                                await self.notification_queue.put(undecrypted_tx)
+                            else:
+                                await self.notification_queue.put(tx)
+
                             logger.debug(f"TransactionReviewer: Queued notification for transaction {tx.hash}")
 
                         return ReviewingResult(
