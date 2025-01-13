@@ -22,8 +22,8 @@ from nodetools.protocols.credentials import CredentialManager
 from nodetools.utilities.credentials import SecretType
 from nodetools.configuration.configuration import NodeConfig
 from nodetools.utilities.exceptions import HandshakeRequiredException
-from nodetools.configuration.constants import MAX_CHUNK_SIZE, XRP_MEMO_STRUCTURAL_OVERHEAD
-from nodetools.configuration.constants import SystemMemoType
+from nodetools.configuration.constants import MAX_CHUNK_SIZE, XRP_MEMO_STRUCTURAL_OVERHEAD, UNIQUE_ID_VERSION
+from nodetools.configuration.constants import MEMO_VERSION
 
 class MemoProcessor:
     """Entry point for memo processing"""
@@ -134,12 +134,16 @@ class MemoProcessor:
         )
 
 def generate_custom_id():
-    """ Generate a unique memo_type """
+    """ Generate a unique memo_type following the pattern: 'v1.0.0.YYYY-MM-DD_HH:MM__LLNN'
+    where LL are random uppercase letters and NN are random numbers.
+    
+    Example: 'v1.0.2024-03-20_15:30__AB12'
+    """
     letters = ''.join(random.choices(string.ascii_uppercase, k=2))
     numbers = ''.join(random.choices(string.digits, k=2))
     second_part = letters + numbers
     date_string = datetime.now().strftime("%Y-%m-%d %H:%M")
-    output= date_string+'__'+second_part
+    output= f"v{UNIQUE_ID_VERSION}.{date_string}__" + second_part
     output = output.replace(' ',"_")
     return output
 
@@ -597,7 +601,7 @@ class StandardizedMemoProcessor:
 
         # Create base unencoded Memo
         base_memo = Memo(
-            memo_format=f"{encryption_type}.{compression_type}",  # Format prefix
+            memo_format=f"{MemoDataStructureType.VERSION.value}{MEMO_VERSION}.{encryption_type}.{compression_type}",  # Format prefix
             memo_type=memo_params.memo_type,
             memo_data=processed_data
         )
@@ -665,7 +669,7 @@ class StandardizedMemoProcessor:
                 
                 # Get shared secret and encrypt
                 shared_secret = message_encryption.get_shared_secret(
-                    received_key=counterparty_key,
+                    received_public_key=counterparty_key,
                     channel_private_key=wallet.seed
                 )
                 processed_data = message_encryption.encrypt_memo(
@@ -689,7 +693,7 @@ class StandardizedMemoProcessor:
 
         # Create base unencoded Memo
         base_memo = Memo(
-            memo_format=f"{encryption_type}.{compression_type}",  # Format prefix
+            memo_format=f"{MemoDataStructureType.VERSION.value}{MEMO_VERSION}.{encryption_type}.{compression_type}",  # Format prefix
             memo_type=memo_type,
             memo_data=processed_data
         )

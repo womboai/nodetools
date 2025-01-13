@@ -262,6 +262,22 @@ class TransactionRepository:
         )
         
         return [MemoTransaction(**tx) for tx in results]
+    
+    async def get_reviewing_result(self, tx_hash: str) -> Optional[Dict[str, Any]]:
+        """Get the reviewing result for a transaction if it exists
+        
+        Args:
+            tx_hash: The transaction hash to look up
+            
+        Returns:
+            Dict containing the reviewing result if found, None otherwise
+        """
+        result = await self._execute_query(
+            query_name='get_reviewing_result',
+            query_category='xrpl',
+            params=[tx_hash]
+        )
+        return result[0] if result else None
 
     async def store_reviewing_result(self, result: 'ReviewingResult') -> None:
         """Store the reviewing result for a transaction

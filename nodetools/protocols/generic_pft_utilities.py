@@ -177,18 +177,6 @@ class GenericPFTUtilities(Protocol):
         """
         ...
 
-    def extract_transaction_info_from_response_object(self, response):
-        """
-        Extract key information from an XRPL transaction response object.
-
-        Args:
-        response (Response): The XRPL transaction response object.
-
-        Returns:
-        dict: A dictionary containing extracted transaction information.
-        """
-        ...
-
     async def send_xrp(
             self,
             wallet_seed_or_wallet: Union[str, Wallet], 
@@ -199,15 +187,25 @@ class GenericPFTUtilities(Protocol):
         ):
         ...
 
-    def extract_transaction_info_from_response_object__standard_xrp(self, response):
+    def extract_transaction_info(self, response) -> dict:
         """
         Extract key information from an XRPL transaction response object.
-        
+        Handles both native XRP and issued currency (e.g. PFT) transactions.
+
         Args:
-        response (Response): The XRPL transaction response object.
-        
+            response (Response): The XRPL transaction response object.
+
         Returns:
-        dict: A dictionary containing extracted transaction information.
+            dict: A dictionary containing extracted transaction information with keys:
+                - time: Transaction timestamp
+                - amount: Transaction amount
+                - currency: Currency code (XRP or token currency)
+                - send_address: Sender's XRPL address
+                - destination_address: Recipient's XRPL address
+                - status: Transaction status
+                - hash: Transaction hash
+                - xrpl_explorer_url: URL to transaction in XRPL explorer
+                - clean_string: Human-readable transaction summary
         """
         ...
 

@@ -26,6 +26,17 @@ class TransactionRepository(Protocol):
         """
         ...
 
+    async def get_reviewing_result(self, tx_hash: str) -> Optional[Dict[str, Any]]:
+        """Get the reviewing result for a transaction if it exists
+        
+        Args:
+            tx_hash: The transaction hash to look up
+            
+        Returns:
+            Dict containing the reviewing result if found, None otherwise
+        """
+        ...
+
     async def store_reviewing_result(self, result: 'ReviewingResult') -> None:
         """Store the reviewing result for a transaction"""
         ...

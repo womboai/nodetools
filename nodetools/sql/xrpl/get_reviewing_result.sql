@@ -1,0 +1,1 @@
+select * from transaction_processing_results where hash = $1;

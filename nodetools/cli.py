@@ -1,7 +1,7 @@
 import argparse
 from nodetools.utilities.setup_utilities import (
     arbitrary_credentials,
-    db_init,
+    init_db,
     setup_node,
     update_credentials,
 )
@@ -28,7 +28,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == 'init-db':
-        db_init.main(
+        init_db.main(
             drop_tables=args.drop_tables,
             create_db=args.create_db,
             help_install=args.help_install,

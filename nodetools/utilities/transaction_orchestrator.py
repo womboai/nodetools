@@ -146,13 +146,7 @@ class TransactionReviewer:
         structural_result = StructuralPattern.match(tx)
 
         match structural_result:
-            # case StructuralPattern.NO_MEMO:
-            #     return ReviewingResult(
-            #         tx=tx,
-            #         processed=True,
-            #         rule_name="NoRule",
-            #         notes="No memo present"
-            #     )
+
             case StructuralPattern.DIRECT_MATCH:
                 return await self._review_direct_match(tx)
             
@@ -194,7 +188,7 @@ class TransactionReviewer:
         if len(group.chunk_indices) < structure.total_chunks:
             return ReviewingResult(
                 tx=tx,
-                processed=False,
+                processed=True,  # This is processed in the context of the individual transaction chunk, not the whole MemoGroup
                 rule_name="NoRule",
                 notes=f"Waiting for more chunks ({len(group.chunk_indices)}/{structure.total_chunks})"
             )
@@ -295,7 +289,25 @@ class TransactionReviewer:
                         response_tx = result[0] if result else None
 
                         if not response_tx:
-                            # Request needs processing and might need notification
+                            # Check if this transaction has been reviewed before
+                            existing_result = await self.dependencies.transaction_repository.get_reviewing_result(tx.hash)
+                            if existing_result:
+                                # If it's been reviewed before, mark it as processed to prevent infinite loop
+                                logger.warning(
+                                    f"Transaction {tx.hash} has already been reviewed but no response found. "
+                                    "Marking as processed to prevent duplicate responses. "
+                                    "Ensure that the response-finding query is correct and that the responses are being generated as expected. "
+                                    f"\nQuery used: {response_query.query} "
+                                    f"\nParams used: {response_query.params}"
+                                )
+                                return ReviewingResult(
+                                    tx=tx,
+                                    processed=True,
+                                    rule_name=rule.__class__.__name__,
+                                    notes="Transaction previously reviewed but response not found. Marking as processed to prevent duplicate responses."
+                                )
+
+                            # For first-time reviews, request needs processing and might need notification
                             if pattern.notify and self.notification_queue:
                                 await self.notification_queue.put(tx)
                                 logger.debug(f"TransactionReviewer: Queued notification for transaction {tx.hash}")
@@ -642,7 +654,7 @@ class ResponseProcessor:
 
             # Construct memo group based on response parameters
             memo_group = await MemoProcessor.construct_group(
-                response_params=response_params,
+                memo_params=response_params,
                 credential_manager=self.dependencies.credential_manager,
                 message_encryption=self.dependencies.message_encryption,
                 node_config=self.dependencies.node_config

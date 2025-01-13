@@ -1,6 +1,7 @@
 from enum import Enum
 from decimal import Decimal
 from pathlib import Path
+import re
 
 CONFIG_DIR = Path.home().joinpath("postfiatcreds")
 
@@ -23,16 +24,19 @@ VERIFY_STATE_INTERVAL = 900  # 15 minutes
 # Maximum history length
 MAX_HISTORY = 15  # TODO: rename this to something more descriptive
 
+# Versioning Constants
+MEMO_VERSION = "1.0"
+UNIQUE_ID_VERSION = "1.0"  # Unique ID pattern for memo types
+UNIQUE_ID_PATTERN_V1 = re.compile(fr'(v{UNIQUE_ID_VERSION}\.(?:\d{{4}}-\d{{2}}-\d{{2}}_\d{{2}}:\d{{2}}(?:__[A-Z0-9]{{2,4}})?))')
+
 class SystemMemoType(Enum):
-    # SystemMemoTypes cannot be chunked
     INITIATION_REWARD = 'INITIATION_REWARD'  # name is memo_type, value is memo_data pattern
     HANDSHAKE = 'HANDSHAKE'
+    HANDSHAKE_RESPONSE = 'HANDSHAKE_RESPONSE'
     INITIATION_RITE = 'INITIATION_RITE'
     GOOGLE_DOC_CONTEXT_LINK = 'google_doc_context_link'
-    # INITIATION_GRANT = 'discord_wallet_funding'  # TODO: Deprecate this
 
 SYSTEM_MEMO_TYPES = [memo_type.value for memo_type in SystemMemoType]
-
 
 class PFTSendDistribution(Enum):
     """Controls how PFT amounts are distributed across memo chunks"""

@@ -269,44 +269,6 @@ class GenericPFTUtilities:
             logger.error(traceback.format_exc())
             return False
 
-    async def send_xrp(
-            self,
-            wallet_seed_or_wallet: Union[str, xrpl.wallet.Wallet], 
-            amount: Union[Decimal, int, float], 
-            destination: str, 
-            memo: Memo, 
-            destination_tag: Optional[int] = None
-        ):
-        # Handle wallet input
-        if isinstance(wallet_seed_or_wallet, str):
-            wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
-        elif isinstance(wallet_seed_or_wallet, xrpl.wallet.Wallet):
-            wallet = wallet_seed_or_wallet
-        else:
-            logger.error("GenericPFTUtilities.send_xrp: Invalid wallet input, raising ValueError")
-            raise ValueError("Invalid wallet input")
-
-        client = AsyncJsonRpcClient(self.https_url)
-
-        payment = xrpl.models.transactions.Payment(
-            account=wallet.address,
-            amount=xrpl.utils.xrp_to_drops(Decimal(amount)),
-            destination=destination,
-            memos=[memo],
-            destination_tag=destination_tag
-        )
-        try:    
-            response = await submit_and_wait(payment, client, wallet)
-            return response    
-        except xrpl.transaction.XRPLReliableSubmissionException as e:    
-            logger.error(f"GenericPFTUtilities.send_xrp: Transaction submission failed: {e}")
-            logger.error(traceback.format_exc())
-            raise
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities.send_xrp: Unexpected error: {e}")
-            logger.error(traceback.format_exc())
-            raise
-
     @staticmethod
     def spawn_wallet_from_seed(seed):
         """ outputs wallet initialized from seed"""
@@ -363,56 +325,72 @@ class GenericPFTUtilities:
         """
         return self.message_encryption.get_shared_secret(received_public_key, channel_private_key)
     
-    async def send_memo_group(
-        self,
-        wallet_seed_or_wallet: Union[str, Wallet],
-        destination: str,
-        memo_group: MemoGroup,
-        pft_amount: Optional[Decimal] = None,
-        pft_distribution: PFTSendDistribution = PFTSendDistribution.FULL_AMOUNT_EACH
-    ) -> Union[Response, list[Response]]:
-        """Send a memo group to a destination
+    async def send_xrp(
+            self,
+            wallet_seed_or_wallet: Union[str, xrpl.wallet.Wallet], 
+            amount: Union[Decimal, int, float], 
+            destination: str, 
+            memo_data: Optional[str] = None, 
+            memo_type: Optional[str] = None,
+            compress: bool = False,
+            encrypt: bool = False,
+            destination_tag: Optional[int] = None
+        ) -> Union[Response, list[Response]]:
+        """Send XRP with optional memo processing capabilities.
         
         Args:
             wallet_seed_or_wallet: Either a wallet seed string or a Wallet object
+            amount: Amount of XRP to send
             destination: XRPL destination address
-            memo_group: MemoGroup object containing memos to send
-            pft_amount: Optional total PFT amount to send
-            pft_distribution: Strategy for distributing PFT across chunks:
-                - DISTRIBUTE_EVENLY: Split total amount evenly across all chunks
-                - LAST_CHUNK_ONLY: Send entire amount with last chunk only
-                - FULL_AMOUNT_EACH: Send full amount with each chunk
-        
+            memo_data: Optional memo data to include
+            memo_type: Optional memo type identifier
+            compress: Whether to compress the memo data
+            encrypt: Whether to encrypt the memo data
+            destination_tag: Optional destination tag
+            
         Returns:
             Single Response or list of Responses depending on number of memos
         """
         # Handle wallet input
         if isinstance(wallet_seed_or_wallet, str):
             wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
-        elif isinstance(wallet_seed_or_wallet, Wallet):
+        elif isinstance(wallet_seed_or_wallet, xrpl.wallet.Wallet):
             wallet = wallet_seed_or_wallet
         else:
-            logger.error("GenericPFTUtilities.send_memo: Invalid wallet input, raising ValueError")
+            logger.error("GenericPFTUtilities.send_xrp: Invalid wallet input, raising ValueError")
             raise ValueError("Invalid wallet input")
+
+        if not memo_data:
+            return await self._send_memo_single(
+                wallet=wallet,
+                destination=destination,
+                memo=Memo(),  # Empty memo
+                xrp_amount=Decimal(amount),
+                destination_tag=destination_tag
+            )
         
-        responses = []
-        num_memos = len(memo_group.memos)
+        params = MemoConstructionParameters.construct_standardized_memo(
+            source=wallet.address,
+            destination=destination,
+            memo_data=memo_data,
+            memo_type=memo_type,
+            should_encrypt=encrypt,
+            should_compress=compress
+        )
 
-        for idx, memo in enumerate(memo_group.memos):
-            # Determine PFT amount for this chunk based on distribution strategy
-            chunk_pft_amount = None
-            match pft_distribution:
-                case PFTSendDistribution.DISTRIBUTE_EVENLY:
-                    chunk_pft_amount = pft_amount / (Decimal(num_memos) if num_memos > 0 else 1)
-                case PFTSendDistribution.LAST_CHUNK_ONLY:
-                    chunk_pft_amount = pft_amount if idx == num_memos - 1 else 0
-                case PFTSendDistribution.FULL_AMOUNT_EACH:
-                    chunk_pft_amount = pft_amount
+        memo_group = await MemoProcessor.construct_group_generic(
+            memo_params=params,
+            wallet=wallet,
+            message_encryption=self.message_encryption
+        )
 
-            logger.debug(f"Sending memo {idx + 1} of {len(memo_group.memos)} from {wallet.address} to {destination}")
-            responses.append(await self._send_memo_single(wallet, destination, memo, chunk_pft_amount))
-
-        return responses if len(memo_group.memos) > 1 else responses[0]
+        return await self.send_memo_group(
+            wallet,
+            destination,
+            memo_group,
+            xrp_amount=Decimal(amount),
+            destination_tag=destination_tag
+        )
 
     async def send_memo(self, 
         wallet_seed_or_wallet: Union[str, Wallet], 
@@ -488,8 +466,81 @@ class GenericPFTUtilities:
 
         # Send memo group
         return await self.send_memo_group(wallet, destination, memo_group, pft_amount, pft_distribution)
+    
+    async def send_memo_group(
+        self,
+        wallet_seed_or_wallet: Union[str, Wallet],
+        destination: str,
+        memo_group: MemoGroup,
+        pft_amount: Optional[Decimal] = None,
+        pft_distribution: PFTSendDistribution = PFTSendDistribution.FULL_AMOUNT_EACH,
+        xrp_amount: Optional[Decimal] = None,
+        destination_tag: Optional[int] = None
+    ) -> Union[Response, list[Response]]:
+        """Send a memo group to a destination
+        
+        Args:
+            wallet_seed_or_wallet: Either a wallet seed string or a Wallet object
+            destination: XRPL destination address
+            memo_group: MemoGroup object containing memos to send
+            pft_amount: Optional total PFT amount to send
+            pft_distribution: Strategy for distributing PFT across chunks:
+                - DISTRIBUTE_EVENLY: Split total amount evenly across all chunks
+                - LAST_CHUNK_ONLY: Send entire amount with last chunk only
+                - FULL_AMOUNT_EACH: Send full amount with each chunk
+            xrp_amount: Optional XRP amount to send (only sent with last chunk)
+            destination_tag: Optional destination tag
+        
+        Returns:
+            Single Response or list of Responses depending on number of memos
+        """
+        # Handle wallet input
+        if isinstance(wallet_seed_or_wallet, str):
+            wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
+        elif isinstance(wallet_seed_or_wallet, Wallet):
+            wallet = wallet_seed_or_wallet
+        else:
+            logger.error("GenericPFTUtilities.send_memo: Invalid wallet input, raising ValueError")
+            raise ValueError("Invalid wallet input")
+        
+        responses = []
+        num_memos = len(memo_group.memos)
 
-    async def _send_memo_single(self, wallet: Wallet, destination: str, memo: Memo, pft_amount: Optional[Decimal] = None) -> Response:
+        for idx, memo in enumerate(memo_group.memos):
+            # Determine PFT amount for this chunk based on distribution strategy
+            chunk_pft_amount = None
+            match pft_distribution:
+                case PFTSendDistribution.DISTRIBUTE_EVENLY:
+                    chunk_pft_amount = pft_amount / (Decimal(num_memos) if num_memos > 0 else 1)
+                case PFTSendDistribution.LAST_CHUNK_ONLY:
+                    chunk_pft_amount = pft_amount if idx == num_memos - 1 else 0
+                case PFTSendDistribution.FULL_AMOUNT_EACH:
+                    chunk_pft_amount = pft_amount
+
+            # Only send XRP with last chunk
+            chunk_xrp_amount = xrp_amount if idx == num_memos - 1 else None
+
+            logger.debug(f"Sending memo {idx + 1} of {len(memo_group.memos)} from {wallet.address} to {destination}")
+            responses.append(await self._send_memo_single(
+                wallet,
+                destination,
+                memo,
+                chunk_pft_amount,
+                chunk_xrp_amount,
+                destination_tag
+            ))
+
+        return responses if len(memo_group.memos) > 1 else responses[0]
+
+    async def _send_memo_single(
+        self, 
+        wallet: Wallet, 
+        destination: str, 
+        memo: Memo, 
+        pft_amount: Optional[Decimal] = None,
+        xrp_amount: Optional[Decimal] = None,
+        destination_tag: Optional[int] = None
+    ) -> Response:
         """ Sends a single memo to a destination """
         client = AsyncJsonRpcClient(self.https_url)
 
@@ -499,12 +550,17 @@ class GenericPFTUtilities:
             "memos": [memo]
         }
 
+        if destination_tag is not None:
+            payment_args["destination_tag"] = destination_tag
+
         if pft_amount and pft_amount > 0:
             payment_args["amount"] = xrpl.models.amounts.IssuedCurrencyAmount(
                 currency="PFT",
                 issuer=self.pft_issuer,
                 value=str(pft_amount)
             )
+        elif xrp_amount:
+            payment_args["amount"] = xrpl.utils.xrp_to_drops(xrp_amount)
         else:
             # Send minimum XRP amount for memo-only transactions
             payment_args["amount"] = xrpl.utils.xrp_to_drops(Decimal(global_constants.MIN_XRP_PER_TRANSACTION))
@@ -523,7 +579,7 @@ class GenericPFTUtilities:
             logger.error(f"GenericPFTUtilities._send_memo_single: Unexpected error: {e}")
             logger.error(traceback.format_exc())
             raise
-    
+
     # TODO: Deprecate this method, move its functionality to memo_processor.py
     def _reconstruct_chunked_message(
         self,
@@ -1239,90 +1295,78 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         """
         balance = await self.fetch_xrp_balance(address)
         return (balance >= minimum_xrp_balance, balance)
-
-    def extract_transaction_info_from_response_object(self, response):
+    
+    def extract_transaction_info(self, response) -> dict:
         """
         Extract key information from an XRPL transaction response object.
+        Handles both native XRP and issued currency (e.g. PFT) transactions.
 
         Args:
-        response (Response): The XRPL transaction response object.
+            response (Response): The XRPL transaction response object.
 
         Returns:
-        dict: A dictionary containing extracted transaction information.
-        """
-        result = response.result
-        tx_json = result['tx_json']
-        
-        # Extract required information
-        url_mask = self.network_config.explorer_tx_url_mask
-        transaction_info = {
-            'time': result['close_time_iso'],
-            'amount': tx_json['DeliverMax']['value'],
-            'currency': tx_json['DeliverMax']['currency'],
-            'send_address': tx_json['Account'],
-            'destination_address': tx_json['Destination'],
-            'status': result['meta']['TransactionResult'],
-            'hash': result['hash'],
-            'xrpl_explorer_url': url_mask.format(hash=result['hash'])
-        }
-        clean_string = (f"Transaction of {transaction_info['amount']} {transaction_info['currency']} "
-                        f"from {transaction_info['send_address']} to {transaction_info['destination_address']} "
-                        f"on {transaction_info['time']}. Status: {transaction_info['status']}. "
-                        f"Explorer: {transaction_info['xrpl_explorer_url']}")
-        transaction_info['clean_string']= clean_string
-        return transaction_info
-
-    def extract_transaction_info_from_response_object__standard_xrp(self, response):
-        """
-        Extract key information from an XRPL transaction response object.
-        
-        Args:
-        response (Response): The XRPL transaction response object.
-        
-        Returns:
-        dict: A dictionary containing extracted transaction information.
+            dict: A dictionary containing extracted transaction information with keys:
+                - time: Transaction timestamp
+                - amount: Transaction amount
+                - currency: Currency code (XRP or token currency)
+                - send_address: Sender's XRPL address
+                - destination_address: Recipient's XRPL address
+                - status: Transaction status
+                - hash: Transaction hash
+                - xrpl_explorer_url: URL to transaction in XRPL explorer
+                - clean_string: Human-readable transaction summary
         """
         transaction_info = {}
         
         try:
+            # Handle different response formats
             result = response.result if hasattr(response, 'result') else response
-            
-            transaction_info['hash'] = result.get('hash')
-            url_mask = self.network_config.explorer_tx_url_mask
-            transaction_info['xrpl_explorer_url'] = url_mask.format(hash=transaction_info['hash'])
-            
             tx_json = result.get('tx_json', {})
-            transaction_info['send_address'] = tx_json.get('Account')
-            transaction_info['destination_address'] = tx_json.get('Destination')
             
-            # Handle different amount formats
-            if 'DeliverMax' in tx_json:
-                transaction_info['amount'] = str(int(tx_json['DeliverMax']) / 1000000)  # Convert drops to XRP
-                transaction_info['currency'] = 'XRP'
-            elif 'Amount' in tx_json:
-                if isinstance(tx_json['Amount'], dict):
-                    transaction_info['amount'] = tx_json['Amount'].get('value')
-                    transaction_info['currency'] = tx_json['Amount'].get('currency')
-                else:
-                    transaction_info['amount'] = str(int(tx_json['Amount']) / 1000000)  # Convert drops to XRP
-                    transaction_info['currency'] = 'XRP'
+            # Extract basic transaction info
+            transaction_info.update({
+                'hash': result.get('hash'),
+                'xrpl_explorer_url': self.network_config.explorer_tx_url_mask.format(hash=result.get('hash')),
+                'send_address': tx_json.get('Account'),
+                'destination_address': tx_json.get('Destination'),
+                'time': result.get('close_time_iso') or tx_json.get('date'),
+                'status': result.get('meta', {}).get('TransactionResult') or result.get('engine_result')
+            })
+
+            # Handle amount and currency based on transaction type
+            amount_info = tx_json.get('DeliverMax') or tx_json.get('Amount')
             
-            transaction_info['time'] = result.get('close_time_iso') or tx_json.get('date')
-            transaction_info['status'] = result.get('meta', {}).get('TransactionResult') or result.get('engine_result')
+            if isinstance(amount_info, dict):
+                # Issued currency (e.g. PFT)
+                transaction_info.update({
+                    'amount': amount_info.get('value'),
+                    'currency': amount_info.get('currency')
+                })
+            elif amount_info:
+                # Native XRP (convert from drops)
+                transaction_info.update({
+                    'amount': str(int(amount_info) / 1_000_000),
+                    'currency': 'XRP'
+                })
             
-            # Create clean string
-            clean_string = (f"Transaction of {transaction_info.get('amount', 'unknown amount')} "
-                            f"{transaction_info.get('currency', 'XRP')} "
-                            f"from {transaction_info.get('send_address', 'unknown sender')} "
-                            f"to {transaction_info.get('destination_address', 'unknown recipient')} "
-                            f"on {transaction_info.get('time', 'unknown time')}. "
-                            f"Status: {transaction_info.get('status', 'unknown')}. "
-                            f"Explorer: {transaction_info['xrpl_explorer_url']}")
+            # Create human-readable summary
+            clean_string = (
+                f"Transaction of {transaction_info.get('amount', 'unknown amount')} "
+                f"{transaction_info.get('currency', 'unknown currency')} "
+                f"from {transaction_info.get('send_address', 'unknown sender')} "
+                f"to {transaction_info.get('destination_address', 'unknown recipient')} "
+                f"on {transaction_info.get('time', 'unknown time')}. "
+                f"Status: {transaction_info.get('status', 'unknown')}. "
+                f"Explorer: {transaction_info['xrpl_explorer_url']}"
+            )
             transaction_info['clean_string'] = clean_string
-            
+
         except Exception as e:
-            transaction_info['error'] = str(e)
-            transaction_info['clean_string'] = f"Error extracting transaction info: {str(e)}"
+            logger.error(f"Error extracting transaction info: {str(e)}")
+            transaction_info.update({
+                'error': str(e),
+                'clean_string': f"Error extracting transaction info: {str(e)}"
+            })
         
         return transaction_info
         

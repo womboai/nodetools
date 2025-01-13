@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS transaction_memos (
 
 CREATE TABLE IF NOT EXISTS transaction_processing_results (
     hash VARCHAR(255) PRIMARY KEY,
+    reviewed BOOLEAN NOT NULL,
     processed BOOLEAN NOT NULL,
     rule_name VARCHAR(255),
     response_tx_hash VARCHAR(255),

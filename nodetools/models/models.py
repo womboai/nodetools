@@ -4,10 +4,11 @@ from typing import Set, Optional, Dict, Any, Pattern, TYPE_CHECKING, List, Union
 from enum import Enum
 from loguru import logger
 from decimal import Decimal
-from xrpl.models import Memo
 import re
 from datetime import datetime as dt
 import copy
+from xrpl.models import Memo
+from nodetools.configuration.constants import MEMO_VERSION
 
 if TYPE_CHECKING:
     from nodetools.protocols.credentials import CredentialManager
@@ -32,10 +33,6 @@ class InteractionType(Enum):
     REQUEST = "request"
     RESPONSE = "response"
     STANDALONE = "standalone"
-
-class MemoVersion(Enum):
-    """Versions of the standardized memo format"""
-    V1 = "1"  # Initial version with e.b.c format
 
 class MemoDataStructureType(Enum):
     """Components of the standardized memo format"""
@@ -134,7 +131,7 @@ class MemoStructure:
     group_id: Optional[str] = None
     compression_type: Optional[MemoDataStructureType] = None  # Might be unknown until processing
     encryption_type: Optional[MemoDataStructureType] = None   # Might be unknown until processing
-    version: Optional[MemoVersion] = None
+    version: Optional[str] = None
     is_valid_format: bool = False
 
     @classmethod
@@ -147,14 +144,15 @@ class MemoStructure:
         """
         Check if memo_format follows the standardized format.
         Examples:
-            "v1.e.b.c1/4"  # version 1, encrypted, compressed, chunk 1 of 4
-            "v1.-.b.c2/4"  # version 1, not encrypted, compressed, chunk 2 of 4
-            "v1.-.-.-"     # version 1, no special processing
+            "v1.0.e.b.c1/4"  # version 1.0, encrypted, compressed, chunk 1 of 4
+            "v1.0.-.b.c2/4"  # version 1.0, not encrypted, compressed, chunk 2 of 4
+            "v1.0.-.-.-"     # version 1.0, no special processing
         """
         if not memo_format:
             return False
         
-        parts = memo_format.split(".")
+        # Split on the last 3 periods to get [v1.0, e, b, c1/4]
+        parts = memo_format.rsplit(".", 3)
         if len(parts) != 4:
             return False
         
@@ -164,7 +162,7 @@ class MemoStructure:
         if not version.startswith(MemoDataStructureType.VERSION.value):
             return False
         version_num = version[1:]  # Remove 'v' prefix
-        if version_num not in {v.value for v in MemoVersion}:
+        if version_num != MEMO_VERSION:
             return False
 
         # Validate encryption
@@ -186,23 +184,24 @@ class MemoStructure:
     @classmethod
     def parse_standardized_format(cls, memo_format: str) -> 'MemoStructure':
         """Parse a validated standardized memo_format string."""
-        version, encryption, compression, chunking = memo_format.split(".")
+        version, encryption, compression, chunking = memo_format.rsplit(".", 3)
 
         # Parse version
-        version_type = MemoVersion(version[1:])  # Remove 'v' prefix and convert to enum
+        version_num = version[1:]  # Remove 'v' prefix and convert to enum
+        version_type = version_num if version_num == MEMO_VERSION else None
 
         # Parse encryption
         encryption_type = (
             MemoDataStructureType.ECDH if encryption == MemoDataStructureType.ECDH.value 
             else None
         )
-        
+
         # Parse compression
         compression_type = (
             MemoDataStructureType.BROTLI if compression == MemoDataStructureType.BROTLI.value 
             else None
         )
-        
+
         # Parse chunking
         chunk_index = None
         total_chunks = None
@@ -211,7 +210,7 @@ class MemoStructure:
             if chunk_match:  # We know this matches from validation
                 chunk_index = int(chunk_match.group(1))
                 total_chunks = int(chunk_match.group(2))
-        
+
         return cls(
             is_chunked=chunk_index is not None,
             chunk_index=chunk_index,
@@ -229,9 +228,9 @@ class MemoStructure:
         Extract memo structure from transaction memo fields.
         
         New format examples:
-            "e.b.c1/4"                    # encrypted, compressed, chunk 1 of 4
-            "-.b.c2/4"                    # not encrypted, compressed, chunk 2 of 4
-            "-.-.-"                       # no special processing
+            "v1.0.e.b.c1/4"                    # version 1.0, encrypted, compressed, chunk 1 of 4
+            "v1.0.-.b.c2/4"                    # version 1.0, not encrypted, compressed, chunk 2 of 4
+            "v1.0.-.-.-"                       # version 1.0, no special processing
             "invalid_format"              # Invalid
         """
         memo_format = tx.memo_format
@@ -382,18 +381,15 @@ class MemoPattern:
     def matches(self, tx: MemoTransaction) -> bool:
         """Check if a transaction's memo matches this pattern"""
         if self.memo_type:
-            tx_memo_type = tx.memo_type
-            if not tx_memo_type or not self._pattern_matches(self.memo_type, tx_memo_type):
+            if not tx.memo_type or not self._pattern_matches(self.memo_type, tx.memo_type):
                 return False
 
         if self.memo_format:
-            tx_memo_format = tx.memo_format
-            if not tx_memo_format or not self._pattern_matches(self.memo_format, tx_memo_format):
+            if not tx.memo_format or not self._pattern_matches(self.memo_format, tx.memo_format):
                 return False
 
         if self.memo_data:
-            tx_memo_data = tx.memo_data
-            if not tx_memo_data or not self._pattern_matches(self.memo_data, tx_memo_data):
+            if not tx.memo_data or not self._pattern_matches(self.memo_data, tx.memo_data):
                 return False
 
         return True

@@ -17,7 +17,6 @@ class MessageEncryption:
 
     _instance: ClassVar[Optional['MessageEncryption']] = None
     _initialized = False
-    WHISPER_PREFIX = 'WHISPER__'
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -49,11 +48,6 @@ class MessageEncryption:
             self._auto_handshake_wallets = node_config.auto_handshake_addresses
             logger.debug(f"Initialized auto-handshake addresses: {self._auto_handshake_wallets}")
         return self._auto_handshake_wallets
-
-    @staticmethod
-    def is_encrypted(message: str) -> bool:
-        """Check if a message is encrypted by looking for the WHISPER prefix"""
-        return message.startswith(MessageEncryption.WHISPER_PREFIX)
     
     @staticmethod
     def encrypt_message(message: Union[str, bytes], shared_secret: Union[str, bytes]) -> str:
@@ -65,7 +59,7 @@ class MessageEncryption:
             shared_secret: The shared secret derived from ECDH
             
         Returns:
-            str: Encrypted message content (without WHISPER prefix)
+            str: Encrypted message content
             
         Raises:
             ValueError: If message is neither string nor bytes
@@ -96,7 +90,7 @@ class MessageEncryption:
         Decrypt a message using a shared secret.
         
         Args:
-            encrypted_content: The encrypted message content (without WHISPER prefix)
+            encrypted_content: The encrypted message content
             shared_secret: The shared secret derived from ECDH
             
         Returns:
@@ -117,7 +111,7 @@ class MessageEncryption:
     @staticmethod
     def process_encrypted_message(message: str, shared_secret: bytes) -> str:
         """
-        Process a potentially encrypted message.
+        Process an encrypted message.
         
         Args:
             message: The message to process
@@ -130,29 +124,9 @@ class MessageEncryption:
         Raises:
             ValueError: If the message fails decryption
         """
-        if not MessageEncryption.is_encrypted(message):
-            return message
-        
-        encrypted_content = message.replace(MessageEncryption.WHISPER_PREFIX, '')
-        # logger.debug(f"MessageEncryption.process_encrypted_message: Decrypting {encrypted_content}...")
-        decrypted_message = MessageEncryption.decrypt_message(encrypted_content, shared_secret)
+        decrypted_message = MessageEncryption.decrypt_message(message, shared_secret)
 
         return f"[Decrypted] {decrypted_message}"
-    
-    @staticmethod
-    def prepare_encrypted_message(message: str, shared_secret: Union[str, bytes]) -> str:
-        """
-        Encrypt a message and add the WHISPER prefix.
-
-        Args:
-            message: The message to encrypt
-            shared_secret: The shared secret for encryption
-            
-        Returns:
-            str: Encrypted message with WHISPER prefix
-        """
-        encrypted_content = MessageEncryption.encrypt_message(message, shared_secret)
-        return f"{MessageEncryption.WHISPER_PREFIX}{encrypted_content}"
 
     @staticmethod
     def encrypt_memo(memo: str, shared_secret: str) -> str:
@@ -266,8 +240,7 @@ class MessageEncryption:
                 wallet_seed_or_wallet=channel_private_key, 
                 destination=channel_counterparty, 
                 memo_data=public_key,
-                memo_type=generate_custom_id() + "_" + global_constants.SystemMemoType.HANDSHAKE.value,
-                username=username
+                memo_type=generate_custom_id() + "__" + global_constants.SystemMemoType.HANDSHAKE.value
             )
             if not self.pft_utilities.verify_transaction_response(response):
                 logger.error(f"MessageEncryption.send_handshake: Failed to send handshake from {log_message_source} to {channel_counterparty}")

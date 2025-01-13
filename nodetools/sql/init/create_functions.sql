@@ -17,7 +17,7 @@ CREATE OR REPLACE FUNCTION find_transaction_response(
     memo_type TEXT,
     memo_format TEXT,
     memo_data TEXT,
-    transaction_result VARCHAR(255),
+    transaction_result VARCHAR(50),
     datetime TIMESTAMP
 ) AS $$
 BEGIN
@@ -39,7 +39,7 @@ BEGIN
             NOT require_after_request 
             OR tm.datetime > request_time
         )
-        AND tm.memo_type = response_memo_type
+        AND tm.memo_type LIKE response_memo_type
         AND (response_memo_format IS NULL OR tm.memo_format = response_memo_format)
         AND (response_memo_data IS NULL OR tm.memo_data LIKE response_memo_data)
     ORDER BY tm.datetime ASC
