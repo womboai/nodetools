@@ -29,7 +29,7 @@ class TransactionRepository:
     async def execute_query(
         self,
         query: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[Union[Dict[str, Any], List[Any]]] = None,
         enforce_column_structure: bool = False
     ) -> List[Dict[str, Any]]:
         """
@@ -49,14 +49,21 @@ class TransactionRepository:
             pool = await self.db_manager.get_pool(self.username)
             
             async with pool.acquire() as conn:
-                # Convert named parameters from %(name)s to $1, $2, etc.
+                
                 if params:
-                    # Create a mapping of param names to positions
-                    param_names = list(params.keys())
-                    for i, name in enumerate(param_names, 1):
-                        query = query.replace(f"%({name})s", f"${i}")
-                    # Convert dict to list of values in the correct order
-                    param_values = [params[name] for name in param_names]
+
+                    # Convert named parameters from %(name)s to $1, $2, etc.
+                    if isinstance(params, dict):
+                        # Create a mapping of param names to positions
+                        param_names = list(params.keys())
+                        for i, name in enumerate(param_names, 1):
+                            query = query.replace(f"%({name})s", f"${i}")
+                        # Convert dict to list of values in the correct order
+                        param_values = [params[name] for name in param_names]
+                    
+                    # If params is a list, use it directly
+                    else:
+                        param_values = params
                 else:
                     param_values = []
 
@@ -555,7 +562,7 @@ class TransactionRepository:
         if flag_type not in ('YELLOW', 'RED'):
             raise ValueError("flag_type must be either 'YELLOW' or 'RED'")
             
-        params = [address, flag_type, yellow_flag_hours, red_flag_hours]
+        params = [address, flag_type, str(yellow_flag_hours), str(red_flag_hours)]
         
         await self._execute_mutation(
             query_name='flag_address',
