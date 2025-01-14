@@ -337,6 +337,14 @@ class MemoGroup:
             if MemoStructure.from_transaction(tx).chunk_index is not None
         }
     
+    @property
+    def pft_amount(self) -> Decimal:
+        """Total PFT amount across all transactions in this group"""
+        return sum(
+            (memo.pft_amount for memo in self.memos if isinstance(memo, MemoTransaction)),
+            Decimal(0)
+        )
+    
 class StructuralPattern(Enum):
     """
     Defines patterns for matching XRPL memo structure before content processing.
