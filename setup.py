@@ -19,7 +19,8 @@ setup(
         'matplotlib',
         'PyNaCl',
         'loguru',
-        'asyncpg'
+        'asyncpg',
+        'sqlparse'
     ],
     include_package_data=True, 
     package_data={

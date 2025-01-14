@@ -26,3 +26,7 @@ class CredentialManager(Protocol):
             ValueError: if received_key is invalid or secret not found
         """
         ...
+
+    def enter_and_encrypt_credential(self, credentials_dict: dict):
+        """Encrypt and store multiple credentials in SQLite database"""
+        ...

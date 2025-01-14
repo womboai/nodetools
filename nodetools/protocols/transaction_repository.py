@@ -1,4 +1,4 @@
-from typing import Protocol, TYPE_CHECKING, List, Dict, Any, Optional
+from typing import Protocol, TYPE_CHECKING, List, Dict, Any, Optional, Union
 from nodetools.models.models import MemoTransaction
 from decimal import Decimal
 
@@ -60,7 +60,7 @@ class TransactionRepository(Protocol):
     async def execute_query(
         self,
         query: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[Union[Dict[str, Any], List[Any]]] = None,
         enforce_column_structure: bool = False
     ) -> List[Dict[str, Any]]:
         """
@@ -68,9 +68,9 @@ class TransactionRepository(Protocol):
         
         Args:
             query: SQL query string
-            params: Optional dictionary of query parameters
+            params: Optional dictionary of query parameters or list of parameters
             enforce_column_structure: If True, enforce the column structure of the query, 
-                otherwise empty results will return None
+                otherwise empty results will return None. 
                 Useful when placing results into a pandas dataframe that requires a consistent structure
             
         Returns:

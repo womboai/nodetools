@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import nodetools.configuration.constants as global_constants
+from dataclasses import field
 
 @dataclass
 class NetworkConfig:
@@ -27,6 +28,7 @@ class NodeConfig:
     remembrancer_address: Optional[str] = None
     discord_guild_id: Optional[int] = None
     discord_activity_channel_id: Optional[int] = None
+    schema_extensions: List[str] = field(default_factory=list)  # List of schema extension import paths
 
     def __post_init__(self):
         """Validate configuration and set defaults"""
@@ -103,5 +105,6 @@ def load_node_config(config_path: str | Path) -> NodeConfig:
         remembrancer_address=config_data.get('remembrancer_address'),
         discord_guild_id=config_data.get('discord_guild_id'),
         discord_activity_channel_id=config_data.get('discord_activity_channel_id'),
-        auto_handshake_addresses=set(config_data.get('auto_handshake_addresses', []))
+        auto_handshake_addresses=set(config_data.get('auto_handshake_addresses', [])),
+        schema_extensions=config_data.get('schema_extensions', [])
     )

@@ -27,20 +27,36 @@ def setup_node():
     # API Key Selection
     print("\nLLM API Key Setup")
     print("=================")
-    print("The following API keys are supported (OpenRouter recommended):")
-    print("1. OpenRouter - Recommended, provides access to multiple LLMs")
-    print("2. OpenAI    - Direct GPT access")
-    print("3. Anthropic - Direct Claude access")
+    print("OpenRouter API key is required for task generation.")
+    print("You can get one at https://openrouter.ai/")
 
-    has_openrouter = input("\nDo you have an OpenRouter API key? (y/n): ").strip().lower() == 'y'
-    has_openai = input("Do you have an OpenAI API key? (y/n): ").strip().lower() == 'y'
-    has_anthropic = input("Do you have an Anthropic API key? (y/n): ").strip().lower() == 'y'
+    while True:
+        has_openrouter = input("\nDo you have an OpenRouter API key? (y/n): ").strip().lower()
+        if has_openrouter == 'y':
+            break
+        elif has_openrouter == 'n':
+            print("\nERROR: An OpenRouter API key is required to run the node.")
+            print("Please obtain one from https://openrouter.ai/ before continuing.")
+            if input("Continue anyway? (y/n): ").strip().lower() != 'y':
+                return
+            break
+        print("Please enter 'y' or 'n'")
 
-    if not any([has_openrouter, has_openai, has_anthropic]):
-        print("\nWARNING: At least one LLM API key is required for task generation.")
-        print("Please obtain an API key (preferably OpenRouter) before continuing.")
-        if input("Continue anyway? (y/n): ").strip().lower() != 'y':
-            return
+    # TODO: Add OpenAI and Anthropic support
+    # print("The following API keys are supported (OpenRouter recommended):")
+    # print("1. OpenRouter - Recommended, provides access to multiple LLMs")
+    # print("2. OpenAI    - Direct GPT access")
+    # print("3. Anthropic - Direct Claude access")
+
+    # has_openrouter = input("\nDo you have an OpenRouter API key? (y/n): ").strip().lower() == 'y'
+    # has_openai = input("Do you have an OpenAI API key? (y/n): ").strip().lower() == 'y'
+    # has_anthropic = input("Do you have an Anthropic API key? (y/n): ").strip().lower() == 'y'
+
+    # if not any([has_openrouter, has_openai, has_anthropic]):
+    #     print("\nWARNING: At least one LLM API key is required for task generation.")
+    #     print("Please obtain an API key (preferably OpenRouter) before continuing.")
+    #     if input("Continue anyway? (y/n): ").strip().lower() != 'y':
+    #         return
 
     has_remembrancer = input("\nDo you have a remembrancer wallet for your node? (y/n): ").strip().lower() == 'y'
     has_discord = input("Do you want to set up a Discord guild? (y/n): ").strip().lower() == 'y'
@@ -49,16 +65,17 @@ def setup_node():
 
     required_credentials = {
         f'{node_name}{network_suffix}__v1xrpsecret': 'Your PFT Foundation XRP Secret',
-        f'{node_name}{network_suffix}_postgresconnstring': 'PostgreSQL connection string'
+        f'{node_name}{network_suffix}_postgresconnstring': 'PostgreSQL connection string',
+        'openrouter': 'Your OpenRouter API Key (from openrouter.ai)'
     }
 
-    # Add selected API keys
-    if has_openrouter:
-        required_credentials['openrouter'] = 'Your OpenRouter API Key (from openrouter.ai)'
-    if has_openai:
-        required_credentials['openai'] = 'Your OpenAI API Key'
-    if has_anthropic:
-        required_credentials['anthropic'] = 'Your Anthropic API Key'
+    # # Add selected API keys
+    # if has_openrouter:
+    #     required_credentials['openrouter'] = 'Your OpenRouter API Key (from openrouter.ai)'
+    # if has_openai:
+    #     required_credentials['openai'] = 'Your OpenAI API Key'
+    # if has_anthropic:
+    #     required_credentials['anthropic'] = 'Your Anthropic API Key'
 
     # Conditionally add remembrancer credentials
     if has_remembrancer:
@@ -68,6 +85,16 @@ def setup_node():
     if has_discord:
         required_credentials[f'discordbot{network_suffix}_secret'] = 'Your Discord Bot Token'
 
+    schema_extensions = []
+    has_custom_extension = input("\nDo you have any custom SQL database schema extensions? (y/n): ").strip().lower() == 'y'
+    if has_custom_extension:
+        while True:
+            extension_path = input("\nEnter the full import path (e.g., myapp.extensions.CustomExtension): ").strip()
+            if extension_path:
+                schema_extensions.append(extension_path)
+            
+            if input("Add another extension? (y/n): ").strip().lower() != 'y':
+                break
 
     print("\nNow you'll need to enter a password to encrypt your credentials.\n")
     
@@ -117,7 +144,7 @@ def setup_node():
                 credential_value = f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
                 print(f"\nConnection string created with database: {db_name}")
                 print(f"Connection string: {credential_value}")
-                print("The database will be created automatically when you run db_init.py")
+                print("The database will be created automatically when you run `nodetools init-db`")
                 credentials_dict[cred_name] = credential_value
                 break
 
@@ -153,6 +180,9 @@ def setup_node():
         config['discord_guild_id'] = int(input("Enter Discord guild ID: ").strip())
         config['discord_activity_channel_id'] = int(input("Enter Discord activity channel ID: ").strip())
 
+    if schema_extensions:
+        config['schema_extensions'] = schema_extensions
+
     # Save node configuration
     config_dir = get_credentials_directory()
     config_file = config_dir / f"pft_node_{'testnet' if network == 'testnet' else 'mainnet'}_config.json"
@@ -165,6 +195,7 @@ def setup_node():
         cm.enter_and_encrypt_credential(credentials_dict)
         print("\nCredential setup complete!")
         print(f"Credentials stored in: {cm.db_path}")
+        print(f"Node configuration stored in: {config_file}")
         print("\nIMPORTANT: Keep your encryption password safe. You'll need it to run the bot.")
         print("When starting the bot, enter this same encryption password when prompted.")
     except Exception as e:

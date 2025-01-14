@@ -210,13 +210,14 @@ class XRPLWebSocketMonitor:
 
             logger.debug(f"XRPLWebSocketMonitor: Received transaction {tx_message['hash']}, storing in database")
 
-            inserted_tx: Optional[MemoTransaction] = await self.transaction_repository.insert_transaction(tx_message)
-            
-            if inserted_tx and inserted_tx.hash == tx_message['hash']:
-                await self.review_queue.put(inserted_tx)
-            else:
-                logger.error(f"Transaction: {tx_message}")
-                raise Exception(f"Failed to store transaction {tx_message['hash']} in database")
+            memo_tx: Optional[MemoTransaction] = await self.transaction_repository.insert_transaction(tx_message)
+
+            if memo_tx:
+                if memo_tx.hash == tx_message['hash']:
+                    await self.review_queue.put(memo_tx)
+                else:
+                    logger.error(f"Transaction: {tx_message}")
+                    raise Exception(f"Failed to store transaction {tx_message['hash']} in database")
 
         except Exception as e:
             logger.error(f"Error processing transaction update: {e}")

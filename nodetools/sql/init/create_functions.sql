@@ -1,7 +1,4 @@
-DROP TRIGGER IF EXISTS process_tx_memos_trigger ON postfiat_tx_cache;
-DROP TRIGGER IF EXISTS update_pft_holders_trigger ON transaction_memos;
-DROP FUNCTION IF EXISTS find_transaction_response(text, text, timestamp, text, text, text, boolean);
-
+-- Function to find a response to a request transaction
 CREATE OR REPLACE FUNCTION find_transaction_response(
     request_account TEXT,      -- Account that made the request
     request_destination TEXT,  -- Destination account of the request
@@ -47,6 +44,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Function to decode hex-encoded memos
 CREATE OR REPLACE FUNCTION decode_hex_memo(memo_text TEXT) 
 RETURNS TEXT AS $$
 BEGIN
@@ -60,6 +58,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Function to process raw transaction data and insert into transaction_memos
 CREATE OR REPLACE FUNCTION process_tx_memos() 
 RETURNS TRIGGER AS $$
 BEGIN
@@ -104,11 +103,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
-CREATE TRIGGER process_tx_memos_trigger
-    AFTER INSERT OR UPDATE ON postfiat_tx_cache
-    FOR EACH ROW
-    EXECUTE FUNCTION process_tx_memos();
 
 -- Function to update PFT holders and balances when transactions are processed
 CREATE OR REPLACE FUNCTION update_pft_holders()
@@ -177,9 +171,3 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
--- Create trigger
-CREATE TRIGGER update_pft_holders_trigger
-    AFTER INSERT ON transaction_memos
-    FOR EACH ROW
-    EXECUTE FUNCTION update_pft_holders();

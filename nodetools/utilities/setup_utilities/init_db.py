@@ -7,6 +7,31 @@ import subprocess
 import platform
 from nodetools.sql.sql_manager import SQLManager
 import traceback
+from typing import Optional, List
+from nodetools.sql.schema_extension import SchemaExtension
+from nodetools.configuration.configuration import get_node_config
+import importlib
+import os
+
+def load_schema_extensions() -> Optional[List[SchemaExtension]]:
+    """Load schema extensions from node config and environment"""
+    extensions = []
+    
+    # Load from node config
+    try:
+        node_config = get_node_config()
+        for ext_path in node_config.schema_extensions:
+            try:
+                module_path, class_name = ext_path.rsplit('.', 1)
+                module = importlib.import_module(module_path)
+                extension_class = getattr(module, class_name)
+                extensions.append(extension_class())
+            except Exception as e:
+                print(f"Warning: Failed to load extension {ext_path}: {e}")
+    except FileNotFoundError:
+        print("No node configuration found. Skipping config-based extensions.")
+    
+    return extensions
 
 def extract_node_name(postgres_key: str) -> str:
     """Extract node name from PostgreSQL credential key.
@@ -239,7 +264,7 @@ def create_database_if_needed(db_conn_string: str) -> bool:
         print(f"Error creating database: {e}")
         return False
 
-def init_database(drop_tables: bool = False, create_db: bool = False):
+def init_database(drop_tables: bool = False, create_db: bool = False, schema_extensions: Optional[List[SchemaExtension]] = None):
     """Initialize the PostgreSQL database with required tables and views.
     
     Args:
@@ -310,43 +335,76 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
                 with engine.connect() as connection:
 
                     if drop_tables:
+                        table_names = sql_manager.get_table_names('init', 'create_tables')
+
+                        print(f"\nThe following {network_type} tables will be dropped:")
+                        for table_name in table_names:
+                            print(f"- {table_name}")
+            
                         confirm = input(f"WARNING: This will drop existing {network_type} tables. Are you sure you want to continue? (y/n): ")
                         if confirm.lower() != "y":
                             print("Database initialization cancelled.")
                             return
-                        # Drop core tables
-                        connection.execute(text("DROP TABLE IF EXISTS transaction_processing_results CASCADE;"))
-                        connection.execute(text("DROP TABLE IF EXISTS transaction_memos CASCADE;"))
-                        connection.execute(text("DROP TABLE IF EXISTS postfiat_tx_cache CASCADE;"))
-                        connection.execute(text("DROP TABLE IF EXISTS pft_holders CASCADE;"))
-                        connection.execute(text("DROP TABLE IF EXISTS authorized_addresses CASCADE;"))
+                        
+                        # Drop the tables
+                        for table_name in table_names:
+                            connection.execute(text(f"DROP TABLE IF EXISTS {table_name} CASCADE;"))
+                            connection.commit()
+                            print(f"✓ Dropped table: {table_name}")
+                        print("\nAll tables dropped successfully.")
 
-                        connection.commit()
-                        print("Dropped existing tables.")
-
-                    # Initialize core database objects
+                    # Initialize core database objects in correct order
                     print("\nInitializing core database objects...")
-                    for category in ['create_tables', 'create_functions', 'create_views', 'create_indices']:
-                        query = sql_manager.load_query('init', category)
-                        connection.execute(text(query))
+
+                    # 1. Create Tables
+                    print("- Creating tables...")
+                    for stmt in sql_manager.load_statements('init', 'create_tables'):
+                        connection.execute(text(stmt))
                         connection.commit()
 
-                    # Grant privileges for core tables
-                    print("\nGranting privileges for core tables...")
-                    core_tables = ["postfiat_tx_cache", "transaction_processing_results", "transaction_memos", "pft_holders", "authorized_addresses"]
-                    for table in core_tables:
-                        connection.execute(text(f"GRANT ALL PRIVILEGES ON TABLE {table} to postfiat;"))
+                    # 2. Create Functions
+                    print("- Creating functions...")
+                    for stmt in sql_manager.load_statements('init', 'create_functions'):
+                        connection.execute(text(stmt))
+                        connection.commit()
+
+                    # 3. Create Views
+                    print("- Creating views...")
+                    for stmt in sql_manager.load_statements('init', 'create_views'):
+                        connection.execute(text(stmt))
+                        connection.commit()
+
+                    # 4. Create Triggers
+                    print("- Creating triggers...")
+                    for stmt in sql_manager.load_statements('init', 'create_triggers'):
+                        connection.execute(text(stmt))
+                        connection.commit()
+
+                    # 5. Create Indices
+                    print("- Creating indices...")
+                    for stmt in sql_manager.load_statements('init', 'create_indices'):
+                        connection.execute(text(stmt))
+                        connection.commit()
+
+                    # Grant privileges
+                    print("- Granting table privileges...")
+                    # Get actual table names from our SQLManager
+                    table_names = sql_manager.get_table_names('init', 'create_tables')
+                    for table in table_names:
+                        connection.execute(text(f"GRANT ALL PRIVILEGES ON TABLE {table} TO postfiat;"))
 
                     # Grant view privileges
-                    connection.execute(text("""
-                        SELECT 'GRANT SELECT ON ' || viewname || ' TO postfiat;'
+                    print("- Granting view privileges...")
+                    result = connection.execute(text("""
+                        SELECT format('GRANT SELECT ON %I TO postfiat;', viewname)
                         FROM pg_views
                         WHERE schemaname = 'public'
                     """))
+                    for (grant_stmt,) in result:
+                        connection.execute(text(grant_stmt))
+                        connection.commit()
 
-                    connection.commit()
-
-                    # After creating tables and views, run backfill for triggers
+                    # Backfill triggers
                     print("\nBackfilling existing records for triggers...")
                     backfill_queries = [
                         # Add any backfill queries needed for triggers
@@ -361,36 +419,101 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
                         except Exception as e:
                             print(f"Warning: Backfill query failed: {e}")
 
-                    # Verify the results
-                    result = connection.execute(text("""
-                        SELECT 
-                            (SELECT COUNT(*) FROM postfiat_tx_cache) as total_transactions,
-                            (SELECT COUNT(*) FROM transaction_memos) as total_memos,
-                            (SELECT COUNT(*) FROM transaction_processing_results) as total_processing_results,
-                            (SELECT COUNT(*) FROM pft_holders) as total_pft_holders,
-                            (SELECT COUNT(*) FROM authorized_addresses) as total_authorized_addresses
-                    """))
-                    counts = result.fetchone()
-                    print(f"\nBackfill results:")
-                    print(f"- Total transactions: {counts[0]}")
-                    print(f"- Processed memos: {counts[1]}")
-                    print(f"- Processed results: {counts[2]}")
-                    print(f"- PFT holders: {counts[3]}")
-                    print(f"- Authorized addresses: {counts[4]}\n")
+                    if schema_extensions:
+                        print(f"\nApplying schema extensions for {node_name}...")
+                        for extension in schema_extensions:
+                            print(f"Applying extension: {extension.__class__.__name__}")
 
-                    tables_to_verify = core_tables  # Add more tables here if needed
+                            # Follow same order as core schema
+                            for step, statements in [
+                                ("tables", extension.get_table_definitions()),
+                                ("functions", extension.get_function_definitions()),
+                                ("views", extension.get_view_definitions()),
+                                ("triggers", extension.get_trigger_definitions()),
+                                ("indices", extension.get_index_definitions())
+                            ]:
+                                if statements:
+                                    print(f"- Creating {step}...")
+                                    for statement in statements:
+                                        connection.execute(text(statement))
+                                        connection.commit()
 
-                    for table in tables_to_verify:
-                        result = connection.execute(text(f"""
-                            SELECT column_name, data_type 
-                            FROM information_schema.columns 
-                            WHERE table_name = '{table}';
-                        """))
-                        columns = result.fetchall()
-                        print(f"\nTable: {table}")
-                        print("Columns:")
-                        for col in columns:
-                            print(f"- {col[0]}: {col[1]}")
+                            # Grant privileges
+                            for table, privilege in extension.get_privileges():
+                                connection.execute(text(f"GRANT {privilege} ON TABLE {table} TO postfiat;"))
+                                connection.commit()
+
+                    # Get lists of objects we expect from our SQL files
+                    expected_tables = sql_manager.get_table_names('init', 'create_tables')
+                    expected_functions = sql_manager.get_function_names('init', 'create_functions')
+                    expected_views = sql_manager.get_view_names('init', 'create_views')
+                    expected_triggers = sql_manager.get_trigger_names('init', 'create_triggers')
+                    expected_indices = sql_manager.get_index_names('init', 'create_indices')
+
+                    # Add expected objects from schema extensions
+                    if schema_extensions:
+                        for extension in schema_extensions:
+                            # For each extension, parse its SQL statements to get object names
+                            extension_tables = sql_manager.get_table_names_from_statements(
+                                extension.get_table_definitions())
+                            extension_functions = sql_manager.get_function_names_from_statements(
+                                extension.get_function_definitions())
+                            extension_views = sql_manager.get_view_names_from_statements(
+                                extension.get_view_definitions())
+                            extension_triggers = sql_manager.get_trigger_names_from_statements(
+                                extension.get_trigger_definitions())
+                            extension_indices = sql_manager.get_index_names_from_statements(
+                                extension.get_index_definitions())
+                            
+                            expected_tables.extend(extension_tables)
+                            expected_functions.extend(extension_functions)
+                            expected_views.extend(extension_views)
+                            expected_triggers.extend(extension_triggers)
+                            expected_indices.extend(extension_indices)
+
+                    # Verify schema
+                    print("\nVerifying schema...")
+                    verify_schema_query = sql_manager.load_query('init', 'verify_schema')
+                    verify_schema_params = {
+                        'expected_tables': expected_tables,
+                        'expected_functions': expected_functions,
+                        'expected_views': expected_views,
+                        'expected_triggers': expected_triggers,
+                        'expected_indices': expected_indices,
+                        'all_expected': expected_tables + expected_functions + expected_views + 
+                                      expected_triggers + expected_indices                   
+                    }
+                    result = connection.execute(text(verify_schema_query), verify_schema_params)
+                    schema_info = result.fetchall()
+                    
+                    for object_type, count, objects, expected_count in schema_info:
+                        print(f"\n{object_type}s ({count} created):")
+                        for obj in objects:
+                            print(f"  - {obj}")
+                        
+                        # Get the expected list for this type
+                        expected = {
+                            'Table': expected_tables,
+                            'Function': expected_functions,
+                            'View': expected_views,
+                            'Trigger': expected_triggers,
+                            'Index': expected_indices
+                        }[object_type]
+                        
+                        # Check if any expected objects are missing
+                        missing = set(expected) - set(objects)
+                        if missing:
+                            print(f"  WARNING: Missing {object_type.lower()}s:")
+                            for obj in missing:
+                                print(f"  - {obj}")
+
+                    print("\nDatabase initialization completed successfully!")
+                    print("Status:")
+                    print(f"- Tables configured (drop_tables={drop_tables})")
+                    print("- Functions created")
+                    print("- Triggers created and backfilled")
+                    print("- Indices updated")
+                    print("- Views updated")
 
             except Exception as e:
                 if "permission denied for schema public" in str(e):
@@ -402,14 +525,6 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
                         return init_database(drop_tables=drop_tables, create_db=create_db)
                 print(f"Error initializing database: {e}")
                 return
-
-            print("\n\nDatabase initialization completed successfully!")
-            print("Status:")
-            print("- Tables configured (drop_tables={})".format(drop_tables))
-            print("- Functions created")
-            print("- Triggers created and backfilled")
-            print("- Indices updated")
-            print("- Views updated")
 
     except Exception as e:
         print(f"Error initializing database: {e}")
@@ -460,7 +575,8 @@ def main(drop_tables=False, create_db=False, help_install=False, revoke_privileg
                 revoke_all_privileges(db_conn_string)
             sys.exit(0)
 
-        init_database(drop_tables=drop_tables, create_db=create_db)
+        schema_extensions = load_schema_extensions()
+        init_database(drop_tables=drop_tables, create_db=create_db, schema_extensions=schema_extensions)
 
     except KeyboardInterrupt:
         print("\nDatabase initialization cancelled.")

@@ -1,4 +1,3 @@
--- Indices for postfiat_tx_cache table
 CREATE INDEX IF NOT EXISTS idx_account_destination
     ON transaction_memos(account, destination);
 CREATE INDEX IF NOT EXISTS idx_close_time_iso

@@ -1,11 +1,12 @@
 from importlib import resources
 import pathlib
-from typing import Optional
+from typing import Optional, List
 from loguru import logger
 import traceback
+import sqlparse
 
 class SQLManager:
-    """Manages SQL script loading and execution"""
+    """Manages SQL script loading and parsing"""
     
     def __init__(self, base_path: Optional[str] = None):
         if base_path is None:
@@ -14,23 +15,19 @@ class SQLManager:
         else:
             self.base_path = pathlib.Path(base_path)
 
-    def load_query(self, category: str, name: str, module: Optional[str] = None) -> str:
+    def load_query(self, category: str, name: str) -> str:
         """Load SQL query from file
         
         Args:
             category: The category of SQL (e.g., 'init', 'queries')
             name: The name of the SQL file without extension
-            module: Optional module name (e.g., 'discord')
             
         Returns:
             str: The contents of the SQL file
         """
         if self.base_path:
             # Use direct file system path if provided
-            if module:
-                file_path = self.base_path / module / f"{name}.sql"
-            else:
-                file_path = self.base_path / category / f"{name}.sql"
+            file_path = self.base_path / category / f"{name}.sql"
             
             try:
                 return file_path.read_text()
@@ -41,7 +38,7 @@ class SQLManager:
         else:
             # Use package resources
             try:
-                package_path = f"nodetools.sql.{module if module else category}"
+                package_path = f"nodetools.sql.{category}"
                 with resources.files(package_path).joinpath(f"{name}.sql").open('r') as f:
                     return f.read()
             except Exception as e:
@@ -49,68 +46,134 @@ class SQLManager:
                 logger.error(traceback.format_exc())
                 raise
 
-    async def execute_script(self, db_manager, category: str, name: str, *args, module: Optional[str] = None):
-        """Execute a SQL script using the database manager
+    def load_statements(self, category: str, name: str) -> List[str]:
+        """Load and parse SQL file into individual statements
         
         Args:
-            db_manager: Database manager instance
             category: The category of SQL (e.g., 'init', 'queries')
             name: The name of the SQL file without extension
-            *args: Arguments to pass to the query
-            module: Optional module name (e.g., 'discord')
-        """
-        query = self.load_query(category, name, module)
-        return await db_manager.execute(query, *args)
-    
-    def initialize_module(self, db_manager, module: str):
-        """Initialize a specific module's database objects
-        
-        Args:
-            db_manager: Database manager instance
-            module: The name of the module to initialize (e.g., 'discord')
-        """
-        logger.info(f"Initializing database objects for module: {module}")
-        
-        # Order matters: tables first, then indices, then views
-        initialization_files = [
-            ('create_tables', 'Creating tables'),
-            ('create_indices', 'Creating indices'),
-            ('create_views', 'Creating views')
-        ]
-        
-        for file_name, description in initialization_files:
-            try:
-                query = self.load_query(file_name, module=module)
-                logger.info(f"{description} for module {module}")
-                db_manager.execute(query)
-            except Exception as e:
-                logger.error(f"Error {description.lower()} for module {module}: {e}")
-                logger.error(traceback.format_exc())
-                raise
 
-    def initialize_all(self, db_manager):
-        """Initialize all database objects including module-specific ones
-        
-        Args:
-            db_manager: Database manager instance
+        Returns:
+            List[str]: List of individual SQL statements
         """
-        logger.info("Starting complete database initialization")
-        
-        # Initialize core tables first
-        try:
-            # Core initialization
-            for category in ['create_tables', 'create_indices', 'create_views']:
-                query = self.load_query('init', category)
-                logger.info(f"Executing core {category}")
-                db_manager.execute(query)
-                
-            # Find and initialize all modules
-            modules = [d for d in self.base_path.iterdir() if d.is_dir() and d.name != 'init']
-            
-            for module_path in modules:
-                self.initialize_module(db_manager, module_path.name)
-                
-        except Exception as e:
-            logger.error(f"Error during database initialization: {e}")
-            logger.error(traceback.format_exc())
-            raise
+        raw_sql = self.load_query(category, name)
+        statements = sqlparse.split(raw_sql)
+        return [stmt for stmt in statements if stmt.strip()]
+    
+    def get_table_names(self, category: str, name: str) -> List[str]:
+        """Extract table names from CREATE TABLE statements in SQL file"""
+        statements = self.load_statements(category, name)
+        return self.get_table_names_from_statements(statements)
+    
+    def get_table_names_from_statements(self, statements: List[str]) -> List[str]:
+        """Extract table names from CREATE TABLE statements"""
+        return [name for stmt in statements if stmt and (name := self._get_table_name_from_statement(stmt))]
+    
+    def _get_table_name_from_statement(self, statement: str) -> Optional[str]:
+        """Extract table name from CREATE TABLE statement"""
+        table_name = None
+        parsed = sqlparse.parse(statement)[0]
+        if (parsed.get_type() == 'CREATE' and any(token.value.upper() == 'TABLE' for token in parsed.tokens)):
+            for i, token in enumerate(parsed.tokens):
+                if token.value.upper() == 'TABLE':
+                    for next_token in parsed.tokens[i+1:]:  # Look at subsequent tokens
+                        match next_token:
+                            case _ if next_token.ttype == sqlparse.tokens.Whitespace:
+                                continue
+                            case _ if next_token.value.upper() in {'IF', 'NOT', 'EXISTS'}:
+                                continue
+                            case _:
+                                table_name = next_token.value.strip('"').split('.')[-1]
+                                return table_name
+
+    def get_function_names(self, category: str, name: str) -> List[str]:
+        """Extract function names from CREATE OR REPLACE FUNCTION statements"""
+        statements = self.load_statements(category, name)
+        return self.get_function_names_from_statements(statements)
+    
+    def get_function_names_from_statements(self, statements: List[str]) -> List[str]:
+        """Extract function names from CREATE OR REPLACE FUNCTION statements"""
+        return [name for stmt in statements if stmt and (name := self._get_function_name_from_statement(stmt))]
+
+    def _get_function_name_from_statement(self, statement: str) -> Optional[str]:
+        """Extract function name from CREATE OR REPLACE FUNCTION statement"""
+        func_name = None
+        parsed = sqlparse.parse(statement)[0]
+        if parsed.get_type() in ['CREATE', 'CREATE OR REPLACE']:
+            for i, token in enumerate(parsed.tokens):
+                if token.value.upper() == 'FUNCTION':
+                    for next_token in parsed.tokens[i+1:]:
+                        if next_token.ttype != sqlparse.tokens.Whitespace:
+                            func_name = next_token.value.split('(')[0].strip('"')
+                            return func_name
+
+    def get_view_names(self, category: str, name: str) -> List[str]:
+        """Extract view names from CREATE OR REPLACE VIEW statements"""
+        statements = self.load_statements(category, name)
+        return self.get_view_names_from_statements(statements)
+    
+    def get_view_names_from_statements(self, statements: List[str]) -> List[str]:
+        """Extract view names from CREATE OR REPLACE VIEW statements"""
+        return [name for stmt in statements if stmt and (name := self._get_view_name_from_statement(stmt))]
+    
+    def _get_view_name_from_statement(self, statement: str) -> Optional[str]:
+        """Extract view name from CREATE OR REPLACE VIEW statement"""
+        view_name = None
+        parsed = sqlparse.parse(statement)[0]
+        if parsed.get_type() in ['CREATE', 'CREATE OR REPLACE']:
+            for i, token in enumerate(parsed.tokens):
+                if token.value.upper() == 'VIEW':
+                    for next_token in parsed.tokens[i+1:]:
+                        if next_token.ttype != sqlparse.tokens.Whitespace:
+                            view_name = next_token.value.strip('"').split('.')[-1]
+                            return view_name
+
+    def get_index_names(self, category: str, name: str) -> List[str]:
+        """Extract index names from CREATE INDEX IF NOT EXISTS statements"""
+        statements = self.load_statements(category, name)
+        return self.get_index_names_from_statements(statements)
+    
+    def get_index_names_from_statements(self, statements: List[str]) -> List[str]:
+        """Extract index names from CREATE INDEX IF NOT EXISTS statements"""
+        return [name for stmt in statements if stmt and (name := self._get_index_name_from_statement(stmt))]
+    
+    def _get_index_name_from_statement(self, statement: str) -> Optional[str]:
+        """Extract index name from CREATE INDEX IF NOT EXISTS statement"""
+        index_name = None
+        parsed = sqlparse.parse(statement)[0]
+        if (parsed.get_type() == 'CREATE' and any(token.value.upper() == 'INDEX' for token in parsed.tokens)):
+            for i, token in enumerate(parsed.tokens):
+                if token.value.upper() == 'INDEX':
+                    for next_token in parsed.tokens[i+1:]:
+                        match next_token:
+                            case _ if next_token.ttype == sqlparse.tokens.Whitespace:
+                                continue
+                            case _ if next_token.value.upper() in {'IF', 'NOT', 'EXISTS'}:
+                                continue
+                            case _:
+                                index_name = next_token.value.strip('"').split('.')[-1]
+                                return index_name
+
+    def get_trigger_names(self, category: str, name: str) -> List[str]:
+        """Extract trigger names from CREATE TRIGGER statements"""
+        statements = self.load_statements(category, name)
+        return self.get_trigger_names_from_statements(statements)
+    
+    def get_trigger_names_from_statements(self, statements: List[str]) -> List[str]:
+        """Extract trigger names from CREATE TRIGGER statements"""
+        return [name for stmt in statements if stmt and (name := self._get_trigger_name_from_statement(stmt))]
+    
+    def _get_trigger_name_from_statement(self, statement: str) -> Optional[str]:
+        """Extract trigger name from CREATE TRIGGER statement"""
+        trigger_name = None
+        parsed = sqlparse.parse(statement)[0]
+        if (parsed.get_type() == 'CREATE' and any(token.value.upper() == 'TRIGGER' for token in parsed.tokens)):
+            for i, token in enumerate(parsed.tokens):
+                if token.value.upper() == 'TRIGGER':
+                    for next_token in parsed.tokens[i+1:]:
+                        match next_token:
+                            case _ if next_token.ttype == sqlparse.tokens.Whitespace:
+                                continue
+                            case _:
+                                trigger_name = next_token.value.strip('"').split('.')[-1]
+                                return trigger_name

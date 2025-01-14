@@ -37,7 +37,7 @@ class TransactionRepository:
         
         Args:
             query: SQL query string
-            params: Optional dictionary of query parameters
+            params: Optional dictionary of query parameters or list of parameters
             enforce_column_structure: If True, enforce the column structure of the query, 
                 otherwise empty results will return None. 
                 Useful when placing results into a pandas dataframe that requires a consistent structure
@@ -437,6 +437,8 @@ class TransactionRepository:
             return results[0]['last_ledger']
         return None
 
+    # PFT HOLDERS AND BALANCES
+
     async def get_pft_holders(self) -> Dict[str, Dict[str, Any]]:
         """Get current PFT holder data from database.
         
@@ -503,6 +505,30 @@ class TransactionRepository:
             query_category='xrpl',
             params=params
         )
+
+    # ENCRYPTION
+
+    async def get_address_handshakes(
+        self,
+        channel_address: str,
+        channel_counterparty: str
+    ) -> List[Dict[str, Any]]:
+        """Get handshake messages between two addresses.
+        
+        Args:
+            channel_address: One end of the encryption channel
+            channel_counterparty: The other end of the encryption channel
+            
+        Returns:
+            List of dictionaries containing handshake details ordered by datetime descending
+        """
+        return await self._execute_query(
+            query_name='get_address_handshakes',
+            query_category='xrpl',
+            params=[channel_address, channel_counterparty]
+        )
+    
+    # AUTHORIZATION
     
     async def authorize_address(
         self,
@@ -521,7 +547,7 @@ class TransactionRepository:
         
         await self._execute_mutation(
             query_name='authorize_address',
-            query_category='xrpl',
+            query_category='auth',
             params=params
         )
 
@@ -540,7 +566,7 @@ class TransactionRepository:
         
         await self._execute_mutation(
             query_name='deauthorize_addresses',
-            query_category='xrpl',
+            query_category='auth',
             params=params
         )
 
@@ -566,7 +592,7 @@ class TransactionRepository:
         
         await self._execute_mutation(
             query_name='flag_address',
-            query_category='xrpl',
+            query_category='auth',
             params=params
         )
 
@@ -583,7 +609,7 @@ class TransactionRepository:
         
         await self._execute_mutation(
             query_name='clear_address_flags',
-            query_category='xrpl',
+            query_category='auth',
             params=params
         )
 
@@ -599,14 +625,14 @@ class TransactionRepository:
         # First clear any expired flags for the address' auth source user
         await self._execute_mutation(
             query_name='clear_expired_flags',
-            query_category='xrpl',
+            query_category='auth',
             params=[]
         )
 
         # Then check if the address is authorized
         result = await self._execute_query(
             query_name='is_address_authorized',
-            query_category='xrpl',
+            query_category='auth',
             params=[account_address]
         )
         return result[0]['is_authorized'] if result else False
@@ -628,14 +654,14 @@ class TransactionRepository:
         # First clear any expired flags
         await self._execute_mutation(
             query_name='clear_expired_flags',
-            query_category='xrpl',
+            query_category='auth',
             params=[]
         )
         
         # Then check for active flags
         result = await self._execute_query(
             query_name='check_if_user_is_flagged',
-            query_category='xrpl',
+            query_category='auth',
             params=[auth_source, auth_source_user_id]
         )
         if result and result[0]['cooldown_seconds'] is not None:
@@ -655,28 +681,8 @@ class TransactionRepository:
         
         result = await self._execute_query(
             query_name='get_associated_addresses',
-            query_category='xrpl',
+            query_category='auth',
             params=params
         )
         
         return [row['address'] for row in result]
-
-    async def get_address_handshakes(
-        self,
-        channel_address: str,
-        channel_counterparty: str
-    ) -> List[Dict[str, Any]]:
-        """Get handshake messages between two addresses.
-        
-        Args:
-            channel_address: One end of the encryption channel
-            channel_counterparty: The other end of the encryption channel
-            
-        Returns:
-            List of dictionaries containing handshake details ordered by datetime descending
-        """
-        return await self._execute_query(
-            query_name='get_address_handshakes',
-            query_category='xrpl',
-            params=[channel_address, channel_counterparty]
-        )
