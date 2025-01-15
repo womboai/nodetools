@@ -8,6 +8,7 @@ def configure_logger(
         output_directory: Path = None,
         log_filename: str = None,
         level: str = None,
+        include_thread: bool = False
 ):
     logger.remove()  # remove default logger
 
@@ -26,7 +27,9 @@ def configure_logger(
 
     # add console logger with formatting
     logger_format = "<white>{time:YYYY-MM-DD HH:mm:ss.SSSSSS}</white> "
-    logger_format += "--- <level>{level}</level> | Thread {thread} <level>{message}</level>"
+    logger_format += "--- <level>{level}</level> |"
+    logger_format += " Thread {thread}" if include_thread else ""
+    logger_format += " <level>{message}</level>"
     logger.add(
         sys.stdout, level=level,
         format=logger_format,

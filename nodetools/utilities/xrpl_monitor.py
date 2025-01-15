@@ -29,6 +29,7 @@ class XRPLWebSocketMonitor:
         self.ws_urls = self.network_config.websockets
         self.ws_url_index = 0
         self.url = self.ws_urls[self.ws_url_index]
+        logger.debug(f"Using wss endpoint: {self.url}")
 
         # Client and queue
         self.client = None
@@ -171,8 +172,6 @@ class XRPLWebSocketMonitor:
 
             if not response.is_successful():
                 raise Exception(f"Subscription failed: {response.result}")
-            
-            logger.info(f"Successfully subscribed to updates on node {self.url}")
 
             # Start timeout checking
             timeout_task = asyncio.create_task(

@@ -144,9 +144,9 @@ class TransactionRepository:
         params: Union[List[Any], List[Tuple[Any, ...]]],
         *,
         is_batch: bool = False,
-        count_query_name: Optional[str] = None,
-        count_params: Optional[List[Any]] = None
-    ) -> None:
+        return_query_name: Optional[str] = None,
+        return_params: Optional[List[Any]] = None
+    ) -> Optional[Any]:
         """Execute a mutation query (INSERT, UPDATE, DELETE).
         
         Args:
@@ -154,11 +154,11 @@ class TransactionRepository:
             query_category: Category/folder containing the SQL file
             params: List of parameters for single operation or list of parameter tuples for batch
             is_batch: If True, uses executemany for batch operations
-            count_query_name: Optional name of query to count affected rows. Count query must have a single parameter ($1)
-            count_params: Optional parameter for count query
+            return_query_name: Optional name of query to execute after mutation to return relevant data
+            return_params: Optional parameters for return query
             
         Returns:
-            Optional[int]: Number of affected rows if count_query_name provided, None otherwise
+            Optional[Any]: Result of return query if provided, None otherwise
         """
         try:
             pool = await self.db_manager.get_pool(self.username)
@@ -174,12 +174,14 @@ class TransactionRepository:
                         await conn.execute(query, *params)
 
                     # Execute count query if provided
-                    if count_query_name and count_params is not None:
-                        count_query = sql_manager.load_query(query_category, count_query_name)
-                        # Replace the parameter placeholder with the array string
-                        count_query = count_query.replace('$1', count_params[0])
-                        result = await conn.fetchrow(count_query)
-                        return result['count'] if result else 0
+                    if return_query_name and return_params is not None:
+                        return_query = sql_manager.load_query(query_category, return_query_name)
+                        # Replace the parameter placeholder with the array string if it's an array
+                        if isinstance(return_params[0], str) and return_params[0].startswith('ARRAY['):
+                            return_query = return_query.replace('$1', return_params[0])
+                            return await conn.fetch(return_query)
+                        else:
+                            return await conn.fetch(return_query, *return_params)
 
                     return None
 
@@ -309,17 +311,17 @@ class TransactionRepository:
             params=params
         )
 
-    async def batch_insert_transactions(self, tx_list: List[Dict[str, Any]]) -> int:
+    async def batch_insert_transactions(self, tx_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Batch insert raw XRPL transactions into postfiat_tx_cache.
         
         Args:
             tx_list: List of transaction dictionaries
             
         Returns:
-            int: Number of transactions successfully inserted
+            List[Dict[str, Any]]: List of inserted transaction details (hash and ledger_index)
         """
         if not tx_list:
-            return 0
+            return []
         
         # Prepare parameters for batch insert
         params = [(
@@ -334,15 +336,17 @@ class TransactionRepository:
         # Prepare hash array for count query
         hash_array = "ARRAY[" + ",".join(f"'{tx['hash']}'" for tx in tx_list) + "]"
 
-        # Do batch insert and count in same transaction
-        return await self._execute_mutation(
+        # Do batch insert and return inserted transactions
+        result = await self._execute_mutation(
             query_name='insert_transaction',
             query_category='xrpl',
             params=params,
             is_batch=True,
-            count_query_name='count_inserted_transactions',
-            count_params=[hash_array]
-        ) or 0  # Return 0 if None is returned
+            return_query_name='get_inserted_transactions',
+            return_params=[hash_array]
+        ) or []
+
+        return [dict(row) for row in result]
 
     async def insert_transaction(self, tx: Dict[str, Any]) -> Optional[MemoTransaction]:
         """Insert a single transaction and return the processed record.

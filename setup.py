@@ -20,7 +20,8 @@ setup(
         'PyNaCl',
         'loguru',
         'asyncpg',
-        'sqlparse'
+        'sqlparse',
+        'tqdm'
     ],
     include_package_data=True, 
     package_data={

@@ -10,11 +10,13 @@ import asyncio
 import traceback
 import time
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 
 # Third party imports
 from loguru import logger
 from xrpl.models import Response
 from cryptography.fernet import InvalidToken
+from tqdm.asyncio import tqdm
 
 # Nodetools imports
 from nodetools.models.models import (
@@ -409,7 +411,6 @@ class ResponseQueueRouter:
                         pattern=pattern,
                         rule=rule
                     )
-                    logger.debug(f"ResponseQueueRouter: Adding queue config for pattern '{pattern_id}'")
     
         return configs
     
@@ -877,8 +878,6 @@ class TransactionOrchestrator:
                 asyncio.create_task(self.response_manager.retry_pending_reviews(), name="ResponseQueueRouterRetryTask")
             ])
 
-            logger.debug("TransactionOrchestrator: Started all tasks")
-
         except Exception as e:
             logger.error(f"TransactionOrchestrator: Error starting: {e}")
             logger.error(traceback.format_exc())
@@ -910,14 +909,23 @@ class TransactionOrchestrator:
         state_sync_stats = StateSyncStats()
 
         log_prefix = "Initial sync" if is_initial_sync else "Periodic sync"
-        logger.info(f"{log_prefix}: Starting PFT state synchronization...")
+        logger.debug(f"{log_prefix}: Starting PFT state synchronization...")
 
         # Get all PFT holder accounts
         trustline_data = await self.generic_pft_utilities.fetch_pft_trustline_data()
         all_accounts = list(trustline_data.keys())
         total_accounts = len(all_accounts)
 
-        logger.info(f"Starting transaction history sync for {total_accounts} accounts")
+        pbar = tqdm(
+            total=total_accounts,
+            desc=f"{log_prefix}: Syncing transaction history",
+            unit="accounts",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} accounts [{elapsed}<{remaining}, {rate_fmt}]'
+        )
+
+        # Add collections for warnings
+        missed_transactions = []  # Will store (account, tx_hash, ledger_index) tuples
+        balance_mismatch_warnings = []
 
         for idx, account in enumerate(all_accounts, 1):
             try:
@@ -928,8 +936,8 @@ class TransactionOrchestrator:
                     total_rows_inserted = 0
                     try:
                         for batch in self._get_transaction_batches(tx_hist, batch_size=BATCH_SIZE):
-                            inserted = await self.transaction_repository.batch_insert_transactions(batch)
-                            total_rows_inserted += inserted
+                            inserted_txs = await self.transaction_repository.batch_insert_transactions(batch)
+                            total_rows_inserted += len(inserted_txs)
 
                         if total_rows_inserted > 0:
                             state_sync_stats.transactions_found += total_rows_inserted
@@ -937,10 +945,10 @@ class TransactionOrchestrator:
                             state_sync_stats.rows_inserted += total_rows_inserted
 
                             if not is_initial_sync:
-                                logger.warning(
-                                    f"{log_prefix}: Found {total_rows_inserted} missing transactions "
-                                    f"for account {account} - possible websocket drop"
-                                )
+                                missed_transactions.extend([
+                                    (account, tx['hash'], tx['ledger_index'])
+                                    for tx in inserted_txs
+                                ])
 
                     except Exception as e:
                         logger.error(f"Error in batch insert for account {account}: {e}")
@@ -955,9 +963,8 @@ class TransactionOrchestrator:
                 if db_holder is None:
                     if xrpl_balance != Decimal(0):
                         if not is_initial_sync:
-                            logger.warning(
-                                f"{log_prefix}: Account {account} has XRPL balance of "
-                                f"{xrpl_balance} PFT but no database record - possible websocket drop"
+                            balance_mismatch_warnings.append(
+                                f"Account {account}: Has XRPL balance of {xrpl_balance} PFT but no database record"
                             )
                         state_sync_stats.balance_mismatches += 1
                         await self.transaction_repository.update_pft_holder(
@@ -970,9 +977,8 @@ class TransactionOrchestrator:
                     db_balance = db_holder['balance']
                     if xrpl_balance != db_balance:
                         if not is_initial_sync:
-                            logger.warning(
-                                f"{log_prefix}: Balance mismatch for account {account}: "
-                                f"XRPL: {xrpl_balance} PFT, Database: {db_balance} PFT - possible websocket drop"
+                            balance_mismatch_warnings.append(
+                                f"Account {account}: XRPL balance {xrpl_balance} PFT != Database balance {db_balance} PFT"
                             )
                         state_sync_stats.balance_mismatches += 1
                         await self.transaction_repository.update_pft_holder(
@@ -984,22 +990,41 @@ class TransactionOrchestrator:
 
                 state_sync_stats.accounts_processed += 1
 
-                # Log progress every 5 accounts
-                if idx % 5 == 0:
-                    progress = (idx / total_accounts) * 100
-                    logger.debug(
-                        f"{log_prefix}: Progress: {progress:.1f}% - "
-                        f"Synced {idx}/{total_accounts} accounts, "
-                        f"{state_sync_stats.rows_inserted} rows inserted"
-                    )
+                pbar.n = idx
+                pbar.set_postfix({
+                    'inserted': state_sync_stats.rows_inserted,
+                    'corrected': state_sync_stats.balances_corrected,
+                }, refresh=True)
                     
             except Exception as e:
                 logger.error(f"{log_prefix}: Error processing account {account}: {e}")
                 logger.error(traceback.format_exc())
                 continue
+
+        pbar.close()
+        print()
+
+        # Log collected warnings after progress bar completes
+        if not is_initial_sync:
+            if missed_transactions:
+                logger.warning(f"{log_prefix}: Detected {len(missed_transactions)} missed transactions:")
+                # Group missed transactions by account for cleaner logging
+                by_account = defaultdict(list)
+                for account, tx_hash, ledger_idx in missed_transactions:
+                    by_account[account].append((tx_hash, ledger_idx))
                 
+                for account, txs in by_account.items():
+                    logger.warning(f"  Account {account}:")
+                    for tx_hash, ledger_idx in sorted(txs, key=lambda x: x[1]):  # Sort by ledger index
+                        logger.warning(f"    - Ledger {ledger_idx}: {tx_hash}")
+            
+            if balance_mismatch_warnings:
+                logger.warning(f"{log_prefix}: Balance mismatches detected:")
+                for warning in balance_mismatch_warnings:
+                    logger.warning(f"  - {warning}")
+
         logger.info(
-            f"{log_prefix}: Completed. Processed {state_sync_stats.accounts_processed}/{total_accounts} "
+            f"{log_prefix}: Processed {state_sync_stats.accounts_processed}/{total_accounts} "
             f"accounts, inserted {state_sync_stats.rows_inserted} rows, "
             f"found {state_sync_stats.transactions_found} new transactions, "
             f"corrected {state_sync_stats.balances_corrected} balances"
@@ -1018,7 +1043,6 @@ class TransactionOrchestrator:
         total_queued = 0
 
         while True:
-            logger.debug(f"TransactionOrchestrator: Getting unprocessed transactions batch (offset: {offset})")
             batch = await self.transaction_repository.get_unprocessed_transactions(
                 order_by="datetime ASC",
                 include_processed=False,   # Set to True for debugging only
@@ -1036,9 +1060,7 @@ class TransactionOrchestrator:
                 break
 
             offset += BATCH_SIZE
-            logger.debug(f"TransactionOrchestrator: Queued {total_queued} unprocessed transactions")
 
-        logger.info(f"TransactionOrchestrator: Total unprocessed transactions queued: {total_queued}")
         return total_queued
 
     async def _state_sync_loop(self):
