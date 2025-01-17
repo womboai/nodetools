@@ -350,6 +350,12 @@ class GenericPFTUtilities:
 
                 # Create and validate MemoGroup
                 memo_group = MemoGroup.create_from_memos(memo_txs)
+
+                # Additional check to ensure we only accept standardized memos
+                if not memo_group.structure or not memo_group.structure.is_valid_format:
+                    # logger.warning(f"Skipping memo group {memo_type} - not using standardized format")
+                    continue
+
                 valid_groups.append(memo_group)
 
                 # Return early if we've reached the desired number of groups

@@ -267,12 +267,37 @@ class MemoGroup:
     
     @classmethod
     def create_from_memos(cls, memos: List[Memo]) -> 'MemoGroup':
-        """Create a new message group from constructed memos"""
-        structure = MemoStructure.from_transaction(memos[0])
+        """Create a new message group from constructed memos.
+        
+        Raises:
+            ValueError: If memos list is empty or if memos have inconsistent structures
+        """
+        if not memos:
+            raise ValueError("Cannot create MemoGroup from empty memo list")
+            
+        # Get structure from first memo
+        base_structure = MemoStructure.from_transaction(memos[0])
+        group_id = memos[0].memo_type
+        
+        # Validate all memos have consistent structure and group_id
+        for memo in memos[1:]:
+            if memo.memo_type != group_id:
+                raise ValueError(f"Inconsistent group_id: {memo.memo_type} != {group_id}")
+                
+            memo_structure = MemoStructure.from_transaction(memo)
+            if base_structure.is_valid_format:  # Only check consistency for new format messages
+                if not (
+                    memo_structure.is_valid_format and
+                    memo_structure.encryption_type == base_structure.encryption_type and
+                    memo_structure.compression_type == base_structure.compression_type and
+                    memo_structure.total_chunks == base_structure.total_chunks
+                ):
+                    raise ValueError(f"Inconsistent memo structure in group {group_id}")
+
         return cls(
-            group_id=memos[0].memo_type,
+            group_id=group_id,
             memos=memos,
-            structure=structure
+            structure=base_structure
         )
     
     def _is_structure_consistent(self, new_structure: MemoStructure) -> bool:
