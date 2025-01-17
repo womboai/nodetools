@@ -155,7 +155,6 @@ class PerformanceMonitor:
             self.save_log = save_log
             if save_log:
                 self.output_dir.mkdir(parents=True, exist_ok=True)
-            print("---------------------------------Initialized PerformanceMonitor--------------------------------")
             self.__class__._initialized = True
 
     def log_measurement(self, process: str, metric_type: str, stats: dict, unit: str):

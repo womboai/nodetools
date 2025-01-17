@@ -4,7 +4,7 @@ from loguru import logger
 import json
 import os
 from pathlib import Path
-import nodetools.configuration.constants as constants
+import nodetools.configuration.constants as global_constants
 
 @dataclass
 class NetworkConfig:
@@ -15,6 +15,7 @@ class NetworkConfig:
     public_rpc_url: str
     explorer_tx_url_mask: str
     local_rpc_url: Optional[str] = None
+    local_ws_url: Optional[str] = None
 
 @dataclass
 class NodeConfig:
@@ -50,6 +51,7 @@ XRPL_MAINNET = NetworkConfig(
     name="mainnet",
     issuer_address="rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW",
     websockets=[
+        "wss://xrpl.postfiat.org:6007",
         "wss://xrplcluster.com", 
         "wss://xrpl.ws/", 
         "wss://s1.ripple.com/", 
@@ -71,42 +73,22 @@ XRPL_TESTNET = NetworkConfig(
     explorer_tx_url_mask='https://testnet.xrpl.org/transactions/{hash}/detailed'
 )
 
-# Node configurations
-MAINNET_NODE = NodeConfig(
-    node_name="postfiatfoundation",
-    node_address="r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD",
-    remembrancer_name="postfiatfoundation_remembrancer",
-    remembrancer_address="rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn",
-    discord_guild_id=1061800464045310053,
-    discord_activity_channel_id=1239280089699450920,
-    auto_handshake_addresses=set()  # use defaults
-)
-
-TESTNET_NODE = NodeConfig(
-    node_name="postfiatfoundation_testnet",
-    node_address="rUWuJJLLSH5TUdajVqsHx7M59Vj3P7giQV",
-    remembrancer_name="postfiatfoundation_testnet_remembrancer",
-    remembrancer_address="rN2oaXBhFE9urGN5hXup937XpoFVkrnUhu",
-    discord_guild_id=510536760367906818,
-    discord_activity_channel_id=1308884322199277699,
-    auto_handshake_addresses=set()  # use defaults
-)
-
 def get_network_config() -> NetworkConfig:
     """Get current network configuration based on runtime settings"""
     return XRPL_TESTNET if RuntimeConfig.USE_TESTNET else XRPL_MAINNET
 
 def get_node_config() -> NodeConfig:
     """Get current node configuration based on runtime settings"""
-    config_dir = constants.CONFIG_DIR
+    config_dir = global_constants.CONFIG_DIR
     config_dir.mkdir(exist_ok=True)
     network = 'testnet' if RuntimeConfig.USE_TESTNET else 'mainnet'
     config_file = config_dir / f"pft_node_{network}_config.json"
     
     if not config_file.exists():
-        # Fall back to default configs temporarily
-        logger.warning(f"No configuration file found at {config_file}, using default configuration")
-        return constants.TESTNET_NODE if RuntimeConfig.USE_TESTNET else constants.MAINNET_NODE
+        raise FileNotFoundError(
+            f"No configuration file found at {config_file}. "
+            f"Run 'nodetools setup-node' to create a new configuration file."
+        )
     
     return load_node_config(config_file)
 

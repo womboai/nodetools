@@ -170,8 +170,11 @@ def setup_node():
     except Exception as e:
         print(f"\nError storing credentials: {str(e)}")
 
-if __name__ == "__main__":
+def main():
     try:
         setup_node()
     except KeyboardInterrupt:
         print("\nOperation cancelled.")
+
+if __name__ == "__main__":
+    main()

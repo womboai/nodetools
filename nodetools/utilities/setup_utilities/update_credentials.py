@@ -117,5 +117,8 @@ def update_credentials():
             print("Invalid encryption password.")
         return
 
-if __name__ == "__main__":
+def main():
     update_credentials()
+
+if __name__ == "__main__":
+    main()

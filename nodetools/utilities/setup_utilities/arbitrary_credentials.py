@@ -60,8 +60,11 @@ def setup_arbitrary_credentials():
     else:
         print("\nNo credentials were entered.")
 
-if __name__ == "__main__":
+def main():
     try:
         setup_arbitrary_credentials()
     except KeyboardInterrupt:
         print("\nOperation cancelled.")
+
+if __name__ == "__main__":
+    main()

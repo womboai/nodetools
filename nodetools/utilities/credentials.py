@@ -6,7 +6,7 @@ from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.fernet import Fernet
 import time
 from enum import Enum
-import nodetools.configuration.constants as constants
+import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
 from nodetools.utilities.ecdh import ECDHUtils
 
@@ -16,7 +16,7 @@ KEY_EXPIRY = -1  # No expiration by default
 
 def get_credentials_directory():
     """Returns the path to the credentials directory, creating it if it doesn't exist"""
-    creds_dir = constants.CONFIG_DIR
+    creds_dir = global_constants.CONFIG_DIR
     creds_dir.mkdir(exist_ok=True)
     return creds_dir
 
@@ -42,11 +42,16 @@ class CredentialManager:
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            password = kwargs.get('password')
-            if args:
-                password = args[0]
+            password = kwargs.get('password', args[0] if args else None)
             if password is None:
                 raise ValueError("Password is required for first CredentialManager instance")
+            
+            # Verify password before allowing instantiation
+            temp_instance = super().__new__(cls)
+            temp_instance.db_path = get_database_path()
+            if not temp_instance.verify_password(password):
+                raise ValueError("Invalid password")
+            
             cls._instance = super().__new__(cls)
         return cls._instance
 
@@ -92,26 +97,33 @@ class CredentialManager:
 
     def verify_password(self, password) -> bool:
         """Verify password by attempting to decrypt a known credential"""
+        # If database doesn't exist yet or is empty, accept any valid password
+        if not self.db_path.exists():
+            return True
+        
         test_key = self._derive_encryption_key(password)
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT encrypted_value FROM credentials 
-                    WHERE key like '%postgresconnstring'
-                    LIMIT 1;
-                """)
+                cursor.execute("SELECT COUNT(*) FROM credentials")
+                count = cursor.fetchone()[0]
+                
+                # If no credentials exist yet, accept any valid password
+                if count == 0:
+                    return True
+                
+                # Otherwise verify by attempting to decrypt an existing credential
+                cursor.execute("SELECT encrypted_value FROM credentials LIMIT 1")
                 row = cursor.fetchone()
                 if row:
                     fernet = Fernet(test_key)
                     fernet.decrypt(row[0].encode())
                     return True
         except Exception as e:
-            print(f"Failed to verify password: {e}")
             return False
         
-    def get_credential(self, credential):
-        """Get a specific credential by type"""
+    def get_credential(self, credential_key: str) -> str:
+        """Get a specific credential"""
         self._check_key_expiry()
 
         with sqlite3.connect(self.db_path) as conn:
@@ -119,7 +131,7 @@ class CredentialManager:
             cursor.execute("""
                 SELECT encrypted_value FROM credentials 
                 WHERE key = ?;
-            """, (credential,))
+            """, (credential_key,))
             row = cursor.fetchone()
             if row:
                 return self._decrypt_value(row[0])

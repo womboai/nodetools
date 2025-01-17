@@ -8,7 +8,7 @@ from anthropic import AsyncAnthropic
 import time
 from asyncio import Semaphore
 from nodetools.utilities.credentials import CredentialManager
-import nodetools.configuration.constants as constants
+import nodetools.configuration.constants as global_constants
 from loguru import logger
 
 class AnthropicTool:
@@ -25,7 +25,7 @@ class AnthropicTool:
             cred_manager = CredentialManager()
             self.client = anthropic.Anthropic(api_key=cred_manager.get_credential('anthropic'))
             self.async_client = AsyncAnthropic(api_key=cred_manager.get_credential('anthropic'))
-            self.default_model = constants.DEFAULT_ANTHROPIC_MODEL
+            self.default_model = global_constants.DEFAULT_ANTHROPIC_MODEL
             self.semaphore = Semaphore(max_concurrent_requests)
             self.rate_limit = requests_per_minute
             self.request_times = []

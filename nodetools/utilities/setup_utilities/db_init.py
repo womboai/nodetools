@@ -5,6 +5,8 @@ from nodetools.utilities.credentials import CredentialManager
 import sys
 import subprocess
 import platform
+from nodetools.sql.sql_manager import SQLManager
+import traceback
 
 def extract_node_name(postgres_key: str) -> str:
     """Extract node name from PostgreSQL credential key.
@@ -266,11 +268,18 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
             print("\nNo PostgreSQL connection strings found!")
             print("Please run setup_credentials.py first to configure your database credentials.")
             return
+        
+        sql_manager = SQLManager()
 
         for postgres_key in postgres_keys:
             # Extract node name from PostgreSQL credential key
             node_name = extract_node_name(postgres_key)
             network_type = "testnet" if "_testnet" in postgres_key else "mainnet"
+
+            # Skip sigildb initialization
+            if 'sigildb' in node_name.lower():
+                print(f"\nSkipping initialization for {node_name} as it's a SigilDB instance...")
+                continue
         
             print(f"\nInitializing database for {node_name} ({network_type})...")
 
@@ -295,128 +304,92 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
                 print("Please ensure the database exists and you have proper permissions.")
                 return
 
-            if drop_tables:
-                confirm = input("WARNING: This will drop existing tables. Are you sure you want to continue? (y/n): ")
-                if confirm.lower() != "y":
-                    print("Database initialization cancelled.")
-                    return
-
             engine = create_engine(db_conn_string)
-
-            # First, create the tables
-            create_tables_sql = {
-                "postfiat_tx_cache":
-                """
-                CREATE TABLE IF NOT EXISTS postfiat_tx_cache (
-                    close_time_iso VARCHAR(255),
-                    hash VARCHAR(255) PRIMARY KEY,
-                    ledger_hash VARCHAR(255),
-                    ledger_index BIGINT,
-                    meta TEXT,
-                    tx_json TEXT,
-                    validated BOOLEAN,
-                    account VARCHAR(255),
-                    delivermax TEXT,
-                    destination VARCHAR(255),
-                    fee VARCHAR(20),
-                    flags FLOAT,
-                    lastledgersequence BIGINT,
-                    sequence BIGINT,
-                    signingpubkey TEXT,
-                    transactiontype VARCHAR(50),
-                    txnsignature TEXT,
-                    date BIGINT,
-                    memos TEXT
-                );
-                """,
-                "foundation_discord":
-                """
-                CREATE TABLE IF NOT EXISTS foundation_discord (
-                    hash VARCHAR(255) PRIMARY KEY,
-                    memo_data TEXT,
-                    memo_type VARCHAR(255),
-                    memo_format VARCHAR(255),
-                    datetime TIMESTAMP,
-                    url TEXT,
-                    directional_pft FLOAT,
-                    account VARCHAR(255),
-                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            }
-
-            # Create indices
-            create_indices_sql = """
-            CREATE INDEX IF NOT EXISTS idx_account_destination
-                ON postfiat_tx_cache(account, destination);
-            CREATE INDEX IF NOT EXISTS idx_close_time_iso
-                ON postfiat_tx_cache(close_time_iso DESC);
-            CREATE INDEX IF NOT EXISTS idx_hash
-                ON postfiat_tx_cache(hash);
-            """
-
-            # Create view
-            create_view_sql = """
-            DROP VIEW IF EXISTS memo_detail_view;
-            CREATE VIEW memo_detail_view AS
-            WITH parsed_json AS (
-                SELECT
-                    *,
-                    tx_json::jsonb as tx_json_parsed,
-                    meta::jsonb as meta_parsed
-                FROM postfiat_tx_cache
-            ),
-            memo_base AS (
-                SELECT
-                    *,
-                    meta_parsed->>'TransactionResult' as transaction_result,
-                    (tx_json_parsed->'Memos') IS NOT NULL as has_memos,
-                    (close_time_iso::timestamp) as datetime,
-                    COALESCE((tx_json_parsed->'DeliverMax'->>'value')::float, 0) as pft_absolute_amount,
-                    (close_time_iso::timestamp)::date as simple_date,
-                    (tx_json_parsed->'Memos'->0->'Memo') as main_memo_data
-                FROM parsed_json
-                WHERE (tx_json_parsed->'Memos') IS NOT NULL
-            )
-            SELECT * from memo_base;
-            """
 
             try:
                 with engine.connect() as connection:
-                    # Only drop tables if explicitly requested
+                    
                     if drop_tables:
-                        for table in create_tables_sql.keys():
-                            connection.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE;"))
+                        confirm = input(f"WARNING: This will drop existing {network_type} tables. Are you sure you want to continue? (y/n): ")
+                        if confirm.lower() != "y":
+                            print("Database initialization cancelled.")
+                            return
+                        connection.execute(text("DROP TABLE IF EXISTS transaction_processing_results CASCADE;"))
+                        connection.execute(text("DROP TABLE IF EXISTS transaction_memos CASCADE;"))
+                        connection.execute(text("DROP TABLE IF EXISTS postfiat_tx_cache CASCADE;"))
+                        connection.execute(text("DROP TABLE IF EXISTS pft_holders CASCADE;"))
+                        connection.execute(text("DROP TABLE IF EXISTS authorized_addresses CASCADE;"))
+
                         connection.commit()
                         print("Dropped existing tables.")
 
-                    # Create the tables if they don't exist
-                    for table, create_table_sql in create_tables_sql.items():
-                        connection.execute(text(create_table_sql))
-                        connection.execute(text(f"GRANT ALL PRIVILEGES ON TABLE {table} to postfiat;"))
+                    # Initialize core database objects
+                    print("\nInitializing core database objects...")
+                    for category in ['create_tables', 'create_functions', 'create_views', 'create_indices']:
+                        query = sql_manager.load_query('init', category)
+                        connection.execute(text(query))
                         connection.commit()
 
+                    # Grant privileges for core tables
+                    print("\nGranting privileges for core tables...")
+                    core_tables = ["postfiat_tx_cache", "transaction_processing_results", "transaction_memos", "pft_holders", "authorized_addresses"]
+                    for table in core_tables:
+                        connection.execute(text(f"GRANT ALL PRIVILEGES ON TABLE {table} to postfiat;"))
+
+                    # Grant view privileges
+                    connection.execute(text("""
+                        SELECT 'GRANT SELECT ON ' || viewname || ' TO postfiat;'
+                        FROM pg_views
+                        WHERE schemaname = 'public'
+                    """))
+
+                    connection.commit()
+
+                    # After creating tables and views, run backfill for triggers
+                    print("\nBackfilling existing records for triggers...")
+                    backfill_queries = [
+                        # Add any backfill queries needed for triggers
+                        "UPDATE postfiat_tx_cache SET hash = hash;",  # Trigger memo processing
+                    ]
+                    
+                    for query in backfill_queries:
+                        try:
+                            connection.execute(text(query))
+                            connection.commit()
+                            print("✓ Successfully processed backfill query")
+                        except Exception as e:
+                            print(f"Warning: Backfill query failed: {e}")
+
+                    # Verify the results
+                    result = connection.execute(text("""
+                        SELECT 
+                            (SELECT COUNT(*) FROM postfiat_tx_cache) as total_transactions,
+                            (SELECT COUNT(*) FROM transaction_memos) as total_memos,
+                            (SELECT COUNT(*) FROM transaction_processing_results) as total_processing_results,
+                            (SELECT COUNT(*) FROM pft_holders) as total_pft_holders,
+                            (SELECT COUNT(*) FROM authorized_addresses) as total_authorized_addresses
+                    """))
+                    counts = result.fetchone()
+                    print(f"\nBackfill results:")
+                    print(f"- Total transactions: {counts[0]}")
+                    print(f"- Processed memos: {counts[1]}")
+                    print(f"- Processed results: {counts[2]}")
+                    print(f"- PFT holders: {counts[3]}")
+                    print(f"- Authorized addresses: {counts[4]}\n")
+
+                    tables_to_verify = core_tables  # Add more tables here if needed
+
+                    for table in tables_to_verify:
                         result = connection.execute(text(f"""
                             SELECT column_name, data_type 
                             FROM information_schema.columns 
                             WHERE table_name = '{table}';
                         """))
                         columns = result.fetchall()
-                        print(f"\nCreated table: {table}")
+                        print(f"\nTable: {table}")
                         print("Columns:")
                         for col in columns:
                             print(f"- {col[0]}: {col[1]}")
-
-                    connection.commit()
-
-                    # Create or update indices
-                    connection.execute(text(create_indices_sql))
-                    connection.commit()
-
-                    # Create or replace view 
-                    connection.execute(text(create_view_sql))
-                    connection.execute(text("GRANT SELECT ON memo_detail_view TO postfiat;"))
-                    connection.commit()
 
             except Exception as e:
                 if "permission denied for schema public" in str(e):
@@ -429,14 +402,17 @@ def init_database(drop_tables: bool = False, create_db: bool = False):
                 print(f"Error initializing database: {e}")
                 return
 
-            print("Database initialization completed successfully!")
+            print("\n\nDatabase initialization completed successfully!")
             print("Status:")
             print("- Tables configured (drop_tables={})".format(drop_tables))
+            print("- Functions created")
+            print("- Triggers created and backfilled")
             print("- Indices updated")
             print("- Views updated")
 
     except Exception as e:
         print(f"Error initializing database: {e}")
+        print(traceback.format_exc())
 
 def print_prerequisites():
     """Print prerequisites information."""
@@ -457,6 +433,38 @@ def print_prerequisites():
         Download and install from: https://www.postgresql.org/download/windows/
         """)
 
+def main(drop_tables=False, create_db=False, help_install=False, revoke_privileges=False):
+    """Entry point for CLI command
+    
+    Args:
+        drop_tables (bool): Drop and recreate tables if True
+        create_db (bool): Create database if it doesn't exist
+        help_install (bool): Show installation prerequisites
+        revoke_privileges (bool): Revoke privileges for testing
+    """
+    try:
+
+        if help_install:
+            print_prerequisites()
+            sys.exit(0)
+        
+        if revoke_privileges:
+            # Get credentials and revoke privileges
+            encryption_password = getpass.getpass("Enter your encryption password: ")
+            cm = CredentialManager(password=encryption_password)
+            postgres_keys = [key for key in cm.list_credentials() if 'postgresconnstring' in key]
+            
+            for key in postgres_keys:
+                db_conn_string = cm.get_credential(key)
+                revoke_all_privileges(db_conn_string)
+            sys.exit(0)
+
+        init_database(drop_tables=drop_tables, create_db=create_db)
+
+    except KeyboardInterrupt:
+        print("\nDatabase initialization cancelled.")
+        sys.exit(0)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Initialize the NodeTools database.")
     parser.add_argument("--drop-tables", action="store_true", help="Drop and recreate tables (WARNING: Destructive)")
@@ -464,20 +472,10 @@ if __name__ == "__main__":
     parser.add_argument("--help-install", action="store_true", help="Show installation prerequisites")
     parser.add_argument("--revoke-privileges", action="store_true", help="Revoke privileges for testing (WARNING: Destructive)")
     args = parser.parse_args()
-
-    if args.help_install:
-        print_prerequisites()
-        sys.exit(0)
     
-    if args.revoke_privileges:
-        # Get credentials and revoke privileges
-        encryption_password = getpass.getpass("Enter your encryption password: ")
-        cm = CredentialManager(password=encryption_password)
-        postgres_keys = [key for key in cm.list_credentials() if 'postgresconnstring' in key]
-        
-        for key in postgres_keys:
-            db_conn_string = cm.get_credential(key)
-            revoke_all_privileges(db_conn_string)
-        sys.exit(0)
-
-    init_database(drop_tables=args.drop_tables, create_db=args.create_db)
+    main(
+        drop_tables=args.drop_tables,
+        create_db=args.create_db,
+        help_install=args.help_install,
+        revoke_privileges=args.revoke_privileges
+    )
