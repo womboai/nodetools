@@ -23,7 +23,7 @@ def setup_node_auto():
         'node_name': f"{node_name}{network_suffix}",
         'auto_handshake_addresses': [],
         'discord_guild_id': os.environ['DISCORD_GUILD_ID'],
-        'discord_activity_channel_id': os.environ['DISCORD_ACTIVITY_CHANNEL_ID'],
+        'discord_activity_channel_id': int(os.environ['DISCORD_ACTIVITY_CHANNEL_ID']),
     }
 
     node_wallet = xrpl.wallet.Wallet.from_seed(credentials_dict[f'{node_name}{network_suffix}__v1xrpsecret'])
