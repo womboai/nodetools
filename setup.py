@@ -21,7 +21,7 @@ setup(
         'loguru',
         'asyncpg',
         'sqlparse',
-        'tqdm'
+        'tqdm',
     ],
     include_package_data=True, 
     package_data={

@@ -51,7 +51,6 @@ class TransactionRepository:
             async with pool.acquire() as conn:
                 
                 if params:
-
                     # Convert named parameters from %(name)s to $1, $2, etc.
                     if isinstance(params, dict):
                         # Create a mapping of param names to positions

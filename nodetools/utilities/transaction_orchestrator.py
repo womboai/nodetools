@@ -1031,7 +1031,7 @@ class TransactionOrchestrator:
         )
 
         return state_sync_stats
-    
+
     async def queue_unprocessed_transactions(self):
         """Queue any unprocessed transactions for review.
     

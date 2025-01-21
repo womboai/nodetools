@@ -1,8 +1,11 @@
 import argparse
+import os
+
 from nodetools.utilities.setup_utilities import (
     arbitrary_credentials,
     init_db,
     setup_node,
+    setup_node_auto,
     update_credentials,
 )
 
@@ -35,7 +38,10 @@ def main():
             revoke_privileges=args.revoke_privileges
         )
     elif args.command == 'setup-node':
-        setup_node.main()
+        if 'AUTO' not in os.environ:
+            setup_node.main()
+        else:
+            setup_node_auto.main()
     elif args.command == 'update-creds':
         update_credentials.main()
     elif args.command == 'create-arbitrary-creds':

@@ -54,6 +54,12 @@ class GenericPFTUtilities:
     _instance = None
     _initialized = False
 
+    TX_JSON_FIELDS = [
+        'Account', 'DeliverMax', 'Destination', 'Fee', 'Flags',
+        'LastLedgerSequence', 'Sequence', 'SigningPubKey', 
+        'TransactionType', 'TxnSignature', 'date', 'ledger_index', 'Memos'
+    ]
+
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
@@ -242,7 +248,7 @@ class GenericPFTUtilities:
             response: Transaction response from submit_and_wait
 
         Returns:
-            bool: True if the transaction was successful, False otherwise
+            Tuple[bool, Response]: True if the transaction was successful, False otherwise
         """
         try:
             # Handle list of responses

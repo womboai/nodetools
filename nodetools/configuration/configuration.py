@@ -1,11 +1,10 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List
 from loguru import logger
 import json
 import os
 from pathlib import Path
 import nodetools.configuration.constants as global_constants
-from dataclasses import field
 
 @dataclass
 class NetworkConfig:
