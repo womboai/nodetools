@@ -671,12 +671,27 @@ class GenericPFTUtilities:
         marker = None  # Fetch transactions using marker pagination
         attempt = 0
         client = AsyncJsonRpcClient(self.https_url)
+        min_index: int | None = None
 
         while attempt < max_attempts:
             try:
+                # try to find earliest transaction from node
+                if min_index is None:
+                    request = xrpl.models.requests.account_tx.AccountTx(
+                                account=self.node_address,
+                                ledger_index_min=-1,
+                                limit=1,
+                                forward=True
+                            )
+
+                    response = await client.request(request)
+                    marker = response.result.get("marker")
+                    earliest_node_ledger_idx = 0 if marker is None else marker["ledger"]
+                    min_index = max(earliest_node_ledger_idx, ledger_index_min)
+
                 request = xrpl.models.requests.account_tx.AccountTx(
                     account=account_address,
-                    ledger_index_min=ledger_index_min,
+                    ledger_index_min=min_index,
                     ledger_index_max=ledger_index_max,
                     limit=limit,
                     marker=marker,
